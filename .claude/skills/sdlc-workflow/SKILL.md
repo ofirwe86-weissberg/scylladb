@@ -47,7 +47,9 @@ Set in each agent's frontmatter as an exact model ID (`claude-opus-5`, `claude-o
 | **Verification** | Opus 5.5 | `reviewer-qa`, `pr-reviewer` |
 | **Design / architecture** | Opus 5.5 | `architect-check` |
 
-Reviewers run on Opus deliberately: in C/C++ the expensive defects — lifetime bugs, UB, races, compatibility breaks — need cross-file reasoning, and a missed one costs far more than the review.
+Every band runs on an Opus model: in C/C++ the expensive defects — lifetime bugs, UB, races, compatibility breaks — need cross-file reasoning, both to avoid writing them and to catch them, and a missed one costs far more than the review.
+
+The reviewers are deliberately on a *different* model from the implementer. Keep it that way when you change either side: a defect the implementing model is blind to is less likely to survive a review by a model that fails differently.
 
 ## Signing what an agent writes to GitHub
 
