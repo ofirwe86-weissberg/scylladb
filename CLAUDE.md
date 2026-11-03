@@ -40,6 +40,8 @@ Upstream: `scylladb/scylladb`. Default branch: `master`. This checkout has two r
 # (e.g. test/boost/combined_tests): find the binary in configure.py or test/<suite>/CMakeLists.txt
 ./tools/toolchain/dbuild ./test.py --mode=dev test/boost/<name>_test.cc
 ./tools/toolchain/dbuild ./test.py --mode=dev test/boost/<name>_test.cc::<test_case>
+# known-good example (33 tests, ~1s once build/dev/scylla is current):
+./tools/toolchain/dbuild ./test.py --mode=dev test/boost/group0_voter_calculator_test.cc
 
 # Functional / integration tests (Python); full path with .py
 ./tools/toolchain/dbuild ./test.py --mode=dev test/cqlpy/<file>.py::<test_function>
@@ -53,11 +55,11 @@ Upstream: `scylladb/scylladb`. Default branch: `master`. This checkout has two r
 git clang-format master
 ```
 
-Build modes: `debug`, `dev`, `release`, `sanitize`. Agents use `dev` by default. If `test.py` hits cgroup-metrics permission errors, add `--no-gather-metrics`. Logs land in `testlog/<mode>/`. A full build is long (hours on modest hardware, ~2–3 GB RAM per compile/link thread); no compiler cache is configured here (`configure.py` supports `ccache`/`sccache`). Existing `build/` tree on this machine is Linux aarch64 from a previous build.
+Build modes: `debug`, `dev`, `release`, `sanitize`. Agents use `dev` by default. If `test.py` hits cgroup-metrics permission errors, add `--no-gather-metrics`. Logs land in `testlog/<mode>/`. A full build is long (hours on modest hardware, ~2–3 GB RAM per compile/link thread), so build the narrowest target. `configure.py --compiler-cache` defaults to `auto` and picks up the image's `sccache` (`build.ninja`: `cxx_launcher = /usr/bin/sccache`), which is what makes a rebuild in a fresh worktree survivable. Measured here at `-j6`: an incremental `build/dev/scylla` relink took 11m32s.
 
 **Max parallel agents: 2.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM.
 
-Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node Python), `cluster` (multi-node, `test/pylib` manager), `cql` (approval tests; review any `.reject` diff before overwriting `.result`), `rest_api`, `nodetool`, `scylla_gdb`. cqlpy tests should also pass on Cassandra.
+Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node Python), `cluster` (multi-node, `test/pylib` manager), `cql` (approval tests; review any `.reject` diff before overwriting `.result`), `rest_api`, `nodetool`, `scylla_gdb`; also `vector_search`, `ldap`, `tools`, `perf`, `dist_test`, `manual` and `pylib_test` (`ls test/` for the full set). cqlpy tests should also pass on Cassandra.
 
 ## Conventions
 
@@ -135,4 +137,4 @@ Flow: intake → implement → architect-check *if structural* → reviewer-qa �
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.
 - `.claude/hooks/guard-destructive-ops.sh` blocks merges, pushes to the default branch, force pushes, `git reset --hard`, `git clean -fdx`, and wiping the build tree. It is a speed bump, not a security boundary — branch protection is the control that holds.
-- `.claude/hooks/check-cpp-format.sh` checks changed lines of edited C/C++ files against `.clang-format` and asks the agent to fix them. It is a silent no-op until `git-clang-format` is installed.
+- `.claude/hooks/check-cpp-format.sh` checks changed lines of edited C/C++ files against `.clang-format` and asks the agent to fix them. The hook runs on the host, where `git-clang-format` is absent, so it is a silent no-op; `clang-format` and `git-clang-format` live in the toolchain image, so format changed lines with `./tools/toolchain/dbuild git clang-format master` yourself rather than relying on the hook.
