@@ -125,7 +125,7 @@ A team of subagents in `.claude/agents/` takes work from request to reviewed PR.
 |---|---|---|
 | `tl-intake` (skill) | session model | Conversation → well-scoped GitHub issues. Stops at the issue. |
 | `sdlc-workflow` (skill) | session model | Issue → PR. Delegates, sequences, decides whether to open the PR. |
-| `implementer` (agent) | Sonnet 5.5 | Builds one issue into tested code. Flags structural changes. |
+| `implementer` (agent) | Opus 5 | Builds one issue into tested code. Flags structural changes. |
 | `architect-check` (agent) | Opus 5.5 | Runs only on structural changes, against "Architecture constraints". |
 | `reviewer-qa` (agent) | Opus 5.5 | Adversarial review of the diff before a human sees it. Builds and runs tests. |
 | `pr-reviewer` (agent) | Opus 5.5 | Cold read of the opened PR — diff, commit message, and whether the description's claims are true. Posts a GitHub review. Always a different instance from the two above. |

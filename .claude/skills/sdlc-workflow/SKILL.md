@@ -39,11 +39,11 @@ This skill defines how the subagents in `.claude/agents/` work together on one t
 
 ## Which model each agent runs on
 
-Set in each agent's frontmatter as an exact model ID (`claude-sonnet-5-5`, `claude-opus-5-5`), not the bare `sonnet`/`opus` alias, so a model change is a deliberate, reviewed edit rather than a silent one. Do not override it per call without a reason you state in the same message.
+Set in each agent's frontmatter as an exact model ID (`claude-opus-5`, `claude-opus-5-5`), not the bare `sonnet`/`opus` alias, so a model change is a deliberate, reviewed edit rather than a silent one. Do not override it per call without a reason you state in the same message.
 
 | Band | Model | Agents |
 |---|---|---|
-| **Implementation** | Sonnet 5.5 | `implementer` |
+| **Implementation** | Opus 5 | `implementer` |
 | **Verification** | Opus 5.5 | `reviewer-qa`, `pr-reviewer` |
 | **Design / architecture** | Opus 5.5 | `architect-check` |
 
