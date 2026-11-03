@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 **ofirwe86-weissberg/scylladb** — a fork of ScyllaDB, a Cassandra/DynamoDB-compatible, shared-nothing NoSQL database written in C++ on the Seastar framework. Core values: performance, correctness, readability.
 
-Upstream: `scylladb/scylladb`. Default branch: `master`. In this checkout the git remote `origin` still points at **upstream**, so never `git push origin` and always pass `-R ofirwe86-weissberg/scylladb` to `gh`.
+Upstream: `scylladb/scylladb`. Default branch: `master`. This checkout has two remotes: `origin` is **upstream** (`scylladb/scylladb`) and `fork` is `ofirwe86-weissberg/scylladb`. Push only to `fork` (`git push fork <branch>`), never to `origin`, and always target the fork explicitly with `gh`: `-R ofirwe86-weissberg/scylladb` for `gh pr` / `gh issue` / `gh label`, and the repo as a positional argument for `gh repo view ofirwe86-weissberg/scylladb`.
 
 `AGENTS.md` routes to detailed style guides. Read the relevant one before editing:
 - `.github/copilot-instructions.md` — build/test commands, code and test philosophy (always)
@@ -17,7 +17,7 @@ Upstream: `scylladb/scylladb`. Default branch: `master`. In this checkout the gi
 
 - Language: C++ built with `-std=gnu++26` (see `configure.py`; the style guide says "C++23, prefer modern features, especially coroutines"). Rust components under `rust/`; Python for tests and tooling.
 - Concurrency: Seastar — shared-nothing, one thread per core (shard), futures/coroutines, cooperative scheduling.
-- Build: `configure.py` → `build.ninja` → ninja (a CMake build exists but is secondary). Toolchain: frozen Docker toolchain `tools/toolchain/dbuild` (image in `tools/toolchain/image`). Scylla builds on Linux only: **on this macOS/arm64 host, run everything through `./tools/toolchain/dbuild`** (ninja, uv, clang-format and ccache are not installed natively). Don't mix dbuild and native builds.
+- Build: `configure.py` → `build.ninja` → ninja (a CMake build exists but is secondary). Toolchain: frozen container toolchain `tools/toolchain/dbuild` (image in `tools/toolchain/image`). `dbuild` uses podman if present, else docker; on this Linux/aarch64 host it's podman. **Run everything through `./tools/toolchain/dbuild`**: ninja, uv, clang-format and ccache live inside the toolchain image and are intentionally not installed on the host, so don't install them natively. Verified here: `./tools/toolchain/dbuild ninja -j6 build/dev/scylla` and `./tools/toolchain/dbuild ./test.py --mode=dev test/cqlpy/test_json.py` both work with no override flags. Use `dev` mode with `-j6`. Don't mix dbuild and native builds.
 - Submodules (`seastar`, `abseil`, `fmt`, `c-ares`, `swagger-ui`, `tools/cqlsh`, `tools/python3`) must be initialized: `git submodule update --init --force --recursive`.
 - Key directories (full map: `docs/dev/repository_layout.md`):
   - `cql3/`, `transport/` — CQL grammar/statements and native protocol; `alternator/` — DynamoDB API; `api/` — REST API
@@ -114,7 +114,7 @@ Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node 
 
 ## Agent skills
 
-- Issue tracker: GitHub Issues on `ofirwe86-weissberg/scylladb` — see `docs/agents/issue-tracker.md`. (Issues are currently **disabled** on this fork; they must be enabled before the workflow can be used.)
+- Issue tracker: GitHub Issues on `ofirwe86-weissberg/scylladb` — see `docs/agents/issue-tracker.md`. (Issues are enabled on the fork.)
 - Triage labels: see `docs/agents/triage-labels.md`.
 
 ## SDLC workflow
