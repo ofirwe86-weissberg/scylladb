@@ -2,6 +2,10 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Current task
+
+See `docs-work/assignment.md`.
+
 ## Repo
 
 **ofirwe86-weissberg/scylladb** — a fork of ScyllaDB, a Cassandra/DynamoDB-compatible, shared-nothing NoSQL database written in C++ on the Seastar framework. Core values: performance, correctness, readability.
@@ -72,6 +76,26 @@ Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node 
 - Tests: every bug fix comes with a test that fails before and passes after, and cites the GitHub/JIRA issue. New tests must be stable (`--repeat 100 --max-failures 1`), fast, deterministic, and free of sleeps; reduce iterations in debug mode.
 - Question requests rather than implementing blindly; flag trade-offs.
 
+## Development rules
+
+These apply to all implementation and review on this project.
+
+**Reactor stalls: treat this code as highly stall-sensitive.**
+- A stall is any command that takes time without giving the shard back. One shard runs everything on one thread, so while it runs, every other request on that shard waits. Code that isn't effectively instant must either be asynchronous (`co_await`, which frees the shard) or yield regularly.
+- While writing code, ask of every loop, parse, serialization, checksum and allocation: how big can its input get, and does it yield? Bound the work or yield with `coroutine::maybe_yield()`, and avoid large contiguous allocations. Never make a blocking call.
+- Reviewers check for stalls explicitly, on the worst-case input and not the typical one.
+- Passing tests don't show the absence of stalls: `test/pylib/cpp/base.py:47` sets `--blocked-reactor-notify-ms=2000000` for C++ tests, so stalls aren't reported there.
+- **If you're not sure whether something can stall, don't decide alone.** Discuss it with `architect-check` first, then raise a flag to the human with what you concluded and what's still unknown.
+
+**Tests are written with the code, not after it.**
+- Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
+- Don't commit while a test fails, and ask the human if any test fails, even one that looks unrelated. Each commit holds a step's test and code together, so it compiles and passes.
+- Show that a test can fail: break the code on purpose, or record its failure before the fix. A test that has never failed proves nothing.
+
+**The test bar is p99, not the happy path.** Passing is the minimum. Tests must take the code to its edge cases: boundary values, maximum sizes, empty inputs, failures at each step, restarts, concurrency and reordering. Before finishing, list the edge cases you considered, and say which are tested and which aren't. Random inputs must use a fixed, logged seed so that a failure can be reproduced.
+
+**Test design is agreed with the human before test code is written** for a new feature: what's tested, at which level, and with which control points.
+
 ## Architecture (big picture)
 
 - **Seastar** (`seastar/`): sharded runtime; most code runs on one shard without locks; cross-shard work via `smp::submit_to`, `sharded<>`, `foreign_ptr`. `main.cc` wires every `sharded<>` service and its startup/shutdown order.
@@ -125,14 +149,20 @@ A team of subagents in `.claude/agents/` takes work from request to reviewed PR.
 
 | Piece | Model | Role |
 |---|---|---|
+| `product-manager` (agent) | Opus 5.5 | Peer of the team lead, not a report. Owns the requirements (the what; the dev team owns the how). Works from documents, not code, and raises issues in the product issue register. |
+| `tester` (agent) | Opus 5.5 | QA. Checks requirements are testable, writes the full end-to-end test plan from them, and implements it as black-box tests. Plan reviewed by `product-manager`, the team lead and `reviewer-qa`. |
 | `tl-intake` (skill) | session model | Conversation → well-scoped GitHub issues. Stops at the issue. |
 | `sdlc-workflow` (skill) | session model | Issue → PR. Delegates, sequences, decides whether to open the PR. |
 | `implementer` (agent) | Opus 5 | Builds one issue into tested code. Flags structural changes. |
-| `architect-check` (agent) | Opus 5.5 | Runs only on structural changes, against "Architecture constraints". |
+| `architect-check` (agent) | Opus 5.5 | Runs on structural changes, against "Architecture constraints". Also reviews integration test coverage across units, from documents only. |
 | `reviewer-qa` (agent) | Opus 5.5 | Adversarial review of the diff before a human sees it. Builds and runs tests. |
 | `pr-reviewer` (agent) | Opus 5.5 | Cold read of the opened PR — diff, commit message, and whether the description's claims are true. Posts a GitHub review. Always a different instance from the two above. |
 
 Flow: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. **Nothing is merged automatically**; the PR still gets human review.
+
+The session acts as team lead. For feature work, run `product-manager` before requirements go to the tester and before bringing a product decision to the human. It doesn't report to the team lead: it writes its issues to the register directly, the team lead relays every new issue to the human without filtering, and only the human closes one. `product-manager` reviews documents, including the test plan, and doesn't review the implementation.
+
+For feature work, the order is: requirements (`product-manager`), then a full test plan based on them (`tester`, reviewed by `product-manager`, the team lead and `reviewer-qa`), and only then code. The test plan is QA's, and QA implements it as black-box, end-to-end tests against the real system (`tester`, reviewed by `reviewer-qa` and `pr-reviewer` like other code). Unit and integration tests are the developer's work, written with the code, and based on mocking rather than end to end. The design lists the units, their connections, and the integration tests for each. `architect-check` reviews that list from the documents, not the code, to confirm every connection is tested and the design holds together.
 
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.
