@@ -68,7 +68,10 @@ std::expected<shipper_config, shipping_state> make_shipper_config(const db::conf
 }
 
 pitr_shipper::pitr_shipper(const db::config& cfg) noexcept
-    : _cfg(cfg) {
+    : _cfg(cfg)
+    , _seal_timer([this] {
+        seal_tick();
+    }) {
 }
 
 future<> pitr_shipper::start() {
@@ -110,9 +113,121 @@ future<> pitr_shipper::start() {
 }
 
 future<> pitr_shipper::stop() {
-    // Nothing is held yet. The hold on segments and the uploads of the later
-    // tickets are drained here.
-    return make_ready_future<>();
+    // The uploads of the later tickets are drained here too.
+    _seal_timer.cancel();
+    return _seal_gate.close();
+}
+
+void pitr_shipper::start_sealing(seal_function seal, node_count_function count_nodes) {
+    // A closed gate means stop() has begun: arming the timer then would leave a
+    // tick behind that no stop() waits for.
+    if (!active() || _seal || _seal_gate.is_closed()) {
+        return;
+    }
+    _seal = std::move(seal);
+    _count_nodes = std::move(count_nodes);
+    _seal_timer.arm_periodic(_shipper_cfg->seal_interval);
+}
+
+void pitr_shipper::seal_tick() {
+    if (!active() || !_seal) {
+        return;
+    }
+    if (_seal_running) {
+        // Dropping it would leave a write that lands in the next segment
+        // waiting two intervals, so one follow-up cycle is owed instead.
+        _seal_again = true;
+        if (!std::exchange(_slow_seal_warned, true)) {
+            // The cycle may be waiting on the node count rather than on the
+            // seal itself, so neither is named here.
+            pitr_logger.warn("A seal cycle is still running at the next tick; the seal interval is {}s", _shipper_cfg->seal_interval.count());
+        } else {
+            pitr_logger.debug("Seal tick during a running cycle, one follow-up is owed");
+        }
+        return;
+    }
+    if (_seal_gate.is_closed()) {
+        // stop() has begun: no cycle may start, and none is owed.
+        return;
+    }
+    // Background: the timer callback cannot wait. The gate makes stop() wait,
+    // and every continuation that touches this shipper runs inside it.
+    _seal_running = true;
+    (void)seastar::try_with_gate(_seal_gate, [this] {
+        return seal_loop().then_wrapped([this](future<> f) {
+            if (f.failed()) {
+                // seal_cycle() records its own failures, so nothing is expected
+                // here. Swallowing it anyway keeps one surprise from leaving
+                // _seal_running set, which would stop sealing on this shard for
+                // the rest of the node's life.
+                _last_outcome = cycle_outcome::seal_failed;
+                _last_failure = fmt::format("the seal cycle failed unexpectedly: {}", f.get_exception());
+                pitr_logger.error("{}", *_last_failure);
+            }
+            // Reached on every path, so a run always releases the next tick.
+            _seal_again = false;
+            _seal_running = false;
+            _slow_seal_warned = false;
+            _cycle_done.broadcast();
+        });
+    }).handle_exception_type([](const seastar::gate_closed_exception&) {
+        // Unreachable: the gate was open just above, with no yield in between.
+        // Captures nothing, so it cannot outlive the shipper.
+    });
+}
+
+future<> pitr_shipper::seal_loop() {
+    do {
+        _seal_again = false;
+        co_await seal_cycle();
+    } while (_seal_again && active() && !_seal_gate.is_closed());
+}
+
+future<> pitr_shipper::wait_for_cycles(std::chrono::milliseconds timeout) {
+    return _cycle_done.wait(timeout, [this] {
+        return !_seal_running;
+    });
+}
+
+// Records every failure instead of throwing, so seal_loop() always finishes.
+future<> pitr_shipper::seal_cycle() {
+    // Every cycle repeats the startup check, because a node can join later.
+    size_t node_count = 0;
+    try {
+        node_count = co_await _count_nodes();
+    } catch (...) {
+        _last_outcome = cycle_outcome::count_failed;
+        _last_failure = fmt::format("reading the node count failed: {}", std::current_exception());
+        static thread_local seastar::logger::rate_limit count_failed_rate_limit(std::chrono::seconds(30));
+        pitr_logger.log(seastar::log_level::warn, count_failed_rate_limit, "Not sealing, the next cycle will try again: {}", *_last_failure);
+        co_return;
+    }
+    // Reading the count yields, so stop() may have begun in the meantime: a
+    // seal started now would run against a commitlog that is shutting down.
+    if (_seal_gate.is_closed()) {
+        co_return;
+    }
+    if (node_count != 1) {
+        _state = shipping_state::off_multi_node;
+        _break_reason = fmt::format("the node counted {} nodes while shipping, and single-node PITR supports exactly one", node_count);
+        _last_outcome = cycle_outcome::shipping_broke;
+        _last_failure = _break_reason;
+        _seal_timer.cancel();
+        if (this_shard_id() == 0) {
+            pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
+        }
+        co_return;
+    }
+    try {
+        co_await _seal();
+        _last_outcome = cycle_outcome::sealed;
+        _last_failure.reset();
+    } catch (...) {
+        _last_outcome = cycle_outcome::seal_failed;
+        _last_failure = fmt::format("sealing the commitlog segment failed: {}", std::current_exception());
+        static thread_local seastar::logger::rate_limit seal_failed_rate_limit(std::chrono::seconds(30));
+        pitr_logger.log(seastar::log_level::warn, seal_failed_rate_limit, "{}; the next cycle will try again", *_last_failure);
+    }
 }
 
 void pitr_shipper::note_cluster_size(size_t node_count) {
