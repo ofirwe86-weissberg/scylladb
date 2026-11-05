@@ -5,7 +5,7 @@
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
-"""Checks of the test code in test_pitr.py that don't need PITR, so these run on any build.
+"""Checks of the test code in pitr_util.py that don't need PITR, so these run on any build.
 
 Every "exact at T" test rests on the reference table, every store failure on GatedStore, and every wait on helpers
 that have to fail when they should. wait_for() swallows exceptions, so a helper that asserts inside it can pass by
@@ -24,9 +24,9 @@ import botocore.config
 import botocore.exceptions
 import pytest
 
-from test.cluster.object_store import test_pitr as pitr
+from test.cluster.object_store import pitr_util as pitr
+from test.cluster.object_store.pitr_util import GatedStore, W, gated_store  # noqa: F401 (gated_store is a fixture)
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
-from test.cluster.object_store.test_pitr import GatedStore, W, gated_store  # noqa: F401 (gated_store is a fixture)
 from test.cluster.util import new_test_keyspace
 from test.pylib.rest_client import HTTPError
 from test.pylib.s3mock_server import create_bucket
