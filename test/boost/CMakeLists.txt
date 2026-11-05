@@ -217,6 +217,8 @@ add_scylla_test(pitr_shipper_test
   KIND SEASTAR)
 add_scylla_test(pitr_t_filter_test
   KIND SEASTAR)
+add_scylla_test(pitr_t_parser_test
+  KIND BOOST)
 add_scylla_test(pretty_printers_test
   KIND BOOST)
 add_scylla_test(radix_tree_test

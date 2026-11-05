@@ -49,7 +49,9 @@ target_sources(db
     rate_limiter.cc
     per_partition_rate_limit_options.cc
     pitr/pitr_shipper.cc
+    pitr/refusal.cc
     pitr/t_filter.cc
+    pitr/t_parser.cc
     row_cache.cc
     tablet_options.cc
     object_storage_endpoint_param.cc
