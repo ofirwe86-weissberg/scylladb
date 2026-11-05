@@ -11,7 +11,7 @@ import logging
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     apply, needs_phase, node_config, now_us, old_ts, pks_of, protect_table, protected_table, PURGEABLE_OPTIONS, read_all, report_stalls, restore_ok,
-    simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, W, wait_covered, write_and_purge
+    row_is_in_the_data, simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, wait_covered, write_and_purge, write_row_flush_then_delete_it
 )
 from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -40,14 +40,18 @@ async def test_row_purged_before_the_backup_stays_deleted(manager: ScyllaCluster
 
 @needs_phase('1.3')
 async def test_row_deleted_before_the_backup_with_its_grace_expired_stays_deleted(manager: ScyllaClusterManager, s3_storage):
-    """T13, RST-3. The tombstone is in the backup, unpurged, and its grace period has passed by the time of the restore."""
-    ts = old_ts()
-    seed = simple_rows([0, 1], ts) + [W(ts + 1, 'DELETE FROM {t} USING TIMESTAMP {ts} WHERE pk = 0')]
-    async with protected_table(manager, s3_storage, seed=seed, schema=f'{TABLE_SCHEMA} WITH gc_grace_seconds = 0') as p:
-        fragments = await p.cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({p.ks}.t)')
-        assert 0 in {f.pk for f in fragments}, 'expected the tombstone still in the data, or this is the purged case again'
-        _, new = await p.restore(await p.covered())
-        seen = await pks_of(p.cql, p.ks, new)
+    """T13, RST-3. The row and its tombstone are both in the backup, unpurged, and the grace period has passed by the time of the restore."""
+    server = await manager.server_add(config=node_config(s3_storage))
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, VNODES_KS) as ks:
+        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA} WITH gc_grace_seconds = 0')
+        await write_row_flush_then_delete_it(manager, server, cql, ks)
+        backup = await protect_table(manager, server, s3_storage, ks, 't')
+        assert await row_is_in_the_data(cql, ks, 0), 'expected row 0 still in the data the backup took, or this test proves nothing'
+        latest = await wait_covered(manager, server, ks, 't')
+        new = unique_name('restored_')
+        await restore_ok(manager, server, ks, 't', backup.name, latest, new)
+        seen = await pks_of(cql, ks, new)
         assert seen == {1}, f'expected row 0 gone, saw {seen}'
 
 

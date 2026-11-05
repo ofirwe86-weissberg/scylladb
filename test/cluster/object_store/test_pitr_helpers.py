@@ -182,10 +182,8 @@ async def test_backup_and_restore_through_the_gate(manager: ScyllaClusterManager
     server = await manager.server_add(config=pitr.node_config(gated_store, shipping=False))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
-        await cql.run_async(f"CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA} WITH compression = {{'sstable_compression': ''}}")
-        for first in range(0, 1200, 300):
-            await pitr.apply(cql, ks, 't', pitr.simple_rows(range(first, first + 300), pitr.now_us() - 3600_000_000, 'x' * 1024))
-            await manager.api.keyspace_flush(server.ip_addr, ks, 't')
+        await cql.run_async(f'CREATE TABLE {ks}.t {pitr.UNCOMPRESSED_SCHEMA}')
+        await pitr.write_several_sstables(manager, server, cql, ks)
         rows = await pitr.read_all(cql, ks, 't')
         size = await manager.api.get_table_disk_space_used(server.ip_addr, ks, 't')
         assert size > 1024 * 1024
@@ -204,7 +202,7 @@ async def test_backup_and_restore_through_the_gate(manager: ScyllaClusterManager
             logger.info(f'The task had already ended: {e}')
         assert (await manager.api.wait_task(server.ip_addr, tid))['state'] == 'failed'
         uploaded = sum(o.size for o in (await pitr.objects_of(gated_store, f'{cut_prefix}/')).values())
-        assert uploaded < size, f'the upload must not be whole: {uploaded} of {size} bytes'
+        assert 0 < uploaded < size, f'the upload must be part-way: {uploaded} of {size} bytes'
         gated_store.recover()
 
         prefix = f'whole/{snap}'
@@ -416,16 +414,16 @@ async def test_conditional_history_reads_back_real_timestamps(manager: ScyllaClu
                                                                               None, None, None, None, None, None))], f'at {t}'
 
 
-async def test_flush_keeps_a_tombstone_with_expired_grace(manager: ScyllaClusterManager):
-    """The expired-grace case in test_pitr_deleted.py: gc_grace_seconds = 0 and no compaction leave the tombstone in the data."""
+async def test_flush_keeps_a_row_and_its_tombstone_with_expired_grace(manager: ScyllaClusterManager):
+    """The expired-grace case in test_pitr_deleted.py: gc_grace_seconds = 0 and no compaction leave the row and its tombstone in the data."""
     server = await manager.server_add()
     cql = manager.get_cql()
     async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
         await cql.run_async(f'CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA} WITH gc_grace_seconds = 0')
-        ts = pitr.old_ts()
-        await pitr.apply(cql, ks, 't', pitr.simple_rows([0, 1], ts) + [W(ts + 1, 'DELETE FROM {t} USING TIMESTAMP {ts} WHERE pk = 0')])
+        await pitr.write_row_flush_then_delete_it(manager, server, cql, ks)
         await take_snapshot_on_one_server(ks, server, manager, logger)
-        assert 0 in {f.pk for f in await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.t)')}
+        assert await pitr.row_is_in_the_data(cql, ks, 0), 'expected row 0 still in the data'
+        assert not await pitr.row_is_in_the_data(cql, ks, 2), 'expected no row 2: the check must be able to say no'
         assert await pitr.pks_of(cql, ks, 't') == {1}
 
 

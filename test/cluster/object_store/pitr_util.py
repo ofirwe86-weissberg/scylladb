@@ -508,6 +508,31 @@ async def write_and_purge(manager, server, cql, ks):
     return ts
 
 
+async def write_row_flush_then_delete_it(manager, server, cql, ks):
+    """Rows 0 and 1 in table t, flushed, then row 0's delete, so that the row and its tombstone are in different sstables. Grace is 0 and nothing compacts,
+    so a snapshot taken now holds both. Returns once the data shows row 0 still there, or this would be the purged case again."""
+    ts = old_ts()
+    await apply(cql, ks, 't', simple_rows([0, 1], ts))
+    await manager.api.keyspace_flush(server.ip_addr, ks, 't')
+    await apply(cql, ks, 't', [W(ts + 1, 'DELETE FROM {t} USING TIMESTAMP {ts} WHERE pk = 0')])
+    await manager.api.keyspace_flush(server.ip_addr, ks, 't')
+
+
+async def row_is_in_the_data(cql, ks, pk) -> bool:
+    fragments = await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.t)')
+    return any(f.pk == pk and f.mutation_fragment_kind == 'clustering row' for f in fragments)
+
+
+async def write_several_sstables(manager, server, cql, ks):
+    """Uncompressed, so that an upload has real bytes, and several sstables, so that an upload cut part-way has finished some objects."""
+    for first in range(0, 1200, 300):
+        await apply(cql, ks, 't', simple_rows(range(first, first + 300), old_ts(), 'x' * 1024))
+        await manager.api.keyspace_flush(server.ip_addr, ks, 't')
+
+
+UNCOMPRESSED_SCHEMA = f"{TABLE_SCHEMA} WITH compression = {{'sstable_compression': ''}}"
+
+
 async def conditional_history(cql, ks) -> list:
     """Conditional writes on table t, one not applied. A conditional write can't choose its timestamp, so this returns
     plain statements with the timestamps the table reports."""
