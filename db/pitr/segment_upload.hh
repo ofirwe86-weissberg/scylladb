@@ -8,15 +8,18 @@
 
 #pragma once
 
+#include <chrono>
 #include <cstdint>
+#include <exception>
+#include <functional>
 #include <stdexcept>
 
+#include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 
 namespace seastar {
 class abort_source;
-class file;
 } // namespace seastar
 
 namespace sstables {
@@ -55,9 +58,12 @@ inline constexpr size_t upload_chunk_size = 64 * 1024;
 // A file holding fewer than `used_size` bytes throws `segment_too_short`, as
 // does one that shrinks while being read.
 //
-// `f` must be a handle dedicated to this call - a fresh open_file_dma() per
-// attempt, never the commitlog's own - since ownership passes here, and it is
-// closed on every path, as is the sink.
+// `f` must be a handle dedicated to this call, never the commitlog's own, since
+// ownership passes here and it is closed on every path, as is the sink. It must
+// read back the bytes the commitlog wrote, which the commitlog wraps on write
+// and read, so an encrypted commitlog is a stated limit of segment shipping and
+// is not handled here, and it must not be a checked file, whose reader turns a
+// missing file or an I/O error into disk-error handling.
 //
 // On failure, including an abort, the sink is aborted before it is closed, so no
 // store finalizes a partial object: `name` then holds nothing, or what an
@@ -69,5 +75,59 @@ inline constexpr size_t upload_chunk_size = 64 * 1024;
 // bounded by the chunk, not by the used size, which can be a full segment.
 seastar::future<upload_result> upload_used_bytes(
         sstables::object_storage_client& client, sstables::object_name name, seastar::file f, uint64_t used_size, seastar::abort_source* as = nullptr);
+
+// Waits between attempts: `base_backoff` before the second attempt, twice the
+// last wait before each one after it, and never more than `max_backoff`. Both
+// are raised to one millisecond, since a store that fails instantly would
+// otherwise be retried in a spin.
+struct retry_policy {
+    std::chrono::milliseconds base_backoff = std::chrono::milliseconds(100);
+    std::chrono::milliseconds max_backoff = std::chrono::seconds(10);
+    // Reports each failed attempt and the wait before the next one, so a caller
+    // can show the error it is retrying; a normal return reports the success
+    // that clears it. Nothing is reported for the attempt that ends the call,
+    // and an exception out of this callback ends it with that exception.
+    std::function<void(std::exception_ptr, std::chrono::milliseconds)> on_attempt_failed;
+};
+
+// Opens one attempt's handle, by the rules stated above for `f`.
+using segment_file_opener = std::function<seastar::future<seastar::file>()>;
+
+// Uploads `used_size` bytes of a sealed segment to `name`, retrying a failure
+// after a backoff from `policy`, until it succeeds or `as` is aborted. A
+// `used_size` of 0, or no opener, is a caller's error: a segment with no used
+// bytes is not shipped at all.
+//
+// Every attempt opens its own handle and writes the same `name`, replacing
+// whatever an earlier attempt left there, so a retry cannot pile up objects.
+// The name must keep the segment's own file name, which a restore matches
+// against its prefix.
+//
+// The count of attempts is not bounded here: a store that is down for a long
+// time is one condition, watched elsewhere, which stops this loop by aborting
+// `as`. The wiring therefore needs an abort source per segment rather than one
+// per shard, and must not record a success for a segment whose close was
+// reported as failed.
+//
+// The abort always wins: once `as` is aborted the call fails with the exception
+// it carries, even if the attempt in flight had already finished uploading -
+// which a rollback makes necessary, since the segment may have been erased and
+// the handle may now be reading a newer segment's bytes. `name` may then hold a
+// complete object that nothing records, which is as safe as any object an
+// earlier attempt left. The in-flight attempt still unwinds, and cancelling an
+// S3 upload can itself retry a request, so the call need not return instantly.
+// The abort can land once more in the gap between this call returning and the
+// caller's continuation, so the wiring must record the success without awaiting
+// anything in between, or check `as` once more itself.
+//
+// Permanent, so propagated as themselves without a backoff: `segment_too_short`
+// and a missing segment file (ENOENT) from the opener, which a rollback may
+// have deleted. Every other failure is retried. A permanent failure leaves the
+// segment held, so the wiring has to break the shipped chain and release it -
+// and since a rollback both aborts and deletes, an abort is reported as the
+// abort even when a permanent failure happened with it, so that path is only
+// taken for a segment the caller is still shipping.
+seastar::future<upload_result> upload_with_retry(sstables::object_storage_client& client, sstables::object_name name, uint64_t used_size,
+        segment_file_opener open_segment_file, retry_policy policy, seastar::abort_source& as);
 
 } // namespace db::pitr
