@@ -139,6 +139,26 @@ public:
         // release_segment() is called for its id. Nothing releases it on its
         // own, so whoever turns it on owns releasing it.
         bool hold_segments = false;
+
+        // Called once for every held segment when it closes, on this shard,
+        // from inside the close, so it must be trivial: it may not block, and
+        // an exception thrown from it is logged and swallowed.
+        //
+        // `used_size` is the number of bytes written to the file, which is
+        // what a replay reads. `failed` means the segment must not be shipped:
+        // either its close did not complete, so its tail cannot be trusted, or
+        // it is being dropped (an oversized-write rollback). In both cases the
+        // hold is released by the commitlog itself, so the segment is deleted
+        // as it would be today, and the handler is expected to break its chain
+        // rather than ship the segment. A `failed` call can therefore arrive
+        // for a segment a previous call already reported as closed.
+        //
+        // Closes are not ordered: a natural close is not awaited, so handler
+        // calls can arrive in an order other than that of the segment ids.
+        // held_segments() keeps creation order, so a consumer that needs order
+        // takes it from there.
+        using segment_closed_handler = std::function<void(segment_id_type id, uint64_t used_size, bool failed)>;
+        segment_closed_handler segment_closed;
     };
 
     struct descriptor {
@@ -328,6 +348,13 @@ public:
      * config::hold_segments is set.
      */
     std::vector<segment_id_type> held_segments() const;
+
+    /**
+     * Used bytes of the held segments that have closed. The segment still
+     * being written is not counted: it cannot be shipped yet. File slack is
+     * not counted either, which is why the limit below keeps a margin.
+     */
+    uint64_t held_bytes() const;
 
     /**
      * Releases the hold on one segment, so that it can be deleted, and runs a

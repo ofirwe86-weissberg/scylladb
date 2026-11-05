@@ -7,26 +7,34 @@
  */
 
 // Tests for the commitlog's point-in-time-recovery hold
-// (commitlog::config::hold_segments): a held segment cannot be deleted until
-// it is released. See https://github.com/ofirwe86-weissberg/scylladb/issues/6.
+// (commitlog::config::hold_segments) and its segment-closed callback
+// (commitlog::config::segment_closed). The consumer of the callback here is a
+// fake recorder: nothing uploads anything yet.
+// See https://github.com/ofirwe86-weissberg/scylladb/issues/6.
 
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
 #include <chrono>
+#include <optional>
 #include <ranges>
 #include <vector>
 
 #include <seastar/core/coroutine.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/sleep.hh>
+#include <seastar/core/with_timeout.hh>
 #include <seastar/testing/test_case.hh>
 #include <seastar/util/noncopyable_function.hh>
 
 #include "db/commitlog/commitlog.hh"
+#include "db/commitlog/commitlog_extensions.hh"
 #include "db/commitlog/rp_set.hh"
+#include "db/extensions.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/checked-file-impl.hh"
 #include "utils/log.hh"
 
 using namespace db;
@@ -107,6 +115,111 @@ future<sealed_segment> write_and_seal(commitlog& log, const table_id& uuid) {
     co_await log.wait_for_pending_deletes();
     co_return sealed_segment{id, name};
 }
+
+// The fake consumer of config::segment_closed. It only records, like the real
+// shipper will only queue: the handler runs inside the close.
+class close_recorder {
+public:
+    struct event {
+        segment_id_type id;
+        uint64_t used_size;
+        bool failed;
+    };
+
+private:
+    std::vector<event> _events;
+    std::optional<std::pair<segment_id_type, bool>> _awaited;
+    std::optional<promise<>> _waiter;
+
+public:
+    commitlog::config::segment_closed_handler handler() {
+        return [this] (segment_id_type id, uint64_t used_size, bool failed) {
+            _events.push_back(event{id, used_size, failed});
+            if (_awaited && *_awaited == std::pair(id, failed)) {
+                _awaited.reset();
+                std::exchange(_waiter, std::nullopt)->set_value();
+            }
+        };
+    }
+
+    const std::vector<event>& events() const {
+        return _events;
+    }
+
+    std::optional<event> find(segment_id_type id, bool failed = false) const {
+        auto i = std::ranges::find_if(_events, [&] (const event& e) { return e.id == id && e.failed == failed; });
+        return i == _events.end() ? std::nullopt : std::optional(*i);
+    }
+
+    bool has(segment_id_type id, bool failed = false) const {
+        return find(id, failed).has_value();
+    }
+
+    // A natural close is not awaited by the write path, so a test that needs
+    // its notification has to wait for it. The timeout turns a notification
+    // that never comes into a failure rather than a hang.
+    future<> wait_for(segment_id_type id, bool failed = false) {
+        if (has(id, failed)) {
+            co_return;
+        }
+        _awaited = std::pair(id, failed);
+        _waiter.emplace();
+        try {
+            co_await with_timeout(lowres_clock::now() + 30s, _waiter->get_future());
+        } catch (timed_out_error&) {
+            _awaited.reset();
+            _waiter.reset();
+            BOOST_FAIL(fmt::format("no {} notification for segment {} within 30s", failed ? "failure" : "close", id));
+        }
+    }
+};
+
+commitlog::config recording_config(close_recorder& rec) {
+    auto cfg = hold_config();
+    cfg.segment_closed = rec.handler();
+    return cfg;
+}
+
+// A file whose next flush fails, once armed. Used to make a close fail.
+class failing_file_impl : public checked_file_impl {
+    bool* _fail_flush;
+
+public:
+    failing_file_impl(file f, bool* fail_flush)
+        : checked_file_impl([] (std::exception_ptr) {}, std::move(f))
+        , _fail_flush(fail_flush) {
+    }
+
+    future<> flush() override {
+        if (_fail_flush && *_fail_flush) {
+            *_fail_flush = false;
+            return make_exception_future<>(std::runtime_error("injected flush failure"));
+        }
+        return checked_file_impl::flush();
+    }
+};
+
+class failing_file_extension : public commitlog_file_extension {
+    bool* _fail_flush;
+
+public:
+    explicit failing_file_extension(bool* fail_flush)
+        : _fail_flush(fail_flush) {
+    }
+
+    future<file> wrap_file(const sstring&, file f, open_flags) override {
+        co_return seastar::make_shared<failing_file_impl>(std::move(f), _fail_flush);
+    }
+    future<> before_delete(const sstring&) override {
+        return make_ready_future<>();
+    }
+    future<> before_rename(const sstring&, const sstring&) override {
+        return make_ready_future<>();
+    }
+    future<> after_rename(const sstring&, const sstring&) override {
+        return make_ready_future<>();
+    }
+};
 
 } // anonymous namespace
 
@@ -283,6 +396,128 @@ SEASTAR_TEST_CASE(test_hold_at_disk_limit_blocks_writes_until_release) {
         }
         log.discard_completed_segments(uuid);
         co_await log.wait_for_pending_deletes();
+    });
+}
+
+// ------------------------------------------------------- the close callback
+
+// The seal the shipper will use notifies, with a used size that covers
+// everything written to the segment.
+SEASTAR_TEST_CASE(test_forced_seal_notifies_with_used_size) {
+    close_recorder rec;
+
+    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+        auto uuid = make_table_id();
+        auto h = co_await write_some(log, uuid);
+        auto id = h.rp().id;
+        auto position = log.current_position();
+        BOOST_REQUIRE_EQUAL(position.id, id);
+
+        co_await log.force_new_active_segment();
+
+        auto event = rec.find(id);
+        BOOST_REQUIRE(event.has_value());
+        BOOST_REQUIRE_GE(event->used_size, position.pos);
+    });
+}
+
+// A natural close - the one the write path starts and does not await - must
+// notify too, and the used size must not claim the file's slack.
+SEASTAR_TEST_CASE(test_natural_close_notifies_with_used_size) {
+    close_recorder rec;
+
+    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+        auto uuid = make_table_id();
+        auto size = log.max_record_size() / 4;
+
+        // Fill the first segment until the write path moves on to a new one.
+        rp_set rps;
+        sstring name;
+        segment_id_type first = 0;
+        position_type last_pos = 0;
+        while (true) {
+            auto h = co_await write_some(log, uuid, size);
+            auto rp = h.rp();
+            rps.put(std::move(h));
+            if (first == 0) {
+                first = rp.id;
+                name = log.get_active_segment_names().back();
+            }
+            if (rp.id != first) {
+                break;
+            }
+            last_pos = rp.pos;
+        }
+
+        co_await rec.wait_for(first);
+        auto event = rec.find(first);
+        BOOST_REQUIRE(event.has_value());
+        BOOST_REQUIRE_GE(event->used_size, last_pos);
+        BOOST_REQUIRE_LE(event->used_size, co_await file_size(name));
+    });
+}
+
+// A close that fails must not be reported as shippable, and must not leave the
+// segment held: the consumer is told, and the commitlog goes on as it would
+// without the hold.
+SEASTAR_TEST_CASE(test_failed_close_is_reported_as_failed_and_not_held) {
+    close_recorder rec;
+    bool fail_flush = false;
+    db::extensions exts;
+    exts.add_commitlog_file_extension("failing", std::make_unique<failing_file_extension>(&fail_flush));
+
+    auto cfg = recording_config(rec);
+    cfg.extensions = &exts;
+
+    co_await with_log(std::move(cfg), [&rec, &fail_flush] (commitlog& log) -> future<> {
+        auto uuid = make_table_id();
+        rp_set rps;
+        auto h = co_await write_some(log, uuid);
+        auto id = h.rp().id;
+        rps.put(std::move(h));
+
+        fail_flush = true;
+        bool threw = false;
+        try {
+            co_await log.force_new_active_segment();
+        } catch (...) {
+            threw = true;
+        }
+        BOOST_REQUIRE(threw);
+
+        BOOST_REQUIRE(rec.has(id, true));
+        BOOST_REQUIRE(!rec.has(id, false));
+
+        auto held = log.held_segments();
+        BOOST_REQUIRE(std::ranges::find(held, id) == held.end());
+
+        log.discard_completed_segments(uuid, rps);
+        co_await log.wait_for_pending_deletes();
+    });
+}
+
+// held_bytes() is what the shipper will watch: it counts the closed, held
+// segments, and a release takes its segment back out.
+SEASTAR_TEST_CASE(test_held_bytes_counts_closed_held_segments) {
+    close_recorder rec;
+
+    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+        auto uuid = make_table_id();
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
+
+        auto first = (co_await write_and_seal(log, uuid)).id;
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), rec.find(first)->used_size);
+
+        auto second = (co_await write_and_seal(log, uuid)).id;
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), rec.find(first)->used_size + rec.find(second)->used_size);
+
+        log.release_segment(first);
+        co_await log.wait_for_pending_deletes();
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), rec.find(second)->used_size);
+
+        log.release_segment(second);
+        co_await log.wait_for_pending_deletes();
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
     });
 }
 
