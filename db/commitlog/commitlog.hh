@@ -129,6 +129,11 @@ public:
         std::optional<segment_id_type> base_segment_id;
 
         const db::extensions * extensions = nullptr;
+
+        // Keep every segment from deletion until release_segment() is called
+        // for it. Used by db/pitr, for the main commitlog only; off leaves the
+        // commitlog as it was. Nothing releases the hold on its own.
+        bool hold_segments = false;
     };
 
     struct descriptor {
@@ -312,6 +317,17 @@ public:
      * associated with them
      */
     future<> delete_segments(std::vector<sstring>) const;
+
+    /**
+     * Ids of the segments held from deletion, in creation order. Empty unless
+     * config::hold_segments is set.
+     */
+    std::vector<segment_id_type> held_segments() const;
+
+    /**
+     * Releases the hold on one segment and sweeps. An unheld id is ignored.
+     */
+    void release_segment(segment_id_type);
 
     uint64_t get_total_size() const;
     uint64_t get_buffer_size() const;
