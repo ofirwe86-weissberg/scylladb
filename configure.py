@@ -634,6 +634,7 @@ scylla_tests = set([
     'test/boost/partitioner_test',
     'test/boost/pitr_shipper_test',
     'test/boost/pitr_t_filter_test',
+    'test/boost/pitr_t_parser_test',
     'test/boost/pretty_printers_test',
     'test/boost/radix_tree_test',
     'test/boost/range_tombstone_list_test',
@@ -1197,7 +1198,9 @@ scylla_core = (['message/messaging_service.cc',
                 'db/marshal/type_parser.cc',
                 'db/per_partition_rate_limit_options.cc',
                 'db/pitr/pitr_shipper.cc',
+                'db/pitr/refusal.cc',
                 'db/pitr/t_filter.cc',
+                'db/pitr/t_parser.cc',
                 'db/rate_limiter.cc',
                 'db/row_cache.cc',
                 'db/schema_applier.cc',
@@ -1677,6 +1680,7 @@ pure_boost_tests = set([
     'test/boost/map_difference_test',
     'test/boost/nonwrapping_interval_test',
     'test/boost/observable_test',
+    'test/boost/pitr_t_parser_test',
     'test/boost/wrapping_interval_test',
     'test/boost/range_tombstone_list_test',
     'test/boost/reservoir_sampling_test',
@@ -1877,7 +1881,8 @@ deps['test/boost/linearizing_input_stream_test'] = [
 ]
 deps['test/boost/api_test'] += api
 deps['test/boost/expr_test'] = ['test/boost/expr_test.cc', 'test/lib/expr_test_utils.cc'] + scylla_core + alternator
-deps['test/boost/rate_limiter_test'] = ['test/boost/rate_limiter_test.cc', 'db/rate_limiter.cc', 'utils/rate_limiter.cc']
+deps['test/boost/pitr_t_parser_test'] = ['test/boost/pitr_t_parser_test.cc', 'db/pitr/refusal.cc', 'db/pitr/t_parser.cc']
+deps['test/boost/rate_limiter_test'] =['test/boost/rate_limiter_test.cc', 'db/rate_limiter.cc', 'utils/rate_limiter.cc']
 deps['test/boost/exceptions_optimized_test'] = ['test/boost/exceptions_optimized_test.cc', 'utils/exceptions.cc']
 deps['test/boost/exceptions_fallback_test'] = ['test/boost/exceptions_fallback_test.cc', 'utils/exceptions.cc']
 
