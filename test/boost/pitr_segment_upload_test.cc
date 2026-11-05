@@ -43,8 +43,11 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/shared_future.hh>
 #include <seastar/core/shared_ptr.hh>
 #include <seastar/core/timer.hh>
+#include <seastar/core/when_all.hh>
+#include <seastar/util/later.hh>
 #include <seastar/testing/on_internal_error.hh>
 
 #include "db/pitr/segment_upload.hh"
@@ -620,6 +623,111 @@ struct retry_fixture {
         for (const auto& tracker : trackers) {
             BOOST_REQUIRE_EQUAL(tracker->closes, 1u);
         }
+    }
+};
+
+// Runs several uploads through one limiter, over one segment file, each writing
+// an object of its own.
+//
+// Two control points make what holds a slot observable without any reliance on
+// timing: every call can be held at its opener, which runs only once a slot is
+// granted, and the fake store's live sinks are counted on every put, which is
+// bookkeeping the store does synchronously and no race can inflate.
+struct limiter_fixture : retry_fixture {
+    segment_upload_limiter limiter;
+    std::string content;
+    // Calls that reached their opener, so were granted a slot.
+    unsigned got_a_slot = 0;
+    // Calls sitting at the gate right now.
+    unsigned at_the_gate = 0;
+    // Sinks alive at once, over every put: one upload streams through one sink.
+    unsigned max_open_sinks = 0;
+    bool hold_at_the_opener = true;
+    shared_promise<> gate;
+    // Per call, in start() order.
+    struct call_state {
+        unsigned openers = 0;
+        std::vector<std::exception_ptr> failures;
+        std::vector<std::chrono::milliseconds> backoffs;
+        abort_source* as = nullptr;
+    };
+    std::vector<std::unique_ptr<call_state>> calls;
+    // Called with each failing call's index, after its failure is recorded.
+    std::function<void(unsigned)> on_call_failure;
+
+    explicit limiter_fixture(size_t limit)
+        : limiter(limit) {
+        store.on_put = [this](unsigned) {
+            max_open_sinks = std::max(max_open_sinks, store.sinks_created - store.sinks_closed);
+        };
+    }
+
+    void write_content(size_t size) {
+        content = make_content(size);
+        // No recycled tail: a used size past the content is then too short.
+        write(content, content.size());
+    }
+
+    void release_gate() {
+        hold_at_the_opener = false;
+        gate.set_value();
+    }
+
+    const call_state& call(unsigned id) const {
+        return *calls[id];
+    }
+
+    // Starts one more upload, on `call_as` and of `used_size` bytes, and returns
+    // its future. Each call writes its own object name.
+    future<upload_result> start(abort_source& call_as, std::optional<uint64_t> used_size = std::nullopt) {
+        const auto id = static_cast<unsigned>(calls.size());
+        auto& c = *calls.emplace_back(std::make_unique<call_state>());
+        c.as = &call_as;
+        auto open = [this, &c]() -> future<file> {
+            if (++c.openers == 1) {
+                ++got_a_slot;
+            }
+            if (hold_at_the_opener) {
+                ++at_the_gate;
+                co_await gate.get_shared_future();
+                --at_the_gate;
+            }
+            co_return co_await open_tracked_file();
+        };
+        auto policy = retry_policy{base_backoff, max_backoff, [this, id, &c](std::exception_ptr ex, std::chrono::milliseconds wait) {
+                                       c.failures.push_back(std::move(ex));
+                                       c.backoffs.push_back(wait);
+                                       if (c.backoffs.size() > max_attempts) {
+                                           c.as->request_abort_ex(too_many_attempts());
+                                       } else if (on_call_failure) {
+                                           on_call_failure(id);
+                                       }
+                                   }};
+        return limiter.upload(client, sstables::object_name("bucket", fmt::format("segment-{}", id)), used_size.value_or(content.size()), std::move(open),
+                std::move(policy), call_as);
+    }
+    future<upload_result> start() {
+        return start(as);
+    }
+
+    // An aborted call ends on its own, without ever being granted a slot, so a
+    // wait that ignored the abort fails here rather than hanging in get().
+    static void require_resolved_without_a_slot(future<upload_result>& f) {
+        for (unsigned i = 0; i < 100 && !f.available(); ++i) {
+            seastar::yield().get();
+        }
+        BOOST_REQUIRE(f.available());
+    }
+
+    // Each call needs several task hops to reach its opener or the slot queue,
+    // more in debug builds with their shuffled task queue, so one yield isn't
+    // enough.
+    void wait_settled(unsigned at_gate, size_t waiting) {
+        for (unsigned i = 0; i < 100 && (at_the_gate < at_gate || limiter.waiters() < waiting); ++i) {
+            seastar::yield().get();
+        }
+        BOOST_REQUIRE_EQUAL(at_the_gate, at_gate);
+        BOOST_REQUIRE_EQUAL(limiter.waiters(), waiting);
     }
 };
 
@@ -1379,4 +1487,238 @@ SEASTAR_THREAD_TEST_CASE(test_a_failing_retry_leaves_an_earlier_good_object_in_p
         BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 1u);
         BOOST_REQUIRE(fx.store.stored(object) == first);
     }
+}
+
+// The concurrency bound (issue #8): an outage leaves every sealed segment of a
+// shard in upload_with_retry(), so the number running at once has to be capped.
+
+SEASTAR_THREAD_TEST_CASE(test_no_more_uploads_run_at_once_than_the_limit) {
+    constexpr unsigned limit = 3;
+    constexpr unsigned starts = 10;
+    limiter_fixture fx(limit);
+    fx.write_content(2 * chunk);
+    std::vector<future<upload_result>> calls;
+    for (unsigned i = 0; i < starts; ++i) {
+        calls.push_back(fx.start());
+    }
+    fx.wait_settled(limit, starts - limit);
+    // Three are held at their openers, and the rest never got that far.
+    BOOST_REQUIRE_EQUAL(fx.at_the_gate, limit);
+    BOOST_REQUIRE_EQUAL(fx.got_a_slot, limit);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), starts - limit);
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), 0u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+
+    fx.release_gate();
+    auto results = seastar::when_all(calls.begin(), calls.end()).get();
+    for (auto& res : results) {
+        BOOST_REQUIRE_EQUAL(res.get().bytes_uploaded, fx.content.size());
+    }
+    BOOST_REQUIRE_EQUAL(fx.got_a_slot, starts);
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), starts);
+    BOOST_REQUIRE_LE(fx.max_open_sinks, limit);
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), limit);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_uploads_in_a_backoff_still_hold_their_slots) {
+    // The two failing uploads sleep for an hour, so nothing but their slots can
+    // keep the other three out.
+    constexpr unsigned limit = 2;
+    limiter_fixture fx(limit);
+    fx.hold_at_the_opener = false;
+    fx.base_backoff = std::chrono::hours(1);
+    fx.max_backoff = std::chrono::hours(1);
+    fx.store.fail_first_sinks = limit;
+    shared_promise<> both_failed;
+    unsigned failures = 0;
+    fx.on_call_failure = [&](unsigned) {
+        if (++failures == limit) {
+            both_failed.set_value();
+        }
+    };
+    fx.write_content(2 * chunk);
+    std::vector<future<upload_result>> calls;
+    for (unsigned i = 0; i < 5; ++i) {
+        calls.push_back(fx.start());
+    }
+    both_failed.get_shared_future().get();
+    BOOST_REQUIRE_EQUAL(fx.got_a_slot, limit);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 3u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, limit);
+    BOOST_REQUIRE(fx.store.objects.empty());
+
+    fx.as.request_abort_ex(caller_cancelled());
+    auto results = seastar::when_all(calls.begin(), calls.end()).get();
+    for (auto& res : results) {
+        BOOST_REQUIRE_THROW(res.get(), caller_cancelled);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_waiter_does_not_start_while_the_slot_is_taken) {
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    auto first = fx.start();
+    auto waiter = fx.start();
+    fx.wait_settled(1, 1);
+    BOOST_REQUIRE_EQUAL(fx.call(1).openers, 0u);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 1u);
+    fx.release_gate();
+    first.get();
+    waiter.get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_waiter_starts_as_soon_as_a_slot_frees) {
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    auto first = fx.start();
+    auto waiter = fx.start();
+    fx.release_gate();
+    BOOST_REQUIRE_EQUAL(first.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(waiter.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(fx.call(1).openers, 1u);
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 2u);
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_slot_is_released_on_a_permanent_failure) {
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    // One byte more than the file holds, which is permanent.
+    auto first = fx.start(fx.as, fx.content.size() + 1);
+    auto waiter = fx.start();
+    fx.release_gate();
+    BOOST_REQUIRE_THROW(first.get(), segment_too_short);
+    // The slot came back as the call ended, and went straight to the waiter,
+    // which is no longer queued: a slot leaked here would leave it waiting.
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 0u);
+    BOOST_REQUIRE_EQUAL(waiter.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_slot_is_released_on_an_abort) {
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    abort_source first_as;
+    auto first = fx.start(first_as);
+    auto waiter = fx.start();
+    fx.wait_settled(1, 1);
+    first_as.request_abort_ex(caller_cancelled());
+    fx.release_gate();
+    BOOST_REQUIRE_THROW(first.get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 0u);
+    BOOST_REQUIRE_EQUAL(waiter.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_slot_is_released_when_the_callers_callback_throws) {
+    limiter_fixture fx(1);
+    // The first upload's attempt fails, and its callback then ends the call.
+    fx.store.fail_first_sinks = 1;
+    fx.on_call_failure = [](unsigned id) {
+        if (id == 0) {
+            throw callback_error();
+        }
+    };
+    fx.write_content(chunk);
+    auto first = fx.start();
+    auto waiter = fx.start();
+    fx.release_gate();
+    BOOST_REQUIRE_THROW(first.get(), callback_error);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 0u);
+    BOOST_REQUIRE_EQUAL(waiter.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(fx.limiter.available_slots(), 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_while_waiting_for_a_slot_opens_nothing) {
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    abort_source waiter_as;
+    auto first = fx.start();
+    auto waiter = fx.start(waiter_as);
+    fx.wait_settled(1, 1);
+    waiter_as.request_abort_ex(caller_cancelled());
+    // The caller's own exception, not the semaphore's, and no upload begun.
+    limiter_fixture::require_resolved_without_a_slot(waiter);
+    BOOST_REQUIRE_THROW(waiter.get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.call(1).openers, 0u);
+    BOOST_REQUIRE_EQUAL(fx.got_a_slot, 1u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+    BOOST_REQUIRE(fx.trackers.empty());
+
+    fx.release_gate();
+    BOOST_REQUIRE_EQUAL(first.get().bytes_uploaded, fx.content.size());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_limit_of_one_runs_the_uploads_one_at_a_time) {
+    limiter_fixture fx(1);
+    fx.hold_at_the_opener = false;
+    fx.write_content(3 * chunk);
+    std::vector<future<upload_result>> calls;
+    for (unsigned i = 0; i < 4; ++i) {
+        calls.push_back(fx.start());
+    }
+    auto results = seastar::when_all(calls.begin(), calls.end()).get();
+    for (auto& res : results) {
+        BOOST_REQUIRE_EQUAL(res.get().bytes_uploaded, fx.content.size());
+    }
+    BOOST_REQUIRE_EQUAL(fx.max_open_sinks, 1u);
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 4u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_limit_of_zero_is_raised_so_uploads_still_run) {
+    limiter_fixture fx(0);
+    BOOST_REQUIRE_EQUAL(fx.limiter.max_concurrent_uploads(), 1u);
+    fx.hold_at_the_opener = false;
+    fx.write_content(chunk);
+    BOOST_REQUIRE_EQUAL(fx.start().get().bytes_uploaded, fx.content.size());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_call_that_was_aborted_before_it_waited_reports_its_own_abort) {
+    // With no slot free, the wait itself is where the abort is seen, and there
+    // the semaphore answers with an exception of its own, which the caller
+    // cannot tell its abort from.
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    abort_source waiter_as;
+    waiter_as.request_abort_ex(caller_cancelled());
+    auto first = fx.start();
+    auto waiter = fx.start(waiter_as);
+    limiter_fixture::require_resolved_without_a_slot(waiter);
+    BOOST_REQUIRE_THROW(waiter.get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.call(1).openers, 0u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+
+    fx.release_gate();
+    BOOST_REQUIRE_EQUAL(first.get().bytes_uploaded, fx.content.size());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_plain_abort_while_waiting_for_a_slot_reports_the_abort_source) {
+    // A plain request_abort() carries no exception of the caller's, so the
+    // semaphore answers the wait with semaphore_aborted. The call reports what
+    // the abort source itself carries instead, as the rest of this unit does.
+    limiter_fixture fx(1);
+    fx.write_content(chunk);
+    abort_source waiter_as;
+    auto first = fx.start();
+    auto waiter = fx.start(waiter_as);
+    fx.wait_settled(1, 1);
+    BOOST_REQUIRE_EQUAL(fx.limiter.waiters(), 1u);
+    waiter_as.request_abort();
+    limiter_fixture::require_resolved_without_a_slot(waiter);
+    try {
+        waiter.get();
+        BOOST_FAIL("the waiting call should have been aborted");
+    } catch (const seastar::semaphore_aborted&) {
+        BOOST_FAIL("the semaphore's own exception reached the caller");
+    } catch (const seastar::abort_requested_exception&) {
+        // The abort source's default exception, which is what it carries.
+    }
+    // Nothing was opened or put for the aborted call.
+    BOOST_REQUIRE_EQUAL(fx.call(1).openers, 0u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+    BOOST_REQUIRE(fx.trackers.empty());
+
+    fx.release_gate();
+    BOOST_REQUIRE_EQUAL(first.get().bytes_uploaded, fx.content.size());
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 1u);
 }

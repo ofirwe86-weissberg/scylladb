@@ -206,4 +206,31 @@ future<upload_result> upload_with_retry(sstables::object_storage_client& client,
     }
 }
 
+segment_upload_limiter::segment_upload_limiter(size_t max_concurrent_uploads)
+    : _slots(std::max<size_t>(max_concurrent_uploads, 1))
+    , _limit(std::max<size_t>(max_concurrent_uploads, 1)) {
+}
+
+future<upload_result> segment_upload_limiter::upload(sstables::object_storage_client& client, sstables::object_name name, uint64_t used_size,
+        segment_file_opener open_segment_file, retry_policy policy, abort_source& as) {
+    std::optional<semaphore_units<>> slot;
+    try {
+        slot = co_await get_units(_slots, 1, as);
+    } catch (...) {
+        // An abort through request_abort_ex() during the wait already delivers
+        // the caller's own exception. The semaphore answers with its own
+        // semaphore_aborted for a call aborted before it waited, and for a
+        // plain request_abort(), so the caller's exception is put back in its
+        // place, as it is everywhere else in this file: the caller has to
+        // recognise its own abort.
+        if (as.abort_requested()) {
+            std::rethrow_exception(as.abort_requested_exception_ptr());
+        }
+        throw;
+    }
+    // The slot is held for the whole call, so a segment waiting out a backoff
+    // keeps it, and it is released on every way out of here.
+    co_return co_await upload_with_retry(client, std::move(name), used_size, std::move(open_segment_file), std::move(policy), as);
+}
+
 } // namespace db::pitr
