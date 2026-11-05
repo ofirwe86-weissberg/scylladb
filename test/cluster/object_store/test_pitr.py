@@ -17,12 +17,15 @@ skipped test proves nothing: none of these has run, so none has been seen to fai
 import asyncio
 import json
 import logging
+import os
 import random
 import re
 import shlex
+import threading
 import time
 import uuid
 
+from collections.abc import Mapping, Set as AbstractSet
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, NamedTuple
@@ -32,6 +35,7 @@ import pytest
 
 from cassandra.cluster import ConsistencyLevel
 from cassandra.query import SimpleStatement
+from cassandra.util import SortedSet
 
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace, reconnect_driver, wait_for_cql_and_get_hosts
@@ -46,9 +50,13 @@ logger = logging.getLogger(__name__)
 # Add a phase here when it lands, to enable the tests that need it.
 LANDED_PHASES: tuple[str, ...] = ()
 
+# Each test must fail on a build without the change, so PITR_RUN_SKIPPED=1 runs every test as if its phase had landed. With
+# PITR_DEADLINE_SECONDS=10 as well, a poll of an endpoint that doesn't exist gives up quickly. Neither is for normal runs.
+RUN_SKIPPED = os.environ.get('PITR_RUN_SKIPPED') == '1'
+
 
 def landed(phase: str) -> bool:
-    return phase in LANDED_PHASES
+    return RUN_SKIPPED or phase in LANDED_PHASES
 
 
 def needs_phase(phase: str):
@@ -146,11 +154,12 @@ class Reason:
 
 
 # Words that show a limit or a next action is stated. Lowercase; each is looked for in the lowercased text.
-STATUS_LIMIT_WORDS = ['experimental', 'vnodes', 'tablets']
-RESULT_LIMIT_WORDS = {'limit 3': 'clocks', 'limit 4': 'ttl', 'limit 5': 'newer than t', 'limit 6': "isn't checked",
+STATUS_LIMIT_WORDS = ['experimental', 'vnodes', 'tablets', 'object lock']
+RESULT_LIMIT_WORDS = {'limit 3': 'clocks', 'limit 3, batches': 'batch', 'limit 4': 'ttl', 'limit 5': 'newer than t', 'limit 6': "isn't checked",
                       'limit 15': 'refresh', 'limit 8': 'truncated'}
 WRONG_WAY_BACK = ("Don't load this copy's files into the original unless it's been truncated: "
                   "later deletes in the original still win, and rows stay missing with no error.")
+NOT_VERIFIED_RE = re.compile(r'Not verified: (\d+) collections may differ at this exact T; retry with T one microsecond off\.')
 COPY_NOTICE_WORDS = ['copy', 'production', 'route back', 'own backup']
 SHIPPING_OFF_WORDS = ['node']
 TOPOLOGY_LIMIT_WORDS = {Reason.NODES: 'one node', Reason.RF: 'rf=1'}
@@ -288,13 +297,22 @@ async def get_result(manager, server, ks, new_table) -> Result:
 ####################################################################################################
 
 VNODES_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'enabled': false}"
-DEADLINE_SECONDS = 300
+TABLETS_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}"
+STRONG_KS = TABLETS_KS + " AND tablets = {'initial': 1} AND consistency = 'global'"
+NONDURABLE_KS = VNODES_KS + ' AND durable_writes = false'
+RF2_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'enabled': false}"
+ALTER_KEYSPACE_RF2 = "ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 2}}"
+ALTER_KEYSPACE_RF1_NONDURABLE = ("ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} "
+                                 "AND durable_writes = false")
+PURGEABLE_OPTIONS = "WITH gc_grace_seconds = 0 AND tombstone_gc = {'mode': 'immediate'}"
+DEADLINE_SECONDS = int(os.environ.get('PITR_DEADLINE_SECONDS', 300))
 # The VM's clock steps by up to about 150 ms (docs-work/baseline.md:115-116), so a comparison between a time
 # measured here and one reported by the node has this margin.
 CLOCK_MARGIN_US = 1_000_000
 STEP_US = 1000
-# Absence has no event to poll for, so a check for it watches the bucket for this long: 3 seal intervals, at S = 1 s.
-ABSENCE_WINDOW_SECONDS = 3
+# Absence has no event to poll for, so a check for it watches the bucket for this long: 5 seal intervals, at S = 1 s.
+# T01 requires objects to appear within this time once shipping is on, which is what shows that the window can catch shipping.
+ABSENCE_WINDOW_SECONDS = 5
 THROTTLE_BYTES_PER_SECOND = 128 * 1024
 KILL_ATTEMPTS = 5
 SHARDS = 2                      # test/pylib/scylla_server.py:153
@@ -401,12 +419,12 @@ async def table_exists(cql, ks, table) -> bool:
     return len(list(rows)) > 0
 
 
-async def assert_refused(manager, server, cql, ks, cf, backup, t, reason, watched=(), new_table=None, new_keyspace=None) -> Result:
+async def assert_refused(manager, server, cql, ks, cf, backup, t, reason, watched=(), new_table=None, new_keyspace=None, read_source=True) -> Result:
     """Checks the refusal rules in the requirements' Terms. `watched` are other tables that must read the same."""
     if new_table is None:
         new_table = unique_name('restored_')
     expect_absent = new_keyspace is None and not await table_exists(cql, ks, new_table)
-    tables = [(ks, cf), *[(ks, w) for w in watched]] if not ks.startswith('system') else []
+    tables = [(ks, cf), *[(ks, w) for w in watched]] if read_source and not ks.startswith('system') else []
     before = {w: await read_all(cql, *w) for w in tables}
     result = await run_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace)
     assert result.state == FAILED, f'must be refused: {result}'
@@ -420,6 +438,98 @@ async def assert_refused(manager, server, cql, ks, cf, backup, t, reason, watche
     return result
 
 
+# Scenario setup, shared with test_pitr_helpers.py, which checks it on a build with no PITR.
+
+def unsupported_tables_config(cfg: dict) -> dict:
+    return cfg | {'alternator_port': 8000, 'alternator_write_isolation': 'only_rmw_uses_lwt',
+                  'experimental_features': ['strongly-consistent-tables', 'logstor']}
+
+
+async def create_unsupported_tables(server, cql, ks, tablet_ks, strong_ks, nondurable_ks) -> list[tuple[str, str, str]]:
+    """One table of each kind REF-1 refuses. Returns its keyspace, name and reason code."""
+    alternator = boto3.resource('dynamodb', endpoint_url=f'http://{server.ip_addr}:8000', region_name='us-east-1',
+                                aws_access_key_id='alternator', aws_secret_access_key='secret_pass')
+    await cql.run_async(f'CREATE TABLE {tablet_ks}.t (pk int PRIMARY KEY, v int)')
+    await cql.run_async(f'CREATE TABLE {strong_ks}.t (pk int PRIMARY KEY, v int)')
+    await cql.run_async(f'CREATE TABLE {nondurable_ks}.t (pk int PRIMARY KEY, v int)')
+    await cql.run_async(f'CREATE TABLE {ks}.counters (pk int PRIMARY KEY, c counter)')
+    await cql.run_async(f'CREATE TABLE {ks}.viewed (pk int, ck int, v int, PRIMARY KEY (pk, ck))')
+    await cql.run_async(f'CREATE MATERIALIZED VIEW {ks}.a_view AS SELECT * FROM {ks}.viewed WHERE pk IS NOT NULL AND ck IS NOT NULL PRIMARY KEY (ck, pk)')
+    await cql.run_async(f'CREATE TABLE {ks}.indexed (pk int PRIMARY KEY, v int)')
+    await cql.run_async(f'CREATE INDEX an_index ON {ks}.indexed (v)')
+    await cql.run_async(f"CREATE TABLE {ks}.cdc (pk int PRIMARY KEY, v int) WITH cdc = {{'enabled': true}}")
+    # In a tablet keyspace, as in test_logstor.py. The refusal must still name logstor.
+    await cql.run_async(f"CREATE TABLE {tablet_ks}.logstor (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
+    await asyncio.to_thread(alternator.create_table, TableName='alt', BillingMode='PAY_PER_REQUEST', KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
+                            AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
+                            Tags=[{'Key': 'system:initial_tablets', 'Value': 'none'}])
+    return [(tablet_ks, 't', Reason.TABLETS), (strong_ks, 't', Reason.STRONG), (nondurable_ks, 't', Reason.DURABLE),
+            (ks, 'counters', Reason.COUNTERS), (ks, 'viewed', Reason.VIEW_BASE), (ks, 'a_view', Reason.VIEW_TABLE),
+            (ks, 'indexed', Reason.INDEXED), (ks, 'an_index_index', Reason.INDEX_TABLE),
+            (ks, 'cdc', Reason.CDC), (ks, 'cdc_scylla_cdc_log', Reason.CDC), (tablet_ks, 'logstor', Reason.LOGSTOR),
+            ('system', 'local', Reason.SYSTEM), ('system_schema', 'tables', Reason.SYSTEM), ('alternator_alt', 'alt', Reason.ALTERNATOR)]
+
+
+async def create_rich_table(cql, ks) -> tuple[str, list[str]]:
+    """Table src with non-default options, a UDT, a static and a dropped column, and one row. Returns its DESCRIBE and its rows."""
+    await cql.run_async(f'CREATE TYPE {ks}.addr (street text, zip int)')
+    await cql.run_async(f'''CREATE TABLE {ks}.src (pk int, ck int, v text, a frozen<addr>, gone int, s int static, PRIMARY KEY (pk, ck))
+        WITH CLUSTERING ORDER BY (ck DESC) AND comment = 'pitr' AND gc_grace_seconds = 1234
+        AND compaction = {{'class': 'LeveledCompactionStrategy'}} AND compression = {{'sstable_compression': 'DeflateCompressor'}}''')
+    old = now_us() - 3600_000_000
+    await cql.run_async(f"INSERT INTO {ks}.src (pk, ck, v, a, gone, s) VALUES (1, 1, 'x', {{street: 'y', zip: 2}}, 3, 4) USING TIMESTAMP {old}")
+    await cql.run_async(f'ALTER TABLE {ks}.src DROP gone')
+    return (await cql.run_async(f'DESCRIBE TABLE {ks}.src'))[0].create_statement, await read_all(cql, ks, 'src')
+
+
+SCHEMA_CHANGES = ['TABLE {ks}.t ADD added int', 'TABLE {ks}.t DROP w', "TABLE {ks}.t WITH comment = 'changed'", 'TYPE {ks}.addr ADD extra int']
+
+
+def schema_change_statement(change: str, ks: str) -> str:
+    return 'ALTER ' + change.format(ks=ks)
+
+
+async def create_alterable_table(cql, ks):
+    await cql.run_async(f'CREATE TYPE IF NOT EXISTS {ks}.addr (zip int)')
+    await cql.run_async(f'CREATE TABLE {ks}.t (pk int, ck int, v text, w int, a frozen<addr>, PRIMARY KEY (pk, ck))')
+
+
+async def write_and_purge(manager, server, cql, ks):
+    """Row 1 written and deleted, row 2 written, in table purged. Returns once row 1 and its tombstone are out of the data."""
+    ts = now_us() - 3600_000_000
+    await apply(cql, ks, 'purged', simple_rows([1, 2], ts))
+    await cql.run_async(f'DELETE FROM {ks}.purged USING TIMESTAMP {ts + 1} WHERE pk = 1')
+    await manager.api.keyspace_flush(server.ip_addr, ks, 'purged')
+    # A tombstone can't be purged in the second it was written, so compaction is repeated until it's gone.
+    # If it never goes, the case would prove nothing, and the wait fails.
+    async def purged():
+        await manager.api.keyspace_compaction(server.ip_addr, ks, 'purged')
+        fragments = await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.purged)')
+        return True if {f.pk for f in fragments} == {2} else None
+    await wait_for(purged, deadline())
+    return ts
+
+
+async def conditional_history(cql, ks) -> list:
+    """Conditional writes on table t, one not applied. A conditional write can't choose its timestamp, so this returns
+    plain statements with the timestamps the table reports."""
+    async def conditional(statement, row, value, applied=True):
+        rows = await cql.run_async(statement)
+        assert rows[0][0] is applied, f'{statement}: {rows}'
+        pk, ck = row
+        written = await cql.run_async(f'SELECT WRITETIME(v) FROM {ks}.t WHERE pk = {pk} AND ck = {ck}')
+        return W(written[0][0], f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, {ck}, '{value}') USING TIMESTAMP {{ts}}")
+
+    first = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'first') IF NOT EXISTS", (1, 0), 'first')
+    await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'lost') IF NOT EXISTS", (1, 0), 'first', applied=False)
+    second = await conditional(f"UPDATE {ks}.t SET v = 'second' WHERE pk = 1 AND ck = 0 IF v = 'first'", (1, 0), 'second')
+    other = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (2, 0, 'other') IF NOT EXISTS", (2, 0), 'other')
+    # Only writes to one partition are ordered. The other partition's write has a timestamp of its own, from its own shard's
+    # clock, which steps on this VM. A repeat saw it below the second write.
+    assert first.ts < second.ts, [first, second]
+    return [first, second, other]
+
+
 # Statements, and the independent answer for "exact at T".
 
 class W(NamedTuple):
@@ -428,28 +538,40 @@ class W(NamedTuple):
 
 
 class Batch(NamedTuple):
+    """Parts with different timestamps. The requirements merge a batch first, so a value the batch itself overwrote doesn't count as
+    written. `merged` says by hand which parts survive that, when it isn't all of them."""
     parts: list[W]
+    merged: list[W] | None = None
 
 
 async def apply(cql, ks, table, statements, t=None):
-    """Applies statements in order. With T, it applies them minus every one with a timestamp above T,
-    splitting batches, which is the requirements' definition of exact at T."""
+    """Applies statements in order. With T, it applies them minus every one with a timestamp above T, merging
+    each batch and then splitting it, which is the requirements' definition of exact at T."""
     def text(w):
         return w.cql.format(t=f'{ks}.{table}', ts=w.ts)
     for s in statements:
         if isinstance(s, Batch):
-            parts = [w for w in s.parts if t is None or w.ts <= t]
             if t is None:
-                await cql.run_async('BEGIN UNLOGGED BATCH ' + '; '.join(text(w) for w in parts) + ' APPLY BATCH')
+                await cql.run_async('BEGIN UNLOGGED BATCH ' + '; '.join(text(w) for w in s.parts) + ' APPLY BATCH')
             else:
-                for w in parts:
-                    await cql.run_async(text(w))
+                for w in s.parts if s.merged is None else s.merged:
+                    if w.ts <= t:
+                        await cql.run_async(text(w))
         elif t is None or s.ts <= t:
             await cql.run_async(text(s))
 
 
+def _plain(value):
+    """A collection as a sorted list, so that an answer doesn't depend on the driver's types."""
+    if isinstance(value, Mapping):
+        return sorted(value.items())
+    if isinstance(value, (AbstractSet, SortedSet)):
+        return sorted(value)
+    return value
+
+
 async def read_exact(cql, ks, table) -> list[str]:
-    return sorted(repr(tuple(r)) for r in await cql.run_async(f'SELECT {EXACT_COLUMNS} FROM {ks}.{table}'))
+    return sorted(repr(tuple(_plain(v) for v in r)) for r in await cql.run_async(f'SELECT {EXACT_COLUMNS} FROM {ks}.{table}'))
 
 
 async def expected_at(cql, ks, statements, t, table_options='') -> list[str]:
@@ -501,6 +623,26 @@ def change_statements(pks, base) -> tuple[list, dict[str, int]]:
         out.append(W(ts['tie'], f"DELETE FROM {{t}} USING TIMESTAMP {{ts}} WHERE pk = {pk} AND ck = 30"))
         out.append(W(ts['last'], f"UPDATE {{t}} USING TIMESTAMP {{ts}} SET w = 99 WHERE pk = {pk} AND ck = 25"))
     return out, ts
+
+
+def collection_edge_statements(pks, seed_ts, base) -> tuple[list, list, dict[str, int]]:
+    """The cases limit 3 names, one row each. ck 0: a collection overwrite. ck 1: an empty overwrite. ck 2: a delete batched with an
+    element 1 microsecond later. ck 3 and ck 4: a batch that overwrites its own cell, and its own collection element."""
+    ts = {'overwrite': base + 1000, 'empty': base + 2000, 'delete': base + 3000, 'added': base + 3001, 'low': base + 4000, 'high': base + 5000}
+    seed, changes = [], []
+    for pk in pks:
+        for ck in range(5):
+            seed.append(W(seed_ts, f"UPDATE {{t}} USING TIMESTAMP {{ts}} SET v = 'seed', m = {{{{1: 'a', 2: 'b'}}}} WHERE pk = {pk} AND ck = {ck}"))
+        changes.append(W(ts['overwrite'], f"UPDATE {{t}} USING TIMESTAMP {{ts}} SET m = {{{{2: 'over'}}}} WHERE pk = {pk} AND ck = 0"))
+        changes.append(W(ts['empty'], f"UPDATE {{t}} USING TIMESTAMP {{ts}} SET m = {{{{}}}} WHERE pk = {pk} AND ck = 1"))
+        changes.append(Batch([W(ts['delete'], f"DELETE m FROM {{t}} USING TIMESTAMP {ts['delete']} WHERE pk = {pk} AND ck = 2"),
+                              W(ts['added'], f"UPDATE {{t}} USING TIMESTAMP {ts['added']} SET m[2] = 'added' WHERE pk = {pk} AND ck = 2")]))
+        cell_kept = W(ts['high'], f"UPDATE {{t}} USING TIMESTAMP {ts['high']} SET v = 'kept' WHERE pk = {pk} AND ck = 3")
+        element_kept = W(ts['high'], f"UPDATE {{t}} USING TIMESTAMP {ts['high']} SET m[1] = 'kept' WHERE pk = {pk} AND ck = 4")
+        changes.append(Batch([W(ts['low'], f"UPDATE {{t}} USING TIMESTAMP {ts['low']} SET v = 'overwritten' WHERE pk = {pk} AND ck = 3"), cell_kept,
+                              W(ts['low'], f"UPDATE {{t}} USING TIMESTAMP {ts['low']} SET m[1] = 'overwritten' WHERE pk = {pk} AND ck = 4"), element_kept],
+                             merged=[cell_kept, element_kept]))
+    return seed, changes, ts
 
 
 def simple_rows(pks, ts, value='x') -> list[W]:
@@ -663,16 +805,22 @@ async def delete_object(storage, key):
 
 
 class GatedStore:
-    """The store behind a TCP pass-through which the test can cut, for store failures from outside. Nothing in
-    test/pylib can make a store fail on demand: s3_proxy.py only injects random retryable errors for a whole
-    run. It carries bytes unchanged, so it knows nothing about the protocol."""
+    """The store behind a TCP pass-through which the test can cut or slow, for store failures from outside. Nothing in
+    test/pylib can make a store fail on demand: s3_proxy.py only injects random retryable errors for a whole run. It
+    carries bytes unchanged, so it knows nothing about the protocol.
+
+    It has a thread and an event loop of its own. It has to outlive the test's event loop, because the node keeps using
+    the store until the cluster is torn down, and a blocking call in a test mustn't stall the store."""
     def __init__(self, storage):
         self._storage = storage
         self.port = None
         self.down = False
+        self.connections = 0
         self._server = None
         self._conns = set()
         self._rate = None
+        self._loop = None
+        self._thread = None
 
     def __getattr__(self, name):
         return getattr(self._storage, name)
@@ -684,19 +832,44 @@ class GatedStore:
     def create_endpoint_conf(self):
         return create_conf(self.address, self._storage.region)
 
-    async def start(self):
-        self._server = await asyncio.start_server(self._serve, self._storage.ip, 0)
-        self.port = self._server.sockets[0].getsockname()[1]
+    def start(self):
+        listening = threading.Event()
 
-    async def stop(self):
+        def run():
+            self._loop = asyncio.new_event_loop()
+
+            async def listen():
+                self._server = await asyncio.start_server(self._serve, self._storage.ip, 0)
+                self.port = self._server.sockets[0].getsockname()[1]
+                listening.set()
+            self._loop.run_until_complete(listen())
+            self._loop.run_forever()
+            pending = asyncio.all_tasks(self._loop)
+            for task in pending:
+                task.cancel()
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.close()
+        self._thread = threading.Thread(target=run, daemon=True, name='GatedStore')
+        self._thread.start()
+        assert listening.wait(30), 'the gate did not start'
+
+    def stop(self):
         self.fail()
-        self._server.close()
 
-    def fail(self):
-        self.down = True
+        def close():
+            self._server.close()
+            self._loop.stop()
+        self._loop.call_soon_threadsafe(close)
+        self._thread.join(30)
+
+    def _abort_connections(self):
         for w in self._conns:
             w.transport.abort()
         self._conns.clear()
+
+    def fail(self):
+        self.down = True
+        self._loop.call_soon_threadsafe(self._abort_connections)
 
     def throttle(self, bytes_per_second):
         """Slows every connection, so that the test can see an upload or restore running, and act on it."""
@@ -710,6 +883,7 @@ class GatedStore:
         if self.down:
             writer.transport.abort()
             return
+        self.connections += 1
         self._conns.add(writer)
         up_reader, up_writer = await asyncio.open_connection(self._storage.ip, self._storage.port)
         # A cut can land while the connection above opens. It must not survive that.
@@ -737,9 +911,9 @@ class GatedStore:
 
 
 @pytest.fixture
-async def gated_store(s3_storage, scylla_cluster_teardowns) -> GatedStore:
+def gated_store(s3_storage, scylla_cluster_teardowns) -> GatedStore:
     gate = GatedStore(s3_storage)
-    await gate.start()
+    gate.start()
     scylla_cluster_teardowns.append(gate.stop)
     return gate
 
@@ -776,7 +950,7 @@ async def test_shipping_off_by_default_then_on(manager: ScyllaClusterManager, s3
         await apply(cql, ks, 't1', simple_rows([20], now_us() - 3600_000_000))
         async def something_shipped():
             return True if await objects_of(s3_storage, SHIPPING_PREFIX) else None
-        await wait_for(something_shipped, deadline())
+        await wait_for(something_shipped, time.time() + ABSENCE_WINDOW_SECONDS)
         if not landed('1.3'):
             return      # the rest needs backup and restore
 
@@ -1047,8 +1221,8 @@ async def test_status_answers_for_each_table_state(manager: ScyllaClusterManager
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, VNODES_KS) as ks, \
-               new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as tablet_ks, \
-               new_test_keyspace(manager, VNODES_KS + ' AND durable_writes = false') as nondurable_ks:
+               new_test_keyspace(manager, TABLETS_KS) as tablet_ks, \
+               new_test_keyspace(manager, NONDURABLE_KS) as nondurable_ks:
         for cf in ('protected', 'unbacked'):
             await cql.run_async(f'CREATE TABLE {ks}.{cf} {TABLE_SCHEMA}')
         await cql.run_async(f'CREATE TABLE {ks}.viewed (pk int, ck int, v int, PRIMARY KEY (pk, ck))')
@@ -1090,7 +1264,7 @@ async def test_coverage_advances_with_idle_shards(manager: ScyllaClusterManager,
     """T09, LVL-1. Covered-through passes a single-key write, with the other shard idle, then keeps moving with no writes at all,
     while stored bytes grow by under 4 KiB per shard per seal interval.
 
-    The time taken is logged, not gated: the S + U bound is a developer test (req:81)."""
+    The time taken is logged, not gated: the S + U bound is a developer test (req:82)."""
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, VNODES_KS) as ks:
@@ -1213,6 +1387,7 @@ async def test_exact_at_every_boundary_of_t(manager: ScyllaClusterManager, objec
                  'range_delete_minus_1': ts['range_delete'] - 1,
                  'range_delete_equal': ts['range_delete'],
                  'range_delete_plus_1': ts['range_delete'] + 1,
+                 'map_overwrite_minus_1': ts['map_overwrite'] - 1,
                  'batch_split': ts['batch_low'],
                  'tie': ts['tie'],
                  'interval_end': end}
@@ -1274,23 +1449,12 @@ async def test_deleted_row_stays_deleted(manager: ScyllaClusterManager, s3_stora
     """T13, RST-3. Purged before the backup, grace expired by the restore, truncated before the backup, and compaction during the restore."""
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
-    opts = "WITH gc_grace_seconds = 0 AND tombstone_gc = {'mode': 'immediate'}"
     async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.purged {TABLE_SCHEMA} {opts}')
-        await cql.run_async(f'CREATE TABLE {ks}.truncated {TABLE_SCHEMA} {opts}')
+        await cql.run_async(f'CREATE TABLE {ks}.purged {TABLE_SCHEMA} {PURGEABLE_OPTIONS}')
+        await cql.run_async(f'CREATE TABLE {ks}.truncated {TABLE_SCHEMA} {PURGEABLE_OPTIONS}')
 
         # Shipped, then purged, then backed up: only the shipped log still knows about row 1.
-        ts = now_us() - 3600_000_000
-        await apply(cql, ks, 'purged', simple_rows([1, 2], ts))
-        await cql.run_async(f'DELETE FROM {ks}.purged USING TIMESTAMP {ts + 1} WHERE pk = 1')
-        await manager.api.keyspace_flush(server.ip_addr, ks, 'purged')
-        # A tombstone can't be purged in the second it was written, so compaction is repeated until it's gone.
-        # If it never goes, this case would prove nothing, and the wait fails.
-        async def purged():
-            await manager.api.keyspace_compaction(server.ip_addr, ks, 'purged')
-            fragments = await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.purged)')
-            return True if {f.pk for f in fragments} == {2} else None
-        await wait_for(purged, deadline())
+        ts = await write_and_purge(manager, server, cql, ks)
 
         await apply(cql, ks, 'truncated', simple_rows([1, 2], ts))
         await cql.run_async(f'TRUNCATE TABLE {ks}.truncated')
@@ -1363,15 +1527,7 @@ async def test_new_table_has_schema_of_the_backup(manager: ScyllaClusterManager,
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TYPE {ks}.addr (street text, zip int)')
-        await cql.run_async(f'''CREATE TABLE {ks}.src (pk int, ck int, v text, a frozen<addr>, gone int, s int static, PRIMARY KEY (pk, ck))
-            WITH CLUSTERING ORDER BY (ck DESC) AND comment = 'pitr' AND gc_grace_seconds = 1234
-            AND compaction = {{'class': 'LeveledCompactionStrategy'}} AND compression = {{'sstable_compression': 'DeflateCompressor'}}''')
-        old = now_us() - 3600_000_000
-        await cql.run_async(f"INSERT INTO {ks}.src (pk, ck, v, a, gone, s) VALUES (1, 1, 'x', {{street: 'y', zip: 2}}, 3, 4) USING TIMESTAMP {old}")
-        await cql.run_async(f'ALTER TABLE {ks}.src DROP gone')
-        describe = (await cql.run_async(f'DESCRIBE TABLE {ks}.src'))[0].create_statement
-        rows = await read_all(cql, ks, 'src')
+        describe, rows = await create_rich_table(cql, ks)
         backup = await protect_table(manager, server, s3_storage, ks, 'src')
         t = await wait_covered(manager, server, ks, 'src')
 
@@ -1466,42 +1622,20 @@ async def test_refuse_unsupported_tables(manager: ScyllaClusterManager, s3_stora
     """T18, REF-1. One node, one refusal per kind, all codes different, and the supported control is accepted.
 
     Folded into one node for cost. Failures are collected so that one doesn't hide the rest."""
-    server = await manager.server_add(config=node_config(s3_storage, alternator_port=8000, alternator_write_isolation='only_rmw_uses_lwt',
-                                                         experimental_features=['strongly-consistent-tables', 'logstor']))
+    server = await manager.server_add(config=unsupported_tables_config(node_config(s3_storage)))
     cql = manager.get_cql()
-    alternator = boto3.resource('dynamodb', endpoint_url=f'http://{server.ip_addr}:8000', region_name='us-east-1',
-                                              aws_access_key_id='alternator', aws_secret_access_key='secret_pass')
     async with new_test_keyspace(manager, VNODES_KS) as ks, \
-               new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}") as tablet_ks, \
-               new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} "
-                                          "AND tablets = {'initial': 1} AND consistency = 'global'") as strong_ks, \
-               new_test_keyspace(manager, VNODES_KS + ' AND durable_writes = false') as nondurable_ks:
+               new_test_keyspace(manager, TABLETS_KS) as tablet_ks, \
+               new_test_keyspace(manager, STRONG_KS) as strong_ks, \
+               new_test_keyspace(manager, NONDURABLE_KS) as nondurable_ks:
         await cql.run_async(f'CREATE TABLE {ks}.supported {TABLE_SCHEMA}')
-        await cql.run_async(f'CREATE TABLE {tablet_ks}.t (pk int PRIMARY KEY, v int)')
-        await cql.run_async(f'CREATE TABLE {strong_ks}.t (pk int PRIMARY KEY, v int)')
-        await cql.run_async(f'CREATE TABLE {nondurable_ks}.t (pk int PRIMARY KEY, v int)')
-        await cql.run_async(f'CREATE TABLE {ks}.counters (pk int PRIMARY KEY, c counter)')
-        await cql.run_async(f'CREATE TABLE {ks}.viewed (pk int, ck int, v int, PRIMARY KEY (pk, ck))')
-        await cql.run_async(f'CREATE MATERIALIZED VIEW {ks}.a_view AS SELECT * FROM {ks}.viewed WHERE pk IS NOT NULL AND ck IS NOT NULL PRIMARY KEY (ck, pk)')
-        await cql.run_async(f'CREATE TABLE {ks}.indexed (pk int PRIMARY KEY, v int)')
-        await cql.run_async(f'CREATE INDEX an_index ON {ks}.indexed (v)')
-        await cql.run_async(f"CREATE TABLE {ks}.cdc (pk int PRIMARY KEY, v int) WITH cdc = {{'enabled': true}}")
-        # In a tablet keyspace, as in test_logstor.py. The refusal must still name logstor.
-        await cql.run_async(f"CREATE TABLE {tablet_ks}.logstor (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
-        alternator.create_table(TableName='alt', BillingMode='PAY_PER_REQUEST', KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
-                                AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
-                                Tags=[{'Key': 'system:initial_tablets', 'Value': 'none'}])
-
-        cases = [(tablet_ks, 't', Reason.TABLETS), (strong_ks, 't', Reason.STRONG), (nondurable_ks, 't', Reason.DURABLE),
-                 (ks, 'counters', Reason.COUNTERS), (ks, 'viewed', Reason.VIEW_BASE), (ks, 'a_view', Reason.VIEW_TABLE),
-                 (ks, 'indexed', Reason.INDEXED), (ks, 'an_index_index', Reason.INDEX_TABLE),
-                 (ks, 'cdc', Reason.CDC), (ks, 'cdc_scylla_cdc_log', Reason.CDC), (tablet_ks, 'logstor', Reason.LOGSTOR),
-                 ('system', 'local', Reason.SYSTEM), ('system_schema', 'tables', Reason.SYSTEM), ('alternator_alt', 'alt', Reason.ALTERNATOR)]
+        cases = await create_unsupported_tables(server, cql, ks, tablet_ks, strong_ks, nondurable_ks)
         assert len({c[2] for c in cases}) == len(cases) - 2, 'each kind of table has its own code'
         failures = []
         for k, cf, reason in cases:
             try:
-                await assert_refused(manager, server, cql, k, cf, 'any_backup', now_us(), reason)
+                # A strongly consistent table can't be scanned, so whether it stays the same isn't checked.
+                await assert_refused(manager, server, cql, k, cf, 'any_backup', now_us(), reason, read_source=k != strong_ks)
             except AssertionError as e:
                 failures.append(f'{k}.{cf}: {e}')
         assert not failures, '\n'.join(failures)
@@ -1517,8 +1651,7 @@ async def test_refuse_more_than_one_node_or_rf(manager: ScyllaClusterManager, s3
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
     rf = 2 if case == 'rf_at_creation' else 1
-    opts = f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {rf}}} AND tablets = {{'enabled': false}}"
-    async with new_test_keyspace(manager, opts) as ks:
+    async with new_test_keyspace(manager, RF2_KS if rf == 2 else VNODES_KS) as ks:
         await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
         if rf == 1:     # writes use LOCAL_QUORUM, which a single node can't meet at RF 2
             await apply(cql, ks, 't', simple_rows(range(4), now_us() - 3600_000_000))
@@ -1530,7 +1663,7 @@ async def test_refuse_more_than_one_node_or_rf(manager: ScyllaClusterManager, s3
             t = now_us()
         reason = Reason.RF
         if case == 'rf_altered':
-            await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 2}}")
+            await cql.run_async(ALTER_KEYSPACE_RF2.format(ks=ks))
         elif case == 'node_added':
             await manager.server_add(config=node_config(s3_storage))
             reason = Reason.NODES
@@ -1710,8 +1843,7 @@ async def test_refuse_backup_with_unfinished_upload(manager: ScyllaClusterManage
         await restore_ok(manager, server, ks, 't', cut, await wait_covered(manager, server, ks, 't'), unique_name('restored_'))
 
 
-@pytest.mark.parametrize('change', ['TABLE {ks}.t ADD added int', 'TABLE {ks}.t DROP w', "TABLE {ks}.t WITH comment = 'changed'",
-                                    'TYPE {ks}.addr ADD extra int'],
+@pytest.mark.parametrize('change', SCHEMA_CHANGES,
                          ids=['add_column', 'drop_column', 'option', 'udt_it_uses'])
 @needs_phase('1.3')
 async def test_refuse_schema_change_in_window(manager: ScyllaClusterManager, s3_storage, change):
@@ -1719,15 +1851,14 @@ async def test_refuse_schema_change_in_window(manager: ScyllaClusterManager, s3_
     server = await manager.server_add(config=node_config(s3_storage))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TYPE {ks}.addr (zip int)')
-        await cql.run_async(f'CREATE TABLE {ks}.t (pk int, ck int, v text, w int, a frozen<addr>, PRIMARY KEY (pk, ck))')
+        await create_alterable_table(cql, ks)
         await apply(cql, ks, 't', simple_rows(range(4), now_us() - 3600_000_000))
         describe = (await cql.run_async(f'DESCRIBE TABLE {ks}.t'))[0].create_statement
         backup = await protect_table(manager, server, s3_storage, ks, 't')
         before_change = await wait_covered(manager, server, ks, 't')
 
         low = now_us()
-        await cql.run_async('ALTER ' + change.format(ks=ks))
+        await cql.run_async(schema_change_statement(change, ks))
         high = now_us()
         after_change = await wait_covered(manager, server, ks, 't')
 
@@ -1886,19 +2017,8 @@ async def test_table_with_conditional_writes_is_accepted(manager: ScyllaClusterM
         await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
         backup = await protect_table(manager, server, s3_storage, ks, 't')
 
-        async def conditional(statement, row, value, applied=True):
-            rows = await cql.run_async(statement)
-            assert rows[0][0] is applied, f'{statement}: {rows}'
-            pk, ck = row
-            written = await cql.run_async(f'SELECT WRITETIME(v) FROM {ks}.t WHERE pk = {pk} AND ck = {ck}')
-            return W(written[0][0], f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, {ck}, '{value}') USING TIMESTAMP {{ts}}")
-
-        first = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'first') IF NOT EXISTS", (1, 0), 'first')
-        await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'lost') IF NOT EXISTS", (1, 0), 'first', applied=False)
-        second = await conditional(f"UPDATE {ks}.t SET v = 'second' WHERE pk = 1 AND ck = 0 IF v = 'first'", (1, 0), 'second')
-        other = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (2, 0, 'other') IF NOT EXISTS", (2, 0), 'other')
-        history = [first, second, other]
-        assert first.ts < second.ts < other.ts, history
+        history = await conditional_history(cql, ks)
+        first, second, _ = history
         latest = await wait_covered(manager, server, ks, 't')
 
         for t in (first.ts, second.ts - 1, second.ts, latest):
@@ -2048,6 +2168,59 @@ async def test_schema_change_elsewhere_isnt_a_change_to_this_table(manager: Scyl
         await restore_ok(manager, server, ks, 't', backup.name, latest, new)
         await assert_exact(cql, ks, new, seed, latest)
 
-        await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} "
-                            "AND durable_writes = false")
+        await cql.run_async(ALTER_KEYSPACE_RF1_NONDURABLE.format(ks=ks))
         await assert_refused(manager, server, cql, ks, 't', backup.name, latest, Reason.DURABLE)
+
+
+@needs_phase('1.3')
+async def test_collections_and_batches_at_exact_t(manager: ScyllaClusterManager, s3_storage):
+    """T34, RST-2, RST-7. The cases of limit 3: at the exact T where a collection's overwrite can't be told from a delete, restore gives done and
+    counts it as not verified. One microsecond either side it's exact, with nothing counted. A batch that overwrites its own cell keeps only
+    the merged result."""
+    server = await manager.server_add(config=node_config(s3_storage))
+    cql = manager.get_cql()
+    pks = list(range(8))
+    async with new_test_keyspace(manager, VNODES_KS) as ks:
+        await cql.run_async(f'CREATE TABLE {ks}.src {TABLE_SCHEMA}')
+        backup_seed, _, _ = collection_edge_statements(pks, now_us() - 3600_000_000, 0)
+        await apply(cql, ks, 'src', backup_seed)
+        await assert_every_shard(cql, ks, 'src', pks)
+        backup = await protect_table(manager, server, s3_storage, ks, 'src')
+        _, changes, ts = collection_edge_statements(pks, 0, backup.start_us)
+        await apply(cql, ks, 'src', changes)
+        await wait_covered(manager, server, ks, 'src')
+        history = backup_seed + changes
+
+        # T, the row that may differ at that T, and whether collections are counted there. The overwrite is exact although it's counted (RST-2).
+        cases = [(ts['overwrite'] - 2, None, False), (ts['overwrite'] - 1, None, True), (ts['overwrite'], None, False),
+                 (ts['empty'] - 2, None, False), (ts['empty'] - 1, 1, True), (ts['empty'], None, False),
+                 (ts['delete'] - 1, None, False), (ts['delete'], 2, True), (ts['added'], None, False),
+                 (ts['low'], None, False), (ts['high'] - 1, None, False), (ts['high'], None, False)]
+        got = {}
+        for t, may_differ, counted in cases:
+            new = unique_name('restored_')
+            result = await restore_ok(manager, server, ks, 'src', backup.name, t, new)
+            expected = await expected_at(cql, ks, history, t)
+            actual = await read_exact(cql, ks, new)
+            got[t] = expected
+
+            def fixed(rows):
+                return [row for row in rows if may_differ is None or f', {may_differ}, ' not in row[:12]]
+            assert fixed(actual) == fixed(expected), f'not exact at {iso(t)}'
+            if may_differ is not None:
+                for pk in pks:
+                    rows = await cql.run_async(f'SELECT m FROM {ks}.{new} WHERE pk = {pk} AND ck = {may_differ}')
+                    assert len(rows) == 1 and _plain(rows[0][0]) in (None, [(1, 'a'), (2, 'b')]), f'{pk}, {may_differ} at {iso(t)}: {rows}'
+            if landed('1.4'):
+                found = NOT_VERIFIED_RE.search(result.notices)
+                if counted:
+                    assert found and int(found.group(1)) == len(pks), f'at {iso(t)}: {result.notices}'
+                else:
+                    assert not found, f'at {iso(t)}: {result.notices}'
+
+        # If T weren't deciding these, the cases above would prove nothing.
+        assert got[ts['overwrite'] - 1] != got[ts['overwrite']]
+        assert got[ts['empty'] - 1] != got[ts['empty']]
+        assert got[ts['delete'] - 1] != got[ts['delete']] != got[ts['added']]
+        assert got[ts['high'] - 1] != got[ts['high']]
+        assert got[ts['low']] == got[ts['high'] - 1], 'T between the timestamps of a batch must not recover what the batch overwrote'
