@@ -213,6 +213,8 @@ add_scylla_test(observable_test
   KIND BOOST)
 add_scylla_test(partitioner_test
   KIND SEASTAR)
+add_scylla_test(pitr_apply_to_target_test
+  KIND SEASTAR)
 add_scylla_test(pitr_replay_reader_test
   KIND SEASTAR)
 add_scylla_test(pitr_shipper_test
