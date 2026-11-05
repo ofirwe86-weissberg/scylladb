@@ -131,6 +131,14 @@ void check_position(const db::replay_position& rp, std::string_view what, unsign
     }
 }
 
+// A bound left at the default position is a bound nobody set, and it would silently replay everything. No shard can mean
+// it: a segment id starts at 1, so no position of a shipped segment is the default, on shard 0 as on any other.
+void check_bound_is_set(const db::replay_position& bound, unsigned shard) {
+    if (bound == db::replay_position()) {
+        throw invalid_replay_input(fmt::format("pitr: the bound of shard {} is the default position, which would replay every entry", shard));
+    }
+}
+
 // The mappings seen so far, by schema version. An entry carries its version's
 // column mapping only when the segment had forgotten the version, which the
 // commitlog does per chunk, so an entry that survives the filters may well not
@@ -195,6 +203,7 @@ future<> consume_entry(const shard_replay_params& params, const shipped_segment&
 
 future<replay_reader_stats> replay_shard_segments(const shard_replay_params& params, replay_consumer consume) {
     check_position(params.bound, "bound", params.shard);
+    check_bound_is_set(params.bound, params.shard);
     check_position(params.truncate_floor, "truncation floor", params.shard);
 
     replay_reader_stats stats;
