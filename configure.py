@@ -632,6 +632,7 @@ scylla_tests = set([
     'test/boost/object_storage_upload_test',
     'test/boost/observable_test',
     'test/boost/partitioner_test',
+    'test/boost/pitr_ledger_entry_test',
     'test/boost/pitr_shipper_test',
     'test/boost/pitr_t_filter_test',
     'test/boost/pretty_printers_test',
@@ -1196,6 +1197,7 @@ scylla_core = (['message/messaging_service.cc',
                 'db/large_data_handler.cc',
                 'db/marshal/type_parser.cc',
                 'db/per_partition_rate_limit_options.cc',
+                'db/pitr/ledger_entry.cc',
                 'db/pitr/pitr_shipper.cc',
                 'db/pitr/t_filter.cc',
                 'db/rate_limiter.cc',
@@ -1677,6 +1679,7 @@ pure_boost_tests = set([
     'test/boost/map_difference_test',
     'test/boost/nonwrapping_interval_test',
     'test/boost/observable_test',
+    'test/boost/pitr_ledger_entry_test',
     'test/boost/wrapping_interval_test',
     'test/boost/range_tombstone_list_test',
     'test/boost/reservoir_sampling_test',
@@ -1847,6 +1850,7 @@ deps['test/boost/bytes_ostream_test'] = [
     "utils/dynamic_bitset.cc",
     "test/lib/log.cc",
 ]
+deps['test/boost/pitr_ledger_entry_test'] = ['test/boost/pitr_ledger_entry_test.cc', 'db/pitr/ledger_entry.cc', 'bytes.cc', 'utils/uuid.cc', 'utils/UUID_gen.cc', 'clocks-impl.cc', 'utils/dynamic_bitset.cc', 'utils/hashers.cc', 'utils/on_internal_error.cc']
 deps['test/boost/input_stream_test'] = ['test/boost/input_stream_test.cc']
 deps['test/boost/interval_index_test'] = ['test/boost/interval_index_test.cc']
 deps['test/boost/UUID_test'] = ['clocks-impl.cc', 'utils/UUID_gen.cc', 'test/boost/UUID_test.cc', 'utils/uuid.cc', 'utils/dynamic_bitset.cc', 'utils/hashers.cc', 'utils/on_internal_error.cc']
