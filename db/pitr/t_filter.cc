@@ -42,6 +42,14 @@ filter_stats& filter_stats::operator+=(const filter_stats& o) {
     return *this;
 }
 
+bool is_member_just_above_tombstone(tombstone tomb, api::timestamp_type member_timestamp) {
+    return tomb && tomb.timestamp != api::max_timestamp && member_timestamp == tomb.timestamp + 1;
+}
+
+api::timestamp_type collection_statement_timestamp(tombstone tomb, bool member_just_above_tombstone) {
+    return member_just_above_tombstone ? tomb.timestamp + 1 : tomb.timestamp;
+}
+
 // Returns nothing when nothing in the cell is at or below `t`, so that the
 // caller drops the whole cell.
 static future<std::optional<collection_mutation>> filter_collection(collection_mutation_view cmv, api::timestamp_type t, filter_stats& st) {
@@ -51,7 +59,7 @@ static future<std::optional<collection_mutation>> filter_collection(collection_m
     utils::chunked_vector<std::pair<managed_bytes_view, atomic_cell_view>> kept;
     bool member_just_above_tomb = false;
     for (auto&& kv : cmv) {
-        if (tomb && tomb.timestamp != api::max_timestamp && kv.second.timestamp() == tomb.timestamp + 1) {
+        if (is_member_just_above_tombstone(tomb, kv.second.timestamp())) {
             member_just_above_tomb = true;
         }
         // A dead member keeps its timestamp too, so live and dead members are
@@ -80,7 +88,7 @@ static future<std::optional<collection_mutation>> filter_collection(collection_m
                 ++st.ambiguous_collection_deletes_at_t;
             }
         }
-        const auto statement_timestamp = member_just_above_tomb ? tomb.timestamp + 1 : tomb.timestamp;
+        const auto statement_timestamp = collection_statement_timestamp(tomb, member_just_above_tomb);
         if (statement_timestamp <= t) {
             ++st.collection_tombstones_kept;
         } else {
