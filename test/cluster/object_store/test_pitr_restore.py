@@ -13,9 +13,9 @@ import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     _plain, apply, assert_every_shard, assert_exact, Batch, change_statements, collection_edge_statements, conditional_history, COPY_NOTICE_WORDS,
-    create_rich_table, FLAG_EMPTY_BACKUP, needs_phase, node_config, NOT_VERIFIED_RE, now_us, old_ts, pks_of, protect_table, protected_table, read_all,
-    read_exact, report_stalls, restore_ok, RESULT_LIMIT_WORDS, run_status_commands, seed_statements, simple_rows, STEP_US, STEPS, VNODES_KS, W,
-    wait_covered, wait_protected, Writer, WRONG_WAY_BACK
+    create_rich_table, expected_at, FLAG_EMPTY_BACKUP, needs_phase, node_config, NOT_VERIFIED_RE, now_us, old_ts, pks_of, protect_table,
+    protected_table, read_all, read_exact, report_stalls, restore_ok, RESULT_LIMIT_WORDS, run_status_commands, seed_statements, simple_rows, STEP_US,
+    STEPS, VNODES_KS, W, wait_covered, wait_protected, Writer, WRONG_WAY_BACK
 )
 from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -129,8 +129,9 @@ async def test_batch_overwriting_itself_restores_only_the_merged_result(manager:
         await p.write(changes)
         await p.covered()
         _, new = await p.restore(ts['low'])
-        rows = [r for r in await read_exact(p.cql, p.ks, new) if r.startswith(f'(1, {ck},')]
-        assert len(rows) == 1 and 'overwritten' not in rows[0], f'expected the value from before the batch, saw {rows}'
+        actual = [r for r in await read_exact(p.cql, p.ks, new) if r.startswith(f'(1, {ck},')]
+        expected = [r for r in await expected_at(p.cql, p.ks, seed + changes, ts['low']) if r.startswith(f'(1, {ck},')]
+        assert actual == expected, f'expected the value from before the batch, {expected}, saw {actual}'
 
 
 @needs_phase('1.3')
@@ -157,6 +158,13 @@ async def test_ambiguous_collection_gives_done_and_one_of_two_values(manager: Sc
         rows = await p.cql.run_async(f'SELECT m FROM {p.ks}.{new} WHERE pk = 1 AND ck = {ck}')
         seen = _plain(rows[0][0]) if rows else 'no row'
         assert seen in (None, [(1, 'a'), (2, 'b')]), f'expected an empty collection or the seeded one, saw {seen}'
+
+        def others(rows):
+            return [row for row in rows if not row.startswith(f'(1, {ck},')]
+        expected = others(await expected_at(p.cql, p.ks, seed + changes, ts[stage] + offset))
+        actual = others(await read_exact(p.cql, p.ks, new))
+        assert actual == expected, \
+            f'expected every other row exact. Missing: {sorted(set(expected) - set(actual))}. Extra: {sorted(set(actual) - set(expected))}'
 
 
 AMBIGUOUS_T = [('overwrite', 'overwrite', -1), ('empty_overwrite', 'empty', -1), ('batched_delete', 'delete', 0)]

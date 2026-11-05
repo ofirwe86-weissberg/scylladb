@@ -14,9 +14,10 @@ import uuid
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    apply, assert_refused, assert_stays_unprotected, backup_prefix, CLOCK_MARGIN_US, deadline, get_status, needs_phase, node_config, NONDURABLE_KS,
-    NOT_PROTECTED, now_us, old_ts, pks_of, PROTECTED, protected_table, read_all, Reason, report_stalls, restore_ok, run_nodetool, run_status_commands,
-    simple_rows, STATUS_LIMIT_WORDS, table_entry, TABLE_SCHEMA, table_status, TABLETS_KS, VNODES_KS, wait_covered, wait_protected
+    apply, assert_refused, assert_status_stays, assert_stays_unprotected, backup_prefix, CLOCK_MARGIN_US, deadline, get_status, needs_phase,
+    node_config, NONDURABLE_KS, NOT_PROTECTED, now_us, old_ts, pks_of, PROTECTED, protected_table, read_all, Reason, report_stalls, restore_ok,
+    run_nodetool, run_status_commands, simple_rows, STATUS_LIMIT_WORDS, table_entry, TABLE_SCHEMA, table_status, TABLETS_KS, VNODES_KS, wait_covered,
+    wait_protected
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace
@@ -152,8 +153,8 @@ async def test_restored_table_is_not_protected(manager: ScyllaClusterManager, s3
     """T08, STA-1."""
     async with protected_table(manager, s3_storage) as p:
         _, new = await p.restore(await p.covered())
-        entry = await table_status(manager, p.server, p.ks, new)
-        assert (entry.state, entry.reason) == (NOT_PROTECTED, Reason.RESTORED_TABLE), entry
+        await assert_status_stays(manager, p.server, p.ks, new, lambda e: (e.state, e.reason) == (NOT_PROTECTED, Reason.RESTORED_TABLE),
+                                  'not protected, because it is a restored table')
 
 
 @needs_phase('1.3')

@@ -122,17 +122,31 @@ async def test_gate_cuts_a_connection_opening_across_the_failure(monkeypatch):
         gate.stop()
 
 
-async def test_gate_throttle_slows_traffic():
+async def test_gate_cuts_after_a_number_of_bytes():
     async with EchoServer() as echo:
         gate = gate_for(echo)
-        gate.throttle(128 * 1024)
-        size = 64 * 1024
+        gate.fail_after_bytes(10)
         reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
-        started = time.time()
-        writer.write(b'x' * size)
-        await asyncio.wait_for(reader.readexactly(size), 30)
-        assert time.time() - started >= size / (128 * 1024), 'throttle() must hold traffic back'
-        writer.close()
+        writer.write(b'12345')
+        assert await asyncio.wait_for(reader.readexactly(5), 10) == b'12345'
+        assert not gate.down
+        writer.write(b'1234567890')
+        assert await is_cut(reader), 'the gate must cut once the bytes are used up'
+        assert gate.down and echo.received == 5
+        gate.stop()
+
+
+async def test_gate_holds_traffic_until_it_recovers():
+    async with EchoServer() as echo:
+        gate = gate_for(echo)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        gate.hold()
+        writer.write(b'held')
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readexactly(4), 0.5)
+        assert echo.received == 0, 'nothing may reach the store while it is held'
+        gate.recover()
+        assert await asyncio.wait_for(reader.readexactly(4), 10) == b'held'
         gate.stop()
 
 
@@ -163,8 +177,8 @@ async def test_gate_keeps_s3_signatures_valid(gated_store):
 
 
 async def test_backup_and_restore_through_the_gate(manager: ScyllaClusterManager, gated_store):
-    """An existing backup and restore through the gate, and the cut T23 relies on: a slowed upload, cut when its first object
-    appears, ends failed and partial. Finishing it afterwards works."""
+    """An existing backup and restore through the gate, and the cut T23 relies on: an upload cut after half its bytes ends failed once
+    aborted. Finishing it afterwards works."""
     server = await manager.server_add(config=pitr.node_config(gated_store, shipping=False))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
@@ -178,19 +192,19 @@ async def test_backup_and_restore_through_the_gate(manager: ScyllaClusterManager
 
         snap, tocs = await take_snapshot_on_one_server(ks, server, manager, logger)
         cut_prefix = f'cut/{snap}'
-        gated_store.throttle(pitr.THROTTLE_BYTES_PER_SECOND)
+        gated_store.fail_after_bytes(size // 2)
         tid = await manager.api.backup(server.ip_addr, ks, 't', snap, gated_store.address, gated_store.bucket_name, cut_prefix)
-        async def some_uploaded():
-            return True if await pitr.objects_of(gated_store, f'{cut_prefix}/') else None
-        await wait_for(some_uploaded, pitr.deadline(), period=0.05, backoff_factor=1)
-        gated_store.fail()
+
+        async def went_down():
+            return True if gated_store.down else None
+        await wait_for(went_down, pitr.deadline())
         try:
             await manager.api.abort_task(server.ip_addr, tid)
         except HTTPError as e:
             logger.info(f'The task had already ended: {e}')
         assert (await manager.api.wait_task(server.ip_addr, tid))['state'] == 'failed'
         uploaded = sum(o.size for o in (await pitr.objects_of(gated_store, f'{cut_prefix}/')).values())
-        assert 0 < uploaded < size, f'the upload must be partial: {uploaded} of {size} bytes'
+        assert uploaded < size, f'the upload must not be whole: {uploaded} of {size} bytes'
         gated_store.recover()
 
         prefix = f'whole/{snap}'
@@ -400,6 +414,19 @@ async def test_conditional_history_reads_back_real_timestamps(manager: ScyllaClu
             assert [row for row in at_t if row.startswith('(1, 0,')] == [repr((1, 0, value, None, None, None, None,
                                                                               first.ts if value == 'first' else second.ts,
                                                                               None, None, None, None, None, None))], f'at {t}'
+
+
+async def test_flush_keeps_a_tombstone_with_expired_grace(manager: ScyllaClusterManager):
+    """The expired-grace case in test_pitr_deleted.py: gc_grace_seconds = 0 and no compaction leave the tombstone in the data."""
+    server = await manager.server_add()
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
+        await cql.run_async(f'CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA} WITH gc_grace_seconds = 0')
+        ts = pitr.old_ts()
+        await pitr.apply(cql, ks, 't', pitr.simple_rows([0, 1], ts) + [W(ts + 1, 'DELETE FROM {t} USING TIMESTAMP {ts} WHERE pk = 0')])
+        await take_snapshot_on_one_server(ks, server, manager, logger)
+        assert 0 in {f.pk for f in await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.t)')}
+        assert await pitr.pks_of(cql, ks, 't') == {1}
 
 
 async def test_tombstone_is_purged_before_a_backup(manager: ScyllaClusterManager):

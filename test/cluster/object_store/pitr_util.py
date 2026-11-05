@@ -90,11 +90,11 @@ SHIPPING_PREFIX = 'pitr-log'  # all shipped objects are assumed to be under this
 MUTABLE_OBJECTS = ('head',)   # last component of the shipped objects the product overwrites. All others are immutable
 BACKUP_PREFIX = 'pitr-backups'  # where a backup must go to protect a table: "the shipping store" in SHP-5
 
-CFG_ENDPOINT = 'pitr_shipping_endpoint'  # setting this one turns shipping on
-CFG_BUCKET = 'pitr_shipping_bucket'
-CFG_PREFIX = 'pitr_shipping_prefix'
-CFG_SEAL_SECONDS = 'pitr_seal_interval_seconds'
-CFG_OUTAGE_LIMIT_BYTES = 'pitr_outage_limit_bytes'
+CFG_ENDPOINT = 'pitr_endpoint'  # real, from #5: setting this and the bucket turns shipping on
+CFG_BUCKET = 'pitr_bucket'  # real, from #5
+CFG_PREFIX = 'pitr_prefix'  # real, from #5
+CFG_SEAL_SECONDS = 'pitr_seal_interval_in_seconds'  # real, from #5
+CFG_UNSHIPPED_LIMIT_MB = 'pitr_unshipped_limit_in_mb'  # real, from #5
 CFG_DISK_RESERVE_PERCENT = 'pitr_disk_reserve_percent'  # assumed live-updatable
 
 STATUS_URI = '/storage_service/pitr/status'  # GET
@@ -313,8 +313,6 @@ STEP_US = 1000
 # Absence has no event to poll for, so a check for it watches the bucket for this long: 5 seal intervals, at S = 1 s.
 # T01 requires objects to appear within this time once shipping is on, which is what shows that the window can catch shipping.
 ABSENCE_WINDOW_SECONDS = 5
-THROTTLE_BYTES_PER_SECOND = 128 * 1024
-KILL_ATTEMPTS = 5
 SHARDS = 2                      # test/pylib/scylla_server.py:153
 SEAL_SECONDS = 1                # the default of shipping_options()
 IDLE_WINDOW_US = 10_000_000
@@ -762,15 +760,19 @@ async def assert_nothing_appears(storage, allowed_prefixes=('sstables/',)):
         await asyncio.sleep(0.2)
 
 
-async def assert_stays_unprotected(manager, server, ks, cf) -> TableStatus:
-    """As above, for status: a backup that doesn't protect mustn't start to later."""
+async def assert_status_stays(manager, server, ks, cf, holds, expected: str) -> TableStatus:
+    """As above, for status: what must not change has to stay that way for the whole window. Fails at once if it doesn't."""
     end = time.time() + ABSENCE_WINDOW_SECONDS
     while True:
         entry = await table_status(manager, server, ks, cf)
-        assert entry.state == NOT_PROTECTED and not entry.backups, entry
+        assert holds(entry), f'expected {expected}, saw: {entry}'
         if time.time() >= end:
             return entry
         await asyncio.sleep(0.2)
+
+
+async def assert_stays_unprotected(manager, server, ks, cf) -> TableStatus:
+    return await assert_status_stays(manager, server, ks, cf, lambda e: e.state == NOT_PROTECTED and not e.backups, 'not protected, with no usable backup')
 
 
 def is_immutable(key: str) -> bool:
@@ -819,7 +821,8 @@ class GatedStore:
         self.connections = 0
         self._server = None
         self._conns = set()
-        self._rate = None
+        self._budget = None
+        self._held = False
         self._loop = None
         self._thread = None
 
@@ -872,13 +875,18 @@ class GatedStore:
         self.down = True
         self._loop.call_soon_threadsafe(self._abort_connections)
 
-    def throttle(self, bytes_per_second):
-        """Slows every connection, so that the test can see an upload or restore running, and act on it."""
-        self._rate = bytes_per_second
+    def fail_after_bytes(self, count):
+        """Cuts the store once this many more bytes have gone towards it, whatever they are. No moment to hit."""
+        self._budget = count
+
+    def hold(self):
+        """Stops carrying bytes, without cutting anything. Whatever needs the store waits. No moment to hit."""
+        self._held = True
 
     def recover(self):
         self.down = False
-        self._rate = None
+        self._budget = None
+        self._held = False
 
     async def _serve(self, reader, writer):
         if self.down:
@@ -894,11 +902,15 @@ class GatedStore:
             return
         self._conns.add(up_writer)
 
-        async def pump(src, dst):
+        async def pump(src, dst, towards_store):
             try:
                 while data := await src.read(65536):
-                    if self._rate:
-                        await asyncio.sleep(len(data) / self._rate)
+                    while self._held and not self.down:
+                        await asyncio.sleep(0.01)
+                    if towards_store and self._budget is not None:
+                        self._budget -= len(data)
+                        if self._budget <= 0:
+                            self.fail()
                     if self.down:
                         return
                     dst.write(data)
@@ -908,7 +920,7 @@ class GatedStore:
             finally:
                 dst.close()
                 self._conns.discard(dst)
-        await asyncio.gather(pump(reader, up_writer), pump(up_reader, writer))
+        await asyncio.gather(pump(reader, up_writer, True), pump(up_reader, writer, False))
 
 
 @pytest.fixture

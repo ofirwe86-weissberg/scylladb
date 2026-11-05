@@ -7,15 +7,13 @@
 
 """PITR and deleted data: a deleted row stays deleted, and an accidental TRUNCATE can be undone."""
 
-import asyncio
 import logging
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    apply, DONE, get_result, needs_phase, node_config, now_us, old_ts, pks_of, protect_table, protected_table, PURGEABLE_OPTIONS, read_all,
-    report_stalls, restore_ok, Result, simple_rows, start_restore, STEP_US, TABLE_SCHEMA, VNODES_KS, wait_covered, write_and_purge
+    apply, needs_phase, node_config, now_us, old_ts, pks_of, protect_table, protected_table, PURGEABLE_OPTIONS, read_all, report_stalls, restore_ok,
+    simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, W, wait_covered, write_and_purge
 )
 from test.cluster.util import new_test_keyspace
-from test.pylib.rest_client import HTTPError
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import unique_name
 
@@ -38,6 +36,19 @@ async def test_row_purged_before_the_backup_stays_deleted(manager: ScyllaCluster
         await restore_ok(manager, server, ks, 'purged', backup.name, latest, new)
         seen = await pks_of(cql, ks, new)
         assert seen == {2}, f'expected row 2 only, because row 1 was purged. Saw {seen}'
+
+
+@needs_phase('1.3')
+async def test_row_deleted_before_the_backup_with_its_grace_expired_stays_deleted(manager: ScyllaClusterManager, s3_storage):
+    """T13, RST-3. The tombstone is in the backup, unpurged, and its grace period has passed by the time of the restore."""
+    ts = old_ts()
+    seed = simple_rows([0, 1], ts) + [W(ts + 1, 'DELETE FROM {t} USING TIMESTAMP {ts} WHERE pk = 0')]
+    async with protected_table(manager, s3_storage, seed=seed, schema=f'{TABLE_SCHEMA} WITH gc_grace_seconds = 0') as p:
+        fragments = await p.cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({p.ks}.t)')
+        assert 0 in {f.pk for f in fragments}, 'expected the tombstone still in the data, or this is the purged case again'
+        _, new = await p.restore(await p.covered())
+        seen = await pks_of(p.cql, p.ks, new)
+        assert seen == {1}, f'expected row 0 gone, saw {seen}'
 
 
 @needs_phase('1.3')
@@ -80,32 +91,6 @@ async def test_rows_truncated_before_the_backup_stay_gone(manager: ScyllaCluster
         await restore_ok(manager, server, ks, 't', backup.name, latest, new)
         seen = await pks_of(cql, ks, new)
         assert seen == {3}, f'expected only the row written after the truncate, saw {seen}'
-
-
-@needs_phase('1.3')
-async def test_compaction_during_a_restore_keeps_a_row_deleted(manager: ScyllaClusterManager, s3_storage):
-    """T13, RST-3. **Proposed to move to developer tests:** this passes if every compaction misses the window, and nothing outside can hold the
-    restore there."""
-    async with protected_table(manager, s3_storage, schema=PURGEABLE_SCHEMA) as p:
-        ts = p.backup.start_us + STEP_US
-        await p.cql.run_async(f'DELETE FROM {p.ks}.t USING TIMESTAMP {ts} WHERE pk = 0')
-        await p.covered()
-        new = unique_name('restored_')
-        started = await start_restore(manager, p.server, p.ks, p.cf, p.backup.name, ts, new)
-        assert not isinstance(started, Result), f'expected a task, saw a refusal: {started}'
-        waiting = asyncio.create_task(manager.api.wait_task(p.server.ip_addr, started))
-        attempts = 0
-        while not waiting.done():
-            attempts += 1
-            try:
-                await manager.api.keyspace_compaction(p.server.ip_addr, p.ks, new)
-            except HTTPError as e:      # the table may not exist yet
-                logger.info(f'Compaction attempt {attempts}: {e}')
-        await waiting
-        logger.info(f'Attempted compaction {attempts} times during the restore')
-        assert (await get_result(manager, p.server, p.ks, new)).state == DONE
-        seen = await pks_of(p.cql, p.ks, new)
-        assert seen == {1, 2, 3}, f'expected row 0 gone, saw {seen}'
 
 
 async def truncate_after_t(p) -> tuple[int, list]:

@@ -13,9 +13,9 @@ import time
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    ABSENCE_WINDOW_SECONDS, apply, assert_nothing_appears, CFG_SEAL_SECONDS, get_status, needs_phase, node_config, now_us, objects_of, old_ts, pks_of,
-    protect_table, protected_table, report_stalls, restart, restore_ok, SEAL_SECONDS, SHARDS, shipped_bytes, shipping_options, SHIPPING_PREFIX,
-    simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, W, wait_covered
+    ABSENCE_WINDOW_SECONDS, apply, assert_nothing_appears, CFG_BUCKET, CFG_ENDPOINT, CFG_SEAL_SECONDS, get_status, needs_phase, node_config, now_us,
+    objects_of, old_ts, pks_of, protect_table, protected_table, report_stalls, restart, restore_ok, SEAL_SECONDS, SHARDS, shipped_bytes,
+    shipping_options, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, W, wait_covered
 )
 from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -39,11 +39,20 @@ async def test_status_says_shipping_is_off_by_default(manager: ScyllaClusterMana
 
 
 @needs_phase('1.1')
+async def test_shipping_settings_default_to_off(manager: ScyllaClusterManager, s3_storage):
+    """T01, SHP-1, LVL-1. Unset, and a 60 second seal interval."""
+    server = await manager.server_add(config=node_config(s3_storage, shipping=False))
+    seen = {key: await manager.api.get_config(server.ip_addr, key) for key in (CFG_ENDPOINT, CFG_BUCKET, CFG_SEAL_SECONDS)}
+    assert seen == {CFG_ENDPOINT: '', CFG_BUCKET: '', CFG_SEAL_SECONDS: 60}, f'expected unset, unset and 60 seconds, saw: {seen}'
+
+
+@needs_phase('1.1')
 async def test_nothing_is_shipped_when_off(manager: ScyllaClusterManager, s3_storage):
-    """T01, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which shows the same window catches shipping."""
+    """T01, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which shows the same window catches shipping. The setting is
+    read first, so this can't pass on a build that doesn't have it."""
     server = await off_node(manager, s3_storage)
     cql = manager.get_cql()
-    assert not (await get_status(manager, server)).shipping_on
+    assert await manager.api.get_config(server.ip_addr, CFG_ENDPOINT) == '', 'expected the shipping endpoint unset'
     async with new_test_keyspace(manager, VNODES_KS) as ks:
         await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
         await apply(cql, ks, 't', simple_rows(range(4), old_ts()))
@@ -100,10 +109,13 @@ async def test_status_says_why_shipping_is_off_on_two_nodes(manager: ScyllaClust
 
 @needs_phase('1.1')
 async def test_nothing_is_shipped_on_two_nodes(manager: ScyllaClusterManager, s3_storage):
-    """T02, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which uses the same configuration."""
+    """T02, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which uses the same configuration. The setting is read first,
+    so this can't pass on a build that doesn't have it, and to show that it's set on both nodes."""
     servers = await manager.servers_add(2, config=node_config(s3_storage))
     cql = manager.get_cql()
-    assert not (await get_status(manager, servers[0])).shipping_on
+    for server in servers:
+        seen = await manager.api.get_config(server.ip_addr, CFG_ENDPOINT)
+        assert seen == s3_storage.address, f'expected the shipping endpoint set on {server.ip_addr}, saw: {seen!r}'
     async with new_test_keyspace(manager, VNODES_KS) as ks:
         await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
         await apply(cql, ks, 't', simple_rows(range(4), now_us()))

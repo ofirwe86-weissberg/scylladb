@@ -8,16 +8,17 @@
 """PITR refusals: each condition restore must refuse, and that nothing changes when it does."""
 
 import logging
+import random
 
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    ALTER_KEYSPACE_RF1_NONDURABLE, ALTER_KEYSPACE_RF2, apply, assert_refused, backup_prefix, CFG_DISK_RESERVE_PERCENT, CLOCK_MARGIN_US,
-    create_alterable_table, create_unsupported_tables, deadline, delete_object, FAILED, get_object, is_immutable, iso, ISO_RE, iso_times, needs_phase,
-    NEWER_BACKUP_WORDS, node_config, NONDURABLE_KS, NOT_PROTECTED, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pks_of, protect_table,
-    protected_table, put_object, Reason, report_stalls, restart, restore_ok, RF2_KS, run_restore, schema_change_statement, SCHEMA_CHANGES,
-    shipping_options, SHIPPING_PREFIX, simple_rows, STEP_US, STRONG_KS, table_exists, TABLE_SCHEMA, table_status, TABLETS_KS, TOPOLOGY_LIMIT_WORDS,
-    unsupported_tables_config, VNODES_KS, wait_covered
+    ALTER_KEYSPACE_RF1_NONDURABLE, ALTER_KEYSPACE_RF2, apply, assert_refused, assert_status_stays, assert_stays_unprotected, backup_prefix,
+    CFG_DISK_RESERVE_PERCENT, CLOCK_MARGIN_US, create_alterable_table, create_unsupported_tables, deadline, delete_object, FAILED, get_object,
+    is_immutable, iso, ISO_RE, iso_times, needs_phase, NEWER_BACKUP_WORDS, node_config, NONDURABLE_KS, now_us, objects_of, old_ts,
+    PAST_COVERAGE_WORDS, pks_of, protect_table, protected_table, put_object, Reason, report_stalls, restart, restore_ok, RF2_KS, run_restore,
+    schema_change_statement, SCHEMA_CHANGES, shipping_options, SHIPPING_PREFIX, simple_rows, STEP_US, STRONG_KS, table_exists, TABLE_SCHEMA,
+    TABLETS_KS, TOPOLOGY_LIMIT_WORDS, unsupported_tables_config, VNODES_KS, wait_covered
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace
@@ -90,19 +91,32 @@ MISSING = {Reason.OBJECT_MISSING, Reason.RECORDS_MISSING}
 DAMAGED = {Reason.OBJECT_DAMAGED, Reason.RECORDS_DAMAGED}
 
 
-async def shipped_object_in_window(p, table='t') -> tuple[int, str]:
-    """Writes after the backup, then waits until T is past every upload. Returns T, and the newest immutable object written since. Works without
-    knowing the format: an object can't hold anything newer than its upload, and S3 reports upload times in seconds, hence the 2 seconds."""
-    await p.covered()
-    known = await objects_of(p.storage, SHIPPING_PREFIX)
-    await apply(p.cql, p.ks, table, simple_rows(range(8, 16), p.backup.start_us + STEP_US))
+# Bigger than any idle seal may be (4 KiB, req:82), and random, so that compression can't shrink it.
+PAYLOAD = random.Random(22).randbytes(4096).hex()
+
+
+async def shipped_object_holding_writes(p, table, known) -> tuple[list, int, str]:
+    """Writes after the backup, then waits until T is past every upload. Returns the writes, T, and the biggest new object: it holds the writes, because
+    an object of an idle seal stays under 4 KiB. Works without knowing the format: an object can't hold anything newer than its upload, and S3 reports
+    upload times in seconds, hence the 2 seconds."""
+    writes = simple_rows(range(8, 16), max(now_us(), p.backup.start_us + STEP_US), PAYLOAD)
+    await apply(p.cql, p.ks, table, writes)
     await p.covered()
     objects = await objects_of(p.storage, SHIPPING_PREFIX)
     newest = max(o.last_modified for o in objects.values()).timestamp()
     t = await p.covered(int(newest * 1e6) + 2 * CLOCK_MARGIN_US)
-    window = {k: o for k, o in objects.items() if k not in known and o.size >= 2 and is_immutable(k)}
+    window = {k: o for k, o in objects.items() if k not in known and is_immutable(k)}
     assert window, 'expected a new shipped object, or this test proves nothing'
-    return t, max(window, key=lambda k: (window[k].last_modified, k))
+    key = max(window, key=lambda k: (window[k].size, k))
+    assert window[key].size > 4096, f'expected the object holding the writes to be over 4 KiB, or it may be an idle seal: {key} is {window[key].size} bytes'
+    return writes, t, key
+
+
+async def shipped_object_in_window(p, table='t') -> tuple[int, str, list]:
+    await p.covered()
+    known = await objects_of(p.storage, SHIPPING_PREFIX)
+    writes, t, key = await shipped_object_holding_writes(p, table, known)
+    return t, key, writes
 
 
 async def probe(p, t, key, reasons):
@@ -130,7 +144,7 @@ async def tamper_setup(p, written):
 async def test_refuse_a_removed_shipped_object(manager: ScyllaClusterManager, s3_storage, written):
     """T20, REF-4."""
     async with protected_table(manager, s3_storage) as p:
-        t, key = await tamper_setup(p, written)
+        t, key, _ = await tamper_setup(p, written)
         await delete_object(s3_storage, key)
         await probe(p, t, key, MISSING)
 
@@ -140,7 +154,7 @@ async def test_refuse_a_removed_shipped_object(manager: ScyllaClusterManager, s3
 async def test_refuse_a_shipped_object_cut_short(manager: ScyllaClusterManager, s3_storage, written):
     """T20, REF-4."""
     async with protected_table(manager, s3_storage) as p:
-        t, key = await tamper_setup(p, written)
+        t, key, _ = await tamper_setup(p, written)
         original = await get_object(s3_storage, key)
         await put_object(s3_storage, key, original[:len(original) // 2])
         await probe(p, t, key, DAMAGED)
@@ -151,7 +165,7 @@ async def test_refuse_a_shipped_object_cut_short(manager: ScyllaClusterManager, 
 async def test_refuse_a_shipped_object_with_one_byte_changed(manager: ScyllaClusterManager, s3_storage, written):
     """T20, REF-4."""
     async with protected_table(manager, s3_storage) as p:
-        t, key = await tamper_setup(p, written)
+        t, key, _ = await tamper_setup(p, written)
         changed = bytearray(await get_object(s3_storage, key))
         changed[len(changed) // 2] ^= 0x01
         await put_object(s3_storage, key, bytes(changed))
@@ -162,12 +176,12 @@ async def test_refuse_a_shipped_object_with_one_byte_changed(manager: ScyllaClus
 async def test_restore_works_once_a_tampered_object_is_put_back(manager: ScyllaClusterManager, s3_storage):
     """T20, REF-4. The control: the tampering, and nothing else, caused the refusals."""
     async with protected_table(manager, s3_storage) as p:
-        t, key = await shipped_object_in_window(p)
+        t, key, writes = await shipped_object_in_window(p)
         original = await get_object(s3_storage, key)
         await delete_object(s3_storage, key)
         await probe(p, t, key, MISSING)
         await put_object(s3_storage, key, original)
-        await p.assert_restored_exact(p.seed + simple_rows(range(8, 16), p.backup.start_us + STEP_US), t)
+        await p.assert_restored_exact(p.seed + writes, t)
 
 
 async def gap_after_some_writes(p) -> tuple[int, int, list, str]:
@@ -177,14 +191,7 @@ async def gap_after_some_writes(p) -> tuple[int, int, list, str]:
     await p.write(early)
     before_gap = await p.covered()
     known = await objects_of(p.storage, SHIPPING_PREFIX)    # everything up to before_gap is in these
-    await p.write(simple_rows(range(12, 16), max(now_us(), before_gap + 1)))
-    await p.covered()
-    objects = await objects_of(p.storage, SHIPPING_PREFIX)
-    newest = max(o.last_modified for o in objects.values()).timestamp()
-    end = await p.covered(int(newest * 1e6) + 2 * CLOCK_MARGIN_US)
-    window = {k: o for k, o in objects.items() if k not in known and o.size >= 2 and is_immutable(k)}
-    assert window, 'expected a new shipped object, or this test proves nothing'
-    key = max(window, key=lambda k: (window[k].last_modified, k))
+    _, end, key = await shipped_object_holding_writes(p, p.cf, known)
     await delete_object(p.storage, key)
     return before_gap, end, p.seed + early, key
 
@@ -274,8 +281,7 @@ async def test_status_doesnt_list_a_snapshot_from_before_shipping(manager: Scyll
         await restart(manager, server)
         if upload == 'after_shipping':
             await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
-        entry = await table_status(manager, server, ks, 't')
-        assert entry.state == NOT_PROTECTED and not entry.backups, entry
+        await assert_stays_unprotected(manager, server, ks, 't')
 
 
 # T outside coverage
@@ -350,8 +356,7 @@ async def test_status_doesnt_list_a_snapshot_never_uploaded(manager: ScyllaClust
     """T23, REF-7."""
     async with protected_table(manager, s3_storage) as p:
         await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
-        entry = await p.status()
-        assert [b.name for b in entry.backups] == [p.backup.name], entry
+        await assert_status_stays(manager, p.server, p.ks, p.cf, lambda e: [b.name for b in e.backups] == [p.backup.name], f'only {p.backup.name} listed')
 
 
 # Schema changes and truncates in the window

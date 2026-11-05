@@ -16,19 +16,19 @@ from typing import Any
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_acked_writes_present, backup_prefix, CAUSE_OUTAGE, CAUSE_RESTART, CFG_OUTAGE_LIMIT_BYTES, change_statements, CLOCK_MARGIN_US, deadline,
-    gated_store, get_result, get_status, HTTPError, INCOMPLETE, INCOMPLETE_ACTION_WORDS, iso, iso_times, needs_phase, NOT_PROTECTED, now_us,
-    objects_of, old_ts, PAST_COVERAGE_WORDS, PROTECTED, protected_table, read_all, Reason, report_stalls, Result, run_status_commands,
-    seed_statements, simple_rows, start_restore, STEP_US, STEPS, table_entry, table_status, THROTTLE_BYTES_PER_SECOND, wait_protected, Writer
+    assert_acked_writes_present, assert_exact, assert_status_stays, backup_prefix, CAUSE_OUTAGE, CAUSE_RESTART, CFG_UNSHIPPED_LIMIT_MB,
+    change_statements, CLOCK_MARGIN_US, deadline, DONE, gated_store, get_result, get_status, HTTPError, INCOMPLETE, INCOMPLETE_ACTION_WORDS, iso,
+    iso_times, needs_phase, NOT_PROTECTED, now_us, old_ts, PAST_COVERAGE_WORDS, PROTECTED, protected_table, read_all, Reason, report_stalls, Result,
+    run_status_commands, seed_statements, simple_rows, start_restore, STEP_US, STEPS, table_entry, TABLE_SCHEMA, table_status, wait_protected, Writer
 )
 from test.cluster.object_store.pitr_util import restart as restart_node
-from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
+from test.cluster.object_store.test_backup import take_snapshot_on_one_server
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import unique_name, wait_for
 
 logger = logging.getLogger(__name__)
 
-OUTAGE_LIMIT_BYTES = 1024 * 1024
+OUTAGE_LIMIT_MB = 1
 
 
 async def wait_store_unreachable(manager, server):
@@ -95,8 +95,13 @@ async def test_brief_failure_doesnt_break_protection(manager: ScyllaClusterManag
             return True if entry.lag_seconds is not None and entry.lag_seconds > seen[0].lag_seconds else None
         await wait_for(lag_rose_and_recovered, deadline())
         gated_store.recover()
-        await p.covered()
-        seen.append(await p.status())
+        target = now_us() + CLOCK_MARGIN_US
+
+        async def caught_up_or_broke():
+            entry = await p.status()
+            seen.append(entry)
+            return True if entry.state != PROTECTED or entry.break_cause is not None or entry.latest_us >= target else None
+        await wait_for(caught_up_or_broke, deadline())
         broken = [e for e in seen if e.state != PROTECTED or e.break_cause is not None]
         assert not broken, f'expected no break in {len(seen)} polls, saw: {broken}'
 
@@ -147,7 +152,7 @@ class Outage:
 @asynccontextmanager
 async def long_outage(manager, gate):
     """A protected table, the store cut, and writers running until status shows the break. The store is still down on entry."""
-    async with protected_table(manager, gate, seed=[], **{CFG_OUTAGE_LIMIT_BYTES: OUTAGE_LIMIT_BYTES}) as p:
+    async with protected_table(manager, gate, seed=[], **{CFG_UNSHIPPED_LIMIT_MB: OUTAGE_LIMIT_MB}) as p:
         covered_writes = simple_rows(range(4), p.backup.start_us + STEP_US, 'covered')
         await p.write(covered_writes)
         covered = await p.covered()
@@ -155,15 +160,17 @@ async def long_outage(manager, gate):
         gate.fail()
         writers = [Writer(p.cql, p.ks, p.cf, min_ts=covered + 1, first_pk=1000 + 100000 * i, payload='x' * 1024).start() for i in range(3)]
 
-        async def broke():
+        async def broke_or_a_write_failed():
             status = await get_status(manager, p.server)
             entry = table_entry(status, p.ks, p.cf)
-            return (status, entry) if entry.break_cause == CAUSE_OUTAGE else None
+            return (status, entry) if entry.break_cause == CAUSE_OUTAGE or any(w.failure for w in writers) else None
         try:
-            status, entry = await wait_for(broke, deadline())
+            status, entry = await wait_for(broke_or_a_write_failed, deadline())
         finally:
             for w in writers:
                 await w.stop()
+        failures = [w.failure for w in writers if w.failure is not None]
+        assert not failures, f'expected every write to succeed during the outage, saw: {failures}'
         yield Outage(p, covered_writes, covered, failed_at, writers, status, entry)
 
 
@@ -206,8 +213,8 @@ async def test_outage_shows_a_break_with_its_cause_and_time(manager: ScyllaClust
 async def test_break_from_an_outage_lasts_after_the_store_returns(manager: ScyllaClusterManager, gated_store):
     """T05, OUT-3."""
     async with long_outage(manager, gated_store) as o:
-        entry = await recovered(manager, gated_store, o)
-        assert entry.state == NOT_PROTECTED, f'expected a break to last until a new backup: {entry}'
+        await recovered(manager, gated_store, o)
+        await assert_status_stays(manager, o.p.server, o.p.ks, o.p.cf, lambda e: e.state == NOT_PROTECTED, 'a break to last until a new backup')
 
 
 @needs_phase('1.3')
@@ -398,137 +405,66 @@ async def test_finished_restore_isnt_incomplete_after_a_kill(manager: ScyllaClus
         assert entry.state != INCOMPLETE, entry
 
 
-@dataclass
-class KilledRestore:
-    p: Any
-    t: int
-    history: list
-    new: str
-    before: dict
-    entry: Any
-
-
-@asynccontextmanager
-async def killed_restore(manager, gate):
-    """**Proposed to move to developer tests.** A restore is killed as soon as status shows it, with the store slowed so that it stays running. The
-    timing can't be held from
-    outside: a step that doesn't touch the store could still finish first, in which case these tests fail rather than retrying."""
-    pks = range(50)
-    seed = seed_statements(pks, old_ts())
-    async with protected_table(manager, gate, seed=seed) as p:
-        await p.cql.run_async(f'CREATE TABLE {p.ks}.other (pk int, ck int, v text, PRIMARY KEY (pk, ck))')
-        changes, _ = change_statements(pks, p.backup.start_us)
+@needs_phase('1.3')
+async def test_kill_during_a_restore_leaves_done_or_incomplete(manager: ScyllaClusterManager, gated_store):
+    """T17, RST-12, REF-13, STA-1. Outcome only, with no moment to hit: the store is held, so the restore can't finish, and the node is killed. Which step
+    it reached is for the developer's tests. Either way, other tables are unchanged, and the name can't be reused."""
+    async with protected_table(manager, gated_store) as p:
+        await p.cql.run_async(f'CREATE TABLE {p.ks}.other {TABLE_SCHEMA}')
+        changes = simple_rows(range(10, 14), p.backup.start_us + STEP_US)
         await p.write(changes)
         t = await p.covered()
         before = {cf: await read_all(p.cql, p.ks, cf) for cf in (p.cf, 'other')}
         new = unique_name('restored_')
-        gate.throttle(THROTTLE_BYTES_PER_SECOND)
+        gated_store.hold()
         started = await start_restore(manager, p.server, p.ks, p.cf, p.backup.name, t, new)
         assert not isinstance(started, Result), f'expected a task, saw a refusal: {started}'
+        p.cql = await restart_node(manager, p.server, kill=True, while_down=gated_store.recover)
 
-        async def seen():
-            found = [e for e in (await get_status(manager, p.server)).tables if (e.keyspace, e.table) == (p.ks, new)]
-            return found[0] if found else None
-        await wait_for(seen, deadline(), period=0.001, backoff_factor=1, max_period=0.001)
-        p.cql = await restart_node(manager, p.server, kill=True, while_down=gate.recover)
-        yield KilledRestore(p, t, seed + changes, new, before, await table_status(manager, p.server, p.ks, new))
-
-
-@needs_phase('1.3')
-async def test_killed_restore_shows_incomplete_with_its_step(manager: ScyllaClusterManager, gated_store):
-    """T17, RST-12, STA-1."""
-    async with killed_restore(manager, gated_store) as k:
-        assert k.entry.state == INCOMPLETE, f'expected incomplete: {k.entry}'
-        assert k.entry.step in STEPS, f'expected one of {STEPS}: {k.entry}'
-
-
-@needs_phase('1.3')
-async def test_killed_restore_says_to_drop_it_and_use_a_new_name(manager: ScyllaClusterManager, gated_store):
-    """T17, STA-1."""
-    async with killed_restore(manager, gated_store) as k:
-        missing = [word for word in INCOMPLETE_ACTION_WORDS if word not in k.entry.text.lower()]
-        assert not missing, f'expected {missing} in: {k.entry.text}'
-
-
-@needs_phase('1.3')
-async def test_killed_restore_leaves_other_tables_the_same(manager: ScyllaClusterManager, gated_store):
-    """T17, RST-12."""
-    async with killed_restore(manager, gated_store) as k:
-        for cf, rows in k.before.items():
-            seen = await read_all(k.p.cql, k.p.ks, cf)
+        entry = await table_status(manager, p.server, p.ks, new)
+        if entry.state == INCOMPLETE:
+            assert entry.step in STEPS, f'expected one of {STEPS}: {entry}'
+            missing = [word for word in INCOMPLETE_ACTION_WORDS if word not in entry.text.lower()]
+            assert not missing, f'expected {missing} in: {entry.text}'
+        else:
+            assert (await get_result(manager, p.server, p.ks, new)).state == DONE, f'expected done or incomplete: {entry}'
+            await assert_exact(p.cql, p.ks, new, p.seed + changes, t)
+        for cf, rows in before.items():
+            seen = await read_all(p.cql, p.ks, cf)
             assert seen == rows, f'expected {cf} the same. Missing: {sorted(set(rows) - set(seen))[:5]}. Extra: {sorted(set(seen) - set(rows))[:5]}'
+        await p.refused(t, Reason.NAME_TAKEN, new_table=new)
 
 
 @needs_phase('1.3')
-async def test_killed_restore_keeps_its_name_taken(manager: ScyllaClusterManager, gated_store):
-    """T17, REF-13."""
-    async with killed_restore(manager, gated_store) as k:
-        await k.p.refused(k.t, Reason.NAME_TAKEN, new_table=k.new)
-
-
-@needs_phase('1.3')
-async def test_new_name_works_after_a_killed_restore(manager: ScyllaClusterManager, gated_store):
-    """T17, RST-12."""
-    async with killed_restore(manager, gated_store) as k:
-        await k.p.cql.run_async(f'DROP TABLE {k.p.ks}.{k.new}')
-        await k.p.assert_restored_exact(k.history, k.t)
-
-
-@asynccontextmanager
-async def cut_upload(manager, gate):
-    """**Proposed to move to developer tests.** An upload slowed, then cut when its first object appears. The cut is only as sure as the slowing: the
-    rate is a guess."""
-    async with protected_table(manager, gate, seed=[], schema=UNCOMPRESSED_SCHEMA) as p:
-        for first in range(0, 1200, 300):
-            await p.write(simple_rows(range(first, first + 300), old_ts(), 'x' * 1024))
-            await manager.api.keyspace_flush(p.server.ip_addr, p.ks, p.cf)
+async def test_cut_upload_is_either_usable_or_refused_and_unlisted(manager: ScyllaClusterManager, gated_store):
+    """T23, REF-7. Outcome only, with no moment to hit: the store is cut after half the table's bytes have gone towards it. Those can be other traffic, so
+    the upload may or may not get anywhere. Whether it ends part-way is for the developer's tests."""
+    schema = f"{TABLE_SCHEMA} WITH compression = {{'sstable_compression': ''}}"
+    async with protected_table(manager, gated_store, schema=schema) as p:
+        await p.write(simple_rows(range(10, 300), old_ts(), 'x' * 1024))
         cut, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
         size = await manager.api.get_table_disk_space_used(p.server.ip_addr, p.ks, p.cf)
-        gate.throttle(THROTTLE_BYTES_PER_SECOND)
-        prefix = backup_prefix(p.ks, p.cf, cut)
-        tid = await manager.api.backup(p.server.ip_addr, p.ks, p.cf, cut, gate.address, gate.bucket_name, prefix)
+        gated_store.fail_after_bytes(size // 2)
+        tid = await manager.api.backup(p.server.ip_addr, p.ks, p.cf, cut, gated_store.address, gated_store.bucket_name, backup_prefix(p.ks, p.cf, cut))
 
-        async def some_uploaded():
-            return True if await objects_of(gate, f'{prefix}/') else None
-        await wait_for(some_uploaded, deadline(), period=0.05, backoff_factor=1)
-        gate.fail()
-        try:
-            await manager.api.abort_task(p.server.ip_addr, tid)
-        except HTTPError as e:
-            logger.info(f'The task had already ended: {e}')
+        async def cut_or_finished():
+            if gated_store.down:
+                return True
+            state = (await manager.api.get_task_status(p.server.ip_addr, tid))['state']
+            return True if state in ('done', 'failed') else None
+        await wait_for(cut_or_finished, deadline())
+        if gated_store.down:
+            try:
+                await manager.api.abort_task(p.server.ip_addr, tid)
+            except HTTPError as e:
+                logger.info(f'The task had already ended: {e}')
         state = (await manager.api.wait_task(p.server.ip_addr, tid))['state']
-        assert state == 'failed', f'expected the upload to be cut, or this case proves nothing. Saw {state}'
-        uploaded = sum(o.size for o in (await objects_of(gate, f'{prefix}/')).values())
-        assert 0 < uploaded < size, f'expected a partial upload, or this case proves nothing: {uploaded} of {size} bytes'
-        gate.recover()
-        yield p, cut, prefix
+        gated_store.recover()
 
-
-UNCOMPRESSED_SCHEMA = ("(pk int, ck int, v text, w int, s int static, m map<int, text>, st set<int>, PRIMARY KEY (pk, ck)) "
-                       "WITH compression = {'sstable_compression': ''}")
-
-
-@needs_phase('1.3')
-async def test_refuse_a_backup_whose_upload_was_cut(manager: ScyllaClusterManager, gated_store):
-    """T23, REF-7."""
-    async with cut_upload(manager, gated_store) as (p, cut, _):
-        result = await p.refused(await p.covered(), Reason.BACKUP_UNFINISHED, backup=cut)
-        assert p.backup.name in result.message, f'expected the usable backups listed in: {result.message}'
-        assert 'finish' in result.message.lower(), f'expected it to say the upload did not finish: {result.message}'
-
-
-@needs_phase('1.2')
-async def test_status_doesnt_list_a_backup_whose_upload_was_cut(manager: ScyllaClusterManager, gated_store):
-    """T23, REF-7."""
-    async with cut_upload(manager, gated_store) as (p, _, _):
-        entry = await p.status()
-        assert [b.name for b in entry.backups] == [p.backup.name], entry
-
-
-@needs_phase('1.3')
-async def test_finishing_a_cut_upload_makes_it_usable(manager: ScyllaClusterManager, gated_store):
-    """T23, REF-7."""
-    async with cut_upload(manager, gated_store) as (p, cut, prefix):
-        await do_backup(p.server, cut, prefix, p.ks, p.cf, gated_store, manager, logger)
-        await wait_protected(manager, p.server, p.ks, p.cf, cut)
-        await p.restore(await p.covered(), backup=cut)
+        if state == 'done':
+            await wait_protected(manager, p.server, p.ks, p.cf, cut)
+            await p.restore(await p.covered(), backup=cut)
+        else:
+            result = await p.refused(await p.covered(), Reason.BACKUP_UNFINISHED, backup=cut)
+            assert p.backup.name in result.message, f'expected the usable backups listed in: {result.message}'
+            await assert_status_stays(manager, p.server, p.ks, p.cf, lambda e: [b.name for b in e.backups] == [p.backup.name], f'only {p.backup.name} listed')
