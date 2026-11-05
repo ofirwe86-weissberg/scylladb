@@ -9,6 +9,7 @@
 #include "db/pitr/segment_upload.hh"
 
 #include <algorithm>
+#include <chrono>
 #include <exception>
 #include <optional>
 
@@ -22,7 +23,9 @@
 #include "sstables/object_storage_client.hh"
 #include "utils/chain_abort_source.hh"
 #include "utils/crc.hh"
+#include "utils/exponential_backoff_retry.hh"
 #include "utils/log.hh"
+#include "utils/on_internal_error.hh"
 
 namespace db::pitr {
 
@@ -118,6 +121,72 @@ future<upload_result> upload_used_bytes(sstables::object_storage_client& client,
     co_return co_await with_closeable(std::move(f), [&client, &name, used_size, as](file& f) {
         return upload_to_sink(client, std::move(name), f, used_size, as);
     });
+}
+
+// A segment file that is gone cannot come back, so opening it is the one open
+// failure that is not worth retrying.
+static bool is_missing_file(const std::exception_ptr& ex) {
+    try {
+        std::rethrow_exception(ex);
+    } catch (const std::system_error& e) {
+        return e.code() == std::errc::no_such_file_or_directory;
+    } catch (...) {
+        return false;
+    }
+}
+
+future<upload_result> upload_with_retry(sstables::object_storage_client& client, sstables::object_name name, uint64_t used_size,
+        segment_file_opener open_segment_file, retry_policy policy, abort_source& as) {
+    if (used_size == 0) {
+        utils::on_internal_error(fmt::format("upload_with_retry() called for {} with no used bytes", name));
+    }
+    if (!open_segment_file) {
+        utils::on_internal_error(fmt::format("upload_with_retry() called for {} without a way to open the segment", name));
+    }
+    as.check();
+    const auto name_str = name.str();
+    // Both ends are raised to a millisecond: a store that fails without a round
+    // trip would otherwise be retried in a spin, and the bound has to leave
+    // room for the base it bounds.
+    const auto max_backoff = std::max(policy.max_backoff, std::chrono::milliseconds(1));
+    auto backoff = exponential_backoff_retry(std::clamp(policy.base_backoff, std::chrono::milliseconds(1), max_backoff), max_backoff);
+    // One line per failing segment per interval: an outage fails every segment
+    // on the shard, over and over.
+    logging::logger::rate_limit log_rate_limit(std::chrono::seconds(10));
+    for (unsigned attempt = 1;; ++attempt) {
+        std::exception_ptr ex;
+        // A fresh handle per attempt: a failed attempt's handle is closed, and
+        // its read position is of no use to the next one.
+        std::optional<file> f;
+        try {
+            f = co_await open_segment_file();
+        } catch (...) {
+            ex = std::current_exception();
+            if (is_missing_file(ex)) {
+                std::rethrow_exception(ex);
+            }
+        }
+        if (!ex) {
+            try {
+                co_return co_await upload_used_bytes(client, name, std::move(*f), used_size, &as);
+            } catch (const segment_too_short&) {
+                throw;
+            } catch (...) {
+                ex = std::current_exception();
+            }
+        }
+        if (as.abort_requested()) {
+            std::rethrow_exception(as.abort_requested_exception_ptr());
+        }
+        const auto wait = backoff.sleep_time();
+        upload_log.log(log_level::warn, log_rate_limit, "attempt {} to upload segment {} failed, retrying in {}: {}", attempt, name_str, wait, ex);
+        if (policy.on_attempt_failed) {
+            policy.on_attempt_failed(ex, wait);
+        }
+        // sleep_abortable() reports the caller's own exception, or
+        // sleep_aborted, which is an abort_requested_exception too.
+        co_await backoff.retry(as);
+    }
 }
 
 } // namespace db::pitr
