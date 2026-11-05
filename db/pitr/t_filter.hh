@@ -94,11 +94,26 @@ struct filter_result {
 // keep the delete and drop the data written with it, emptying a collection that
 // no statement ever emptied.
 //
-// The cost is one case which cannot be told apart: overwriting a non-frozen
-// collection or UDT with an empty or null value writes exactly what a plain
-// "DELETE c" writes (a tombstone just below the statement's timestamp, with no
-// members). It is treated as a delete, so T between the two keeps it. Frozen
-// collections and UDTs are plain atomic cells and are not affected.
+// The cost is two shapes which the bytes cannot tell apart from an overwrite,
+// so both are decided by the rule above and both are decided wrongly. They are
+// stated limits of the filter, not bugs in it: the statement boundary is simply
+// not recorded anywhere the filter can read. Frozen collections and UDTs are
+// plain atomic cells and are not affected by either.
+//
+//  1. Overwriting a non-frozen collection or UDT with an empty or null value
+//     writes exactly what a plain "DELETE c" writes: a tombstone just below the
+//     statement's timestamp, with no members. With no member above it, it is
+//     taken at face value and kept as a delete, so a T between the overwrite's
+//     tombstone and its timestamp keeps a delete the user did not issue then.
+//
+//  2. A BATCH merges its statements' mutations into one mutation per key
+//     (cql3/statements/eventual_consistency/batch_executor.cc), each statement
+//     keeping its own timestamp. A batch holding "DELETE c" at X and a write of
+//     a member at X + 1 therefore produces the same bytes as one overwrite at
+//     X + 1, and the delete is dropped together with the member. At T = X the
+//     collection's older members survive, where the real "DELETE c" at X should
+//     have removed them. test_batched_delete_then_member_is_a_stated_limit
+//     pins the behaviour.
 //
 // A cell kept by the filter keeps its original TTL and expiry: the filter
 // rewinds the write history, not the clock, so a cell which has already
@@ -114,6 +129,16 @@ struct filter_result {
 // compaction move it). A mutation built on the heap, as commitlog replay builds
 // one, satisfies both; a partition owned by a memtable or the row cache does
 // not.
+//
+// On what it costs to get here: replay reads a frozen_mutation, so something
+// has to materialise it first. unfreeze_gently() and apply_gently()
+// (mutation/async_utils.hh) do that with preemption points, and strict replay
+// should use them. What has no gentle path is conversion to another schema
+// version (converting_mutation_partition_applier is a synchronous
+// mutation_partition_visitor) and replica::database::apply_in_memory(), so for
+// one oversized partition the conversion before this filter and the apply after
+// it are the unpreemptable parts, not the filter. Unmeasured here; worth
+// measuring against the largest permitted write (task 1.3.3).
 seastar::future<filter_result> filter_at_timestamp(const mutation& m, api::timestamp_type t);
 
 } // namespace db::pitr

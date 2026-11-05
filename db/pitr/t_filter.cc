@@ -46,10 +46,11 @@ filter_stats& filter_stats::operator+=(const filter_stats& o) {
 
 // Filters one collection (or non-frozen UDT) cell. Every member is filtered on
 // its own timestamp; the collection-level tombstone is filtered on the
-// timestamp of the statement it belongs to, which is not always its own (see
-// collection_tombstone_statement_timestamp()). Returns nothing when neither the
-// tombstone nor any member is at or below T, in which case the whole cell is
-// dropped.
+// timestamp of the statement it belongs to, which is not always its own, and
+// which cannot always be recovered from the bytes. The rule and both of its
+// ambiguous cases are described above filter_at_timestamp() in t_filter.hh.
+// Returns nothing when neither the tombstone nor any member is at or below T,
+// in which case the whole cell is dropped.
 static future<std::optional<collection_mutation>> filter_collection(collection_mutation_view cmv, api::timestamp_type t, filter_stats& st) {
     auto tomb = cmv.tomb();
     // The views below point into `cmv`, which the caller guarantees is not
@@ -83,10 +84,15 @@ static future<std::optional<collection_mutation>> filter_collection(collection_m
         // timestamp would keep the delete while dropping the data it was
         // written with, emptying a collection that no statement ever emptied.
         //
-        // A tombstone with no member just above it is taken at face value: that
-        // is what a plain "DELETE c" writes. An overwrite with an empty or null
-        // collection writes exactly the same thing and is indistinguishable
-        // from it; it is treated as a delete.
+        // Two shapes are indistinguishable from an overwrite in the bytes and
+        // are therefore decided the same way, which is wrong for them; both are
+        // stated limits, pending a decision on whether to carry statement
+        // boundaries through the ledger. See t_filter.hh.
+        //  - an overwrite with an empty or null value writes what a plain
+        //    "DELETE c" writes, and is kept as a delete;
+        //  - a BATCH holding "DELETE c" at X and a member write at X + 1 merges
+        //    into one cell (eventual_consistency::batch_executor.cc), and the
+        //    delete is dropped with the member.
         const auto statement_timestamp = member_just_above_tomb ? tomb.timestamp + 1 : tomb.timestamp;
         if (statement_timestamp <= t) {
             ++st.collection_tombstones_kept;

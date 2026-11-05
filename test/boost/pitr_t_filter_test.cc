@@ -96,6 +96,7 @@ struct member_spec {
     sstring key;
     api::timestamp_type ts;
     bool live = true;
+    bool expiring = false;
 };
 
 static collection_mutation map_cell_ex(tombstone tomb, std::vector<member_spec> members) {
@@ -106,8 +107,10 @@ static collection_mutation map_cell_ex(tombstone tomb, std::vector<member_spec> 
         return a.key < b.key;
     });
     for (auto& ms : members) {
-        auto cell = ms.live ? atomic_cell::make_live(*utf8_type, ms.ts, serialized(sstring("val")), atomic_cell::collection_member::yes)
-                            : atomic_cell::make_dead(ms.ts, dt);
+        atomic_cell cell = !ms.live      ? atomic_cell::make_dead(ms.ts, dt)
+                           : ms.expiring ? atomic_cell::make_live(*utf8_type, ms.ts, serialized(sstring("val")), dt + gc_clock::duration(45),
+                                                   gc_clock::duration(45), atomic_cell::collection_member::yes)
+                                         : atomic_cell::make_live(*utf8_type, ms.ts, serialized(sstring("val")), atomic_cell::collection_member::yes);
         auto key_bytes = serialized(ms.key);
         w.push_back(bytes_view(key_bytes), atomic_cell_view(cell));
     }
@@ -657,6 +660,50 @@ SEASTAR_THREAD_TEST_CASE(test_collection_overwrite_is_one_statement) {
     }
 }
 
+// STATED LIMIT, not a bug being asserted as correct behaviour.
+//
+// A BATCH merges its statements into one mutation per key, each statement
+// keeping its own timestamp (eventual_consistency::batch_executor.cc). A batch
+// of "DELETE m" at X and "m['k'] = v" at X + 1 therefore writes exactly what a
+// single overwrite at X + 1 writes, and the filter cannot tell them apart. It
+// applies the overwrite rule, so at T = X the delete goes out with the member
+// and the collection's older members, which the delete at X should have
+// removed, survive in the restored table.
+//
+// This test pins what actually happens so that the limit is visible and any
+// change to it is deliberate. The decision on whether to carry statement
+// boundaries through the ledger is Ofir's.
+SEASTAR_THREAD_TEST_CASE(test_batched_delete_then_member_is_a_stated_limit) {
+    auto s = test_schema();
+    const auto key = ck(*s, "a");
+
+    // An older member, then the batch: DELETE m at T, m['k'] = v at T + 1.
+    auto m = empty_mutation(s);
+    m.set_clustered_cell(key, col(*s, "m"), map_cell_ex(tombstone(T, dt), {{"old", T - 5}, {"k", T + 1}}));
+
+    auto res = filter(m, T);
+
+    // What a correct answer would be, if the statement boundary were known:
+    // the delete at T survives and wipes the older member.
+    auto correct = empty_mutation(s);
+    correct.set_clustered_cell(key, col(*s, "m"), map_cell_ex(tombstone(T, dt), {{"old", T - 5}}));
+    BOOST_REQUIRE_MESSAGE(
+            !res.m.partition().equal(*s, correct.partition()), "the batch ambiguity is gone; update this test and the header if that was deliberate");
+
+    // What actually happens: the tombstone is taken for the overwrite's and
+    // dropped with the member above it, leaving the older member uncovered.
+    auto actual = empty_mutation(s);
+    actual.set_clustered_cell(key, col(*s, "m"), map_cell_ex({}, {{"old", T - 5}}));
+    assert_that(res.m).is_equal_to(actual);
+    BOOST_REQUIRE_EQUAL(res.stats.collection_tombstones_dropped, 1u);
+    BOOST_REQUIRE_EQUAL(res.stats.cells_kept, 1u);
+    BOOST_REQUIRE_EQUAL(res.stats.cells_dropped, 1u);
+
+    // At T + 1 the whole batch is below T and everything is kept, so the limit
+    // only shows between the two timestamps.
+    assert_that(filter(m, T + 1).m).is_equal_to(m);
+}
+
 // A collection larger than the filter's yield batch, so the preemption point
 // inside the member walk is actually taken.
 SEASTAR_THREAD_TEST_CASE(test_large_collection_is_filtered_in_batches) {
@@ -790,7 +837,7 @@ static std::vector<statement> make_statements(schema_ptr s, std::mt19937& gen) {
     std::uniform_int_distribution<api::timestamp_type> ts_dist(0, 6);
     std::uniform_int_distribution<int> coin(0, 1);
     std::uniform_int_distribution<int> kind3(0, 2);
-    std::uniform_int_distribution<int> kind4(0, 3);
+    std::uniform_int_distribution<int> kind5(0, 4);
     const char* rows[] = {"r0", "r1", "r2", "r3"};
 
     std::vector<statement> out;
@@ -850,7 +897,7 @@ static std::vector<statement> make_statements(schema_ptr s, std::mt19937& gen) {
                 continue;
             }
             const auto name = format("m{}", i);
-            switch (kind4(gen)) {
+            switch (kind5(gen)) {
             case 0: // SET m = {...}: tombstone one microsecond below the members
                 add(next_ts(), [=, &s](mutation& m, api::timestamp_type ts) {
                     m.set_clustered_cell(ck(*s, r), col(*s, name.c_str()), map_cell_ex(tombstone(ts - 1, dt), {{"a", ts}, {"b", ts}}));
@@ -864,6 +911,11 @@ static std::vector<statement> make_statements(schema_ptr s, std::mt19937& gen) {
             case 2: // DELETE m['a']
                 add(next_ts(), [=, &s](mutation& m, api::timestamp_type ts) {
                     m.set_clustered_cell(ck(*s, r), col(*s, name.c_str()), map_cell_ex({}, {{"a", ts, false}}));
+                });
+                break;
+            case 3: // m['a'] = ... USING TTL: an expiring member
+                add(next_ts(), [=, &s](mutation& m, api::timestamp_type ts) {
+                    m.set_clustered_cell(ck(*s, r), col(*s, name.c_str()), map_cell_ex({}, {{"a", ts, true, true}}));
                 });
                 break;
             default: // DELETE m
