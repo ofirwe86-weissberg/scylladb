@@ -7,10 +7,10 @@
  */
 
 // Tests for the commitlog's point-in-time-recovery hold
-// (commitlog::config::hold_segments) and its segment-closed callback
-// (commitlog::config::segment_closed). The consumer of the callback here is a
-// fake recorder: nothing uploads anything yet.
-// See https://github.com/ofirwe86-weissberg/scylladb/issues/6.
+// (commitlog::config::hold_segments), its segment-closed callback
+// (commitlog::config::segment_closed) and the limit the hold is clamped to.
+// The consumer of the callback here is a fake recorder: nothing uploads
+// anything yet. See https://github.com/ofirwe86-weissberg/scylladb/issues/6.
 
 #include <boost/test/unit_test.hpp>
 
@@ -48,7 +48,7 @@ table_id make_table_id() {
 
 // Runs `f` against a commitlog in its own directory, then shuts it down and
 // deletes everything, as cl_test in commitlog_test.cc does.
-future<> with_log(commitlog::config cfg, noncopyable_function<future<> (commitlog&)> f) {
+future<> with_log(commitlog::config cfg, noncopyable_function<future<>(commitlog&)> f) {
     tmpdir tmp;
     cfg.commit_log_location = tmp.path().string();
     auto log = co_await commitlog::create_commitlog(std::move(cfg));
@@ -86,7 +86,7 @@ commitlog::config hold_config() {
 }
 
 future<rp_handle> write_some(commitlog& log, const table_id& id, size_t size = 128) {
-    return log.add_mutation(id, size, commitlog::force_sync::no, [size] (commitlog::output& dst) {
+    return log.add_mutation(id, size, commitlog::force_sync::no, [size](commitlog::output& dst) {
         dst.fill('x', size);
     });
 }
@@ -133,7 +133,7 @@ private:
 
 public:
     commitlog::config::segment_closed_handler handler() {
-        return [this] (segment_id_type id, uint64_t used_size, bool failed) {
+        return [this](segment_id_type id, uint64_t used_size, bool failed) {
             _events.push_back(event{id, used_size, failed});
             if (_awaited && *_awaited == std::pair(id, failed)) {
                 _awaited.reset();
@@ -147,7 +147,9 @@ public:
     }
 
     std::optional<event> find(segment_id_type id, bool failed = false) const {
-        auto i = std::ranges::find_if(_events, [&] (const event& e) { return e.id == id && e.failed == failed; });
+        auto i = std::ranges::find_if(_events, [&](const event& e) {
+            return e.id == id && e.failed == failed;
+        });
         return i == _events.end() ? std::nullopt : std::optional(*i);
     }
 
@@ -186,7 +188,7 @@ class failing_file_impl : public checked_file_impl {
 
 public:
     failing_file_impl(file f, bool* fail_flush)
-        : checked_file_impl([] (std::exception_ptr) {}, std::move(f))
+        : checked_file_impl([](std::exception_ptr) {}, std::move(f))
         , _fail_flush(fail_flush) {
     }
 
@@ -231,7 +233,7 @@ BOOST_AUTO_TEST_SUITE(commitlog_hold_test)
 // sealed, discarded segment leaves the active list, so the replay floor moves
 // past it and it is on its way to deletion. That is today's behaviour.
 SEASTAR_TEST_CASE(test_sealed_segment_is_released_without_the_hold) {
-    co_await with_log(base_config(), [] (commitlog& log) -> future<> {
+    co_await with_log(base_config(), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto sealed = co_await write_and_seal(log, uuid);
 
@@ -243,7 +245,7 @@ SEASTAR_TEST_CASE(test_sealed_segment_is_released_without_the_hold) {
 // With the hold, the same segment stays: still in the active list, so the
 // replay floor stays with it, and still on disk, so it can be shipped.
 SEASTAR_TEST_CASE(test_held_segment_is_kept_after_discard) {
-    co_await with_log(hold_config(), [] (commitlog& log) -> future<> {
+    co_await with_log(hold_config(), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto sealed = co_await write_and_seal(log, uuid);
 
@@ -257,7 +259,7 @@ SEASTAR_TEST_CASE(test_held_segment_is_kept_after_discard) {
 
 // Releasing the hold hands the segment back to the normal delete path.
 SEASTAR_TEST_CASE(test_released_segment_is_deleted) {
-    co_await with_log(hold_config(), [] (commitlog& log) -> future<> {
+    co_await with_log(hold_config(), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto sealed = co_await write_and_seal(log, uuid);
 
@@ -273,7 +275,7 @@ SEASTAR_TEST_CASE(test_released_segment_is_deleted) {
 // Releasing something that is not held is ignored, not a crash: a consumer
 // may retry a release after a restart or a repeated notification.
 SEASTAR_TEST_CASE(test_releasing_an_unheld_segment_is_ignored) {
-    co_await with_log(hold_config(), [] (commitlog& log) -> future<> {
+    co_await with_log(hold_config(), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto sealed = co_await write_and_seal(log, uuid);
 
@@ -286,7 +288,7 @@ SEASTAR_TEST_CASE(test_releasing_an_unheld_segment_is_ignored) {
 
 // The hold queue is in creation order, whatever order releases come in.
 SEASTAR_TEST_CASE(test_held_segments_are_in_creation_order) {
-    co_await with_log(hold_config(), [] (commitlog& log) -> future<> {
+    co_await with_log(hold_config(), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto first = (co_await write_and_seal(log, uuid)).id;
         auto second = (co_await write_and_seal(log, uuid)).id;
@@ -310,8 +312,8 @@ SEASTAR_TEST_CASE(test_hold_is_per_commitlog_instance) {
     auto plain_cfg = base_config();
     plain_cfg.fname_prefix = "SchemaLog-"; // as the schema commitlog does
 
-    co_await with_log(hold_config(), [&plain_cfg] (commitlog& held) -> future<> {
-        co_await with_log(plain_cfg, [&held] (commitlog& plain) -> future<> {
+    co_await with_log(hold_config(), [&plain_cfg](commitlog& held) -> future<> {
+        co_await with_log(plain_cfg, [&held](commitlog& plain) -> future<> {
             auto uuid = make_table_id();
 
             auto plain_sealed = co_await write_and_seal(plain, uuid);
@@ -362,14 +364,15 @@ SEASTAR_TEST_CASE(test_hold_at_disk_limit_blocks_writes_until_release) {
     cfg.commitlog_total_space_in_mb = 4 * this_smp_shard_count();
     cfg.allow_going_over_size_limit = false;
 
-    co_await with_log(std::move(cfg), [] (commitlog& log) -> future<> {
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto size = log.max_record_size() / 4;
         // The handles are dropped, so every segment is clean right away: the
         // hold is the only thing keeping the segments on disk.
-        auto write = [&] () -> future<> {
-            auto h = co_await log.add_mutation(uuid, size, db::timeout_clock::now() + 2s, commitlog::force_sync::no,
-                    [size] (commitlog::output& dst) { dst.fill('x', size); });
+        auto write = [&]() -> future<> {
+            auto h = co_await log.add_mutation(uuid, size, db::timeout_clock::now() + 2s, commitlog::force_sync::no, [size](commitlog::output& dst) {
+                dst.fill('x', size);
+            });
             (void)h;
         };
 
@@ -406,7 +409,7 @@ SEASTAR_TEST_CASE(test_hold_at_disk_limit_blocks_writes_until_release) {
 SEASTAR_TEST_CASE(test_forced_seal_notifies_with_used_size) {
     close_recorder rec;
 
-    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+    co_await with_log(recording_config(rec), [&rec](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto h = co_await write_some(log, uuid);
         auto id = h.rp().id;
@@ -426,7 +429,7 @@ SEASTAR_TEST_CASE(test_forced_seal_notifies_with_used_size) {
 SEASTAR_TEST_CASE(test_natural_close_notifies_with_used_size) {
     close_recorder rec;
 
-    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+    co_await with_log(recording_config(rec), [&rec](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         auto size = log.max_record_size() / 4;
 
@@ -469,7 +472,7 @@ SEASTAR_TEST_CASE(test_failed_close_is_reported_as_failed_and_not_held) {
     auto cfg = recording_config(rec);
     cfg.extensions = &exts;
 
-    co_await with_log(std::move(cfg), [&rec, &fail_flush] (commitlog& log) -> future<> {
+    co_await with_log(std::move(cfg), [&rec, &fail_flush](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         rp_set rps;
         auto h = co_await write_some(log, uuid);
@@ -501,7 +504,7 @@ SEASTAR_TEST_CASE(test_failed_close_is_reported_as_failed_and_not_held) {
 SEASTAR_TEST_CASE(test_held_bytes_counts_closed_held_segments) {
     close_recorder rec;
 
-    co_await with_log(recording_config(rec), [&rec] (commitlog& log) -> future<> {
+    co_await with_log(recording_config(rec), [&rec](commitlog& log) -> future<> {
         auto uuid = make_table_id();
         BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
 
@@ -518,6 +521,61 @@ SEASTAR_TEST_CASE(test_held_bytes_counts_closed_held_segments) {
         log.release_segment(second);
         co_await log.wait_for_pending_deletes();
         BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
+    });
+}
+
+// ----------------------------------------------------------- the hold limit
+
+// The configured limit is clamped to three quarters of the lower of this
+// shard's flush threshold and its disk limit, so that a consumer watching
+// held_bytes() reacts before the commitlog flushes memtables or blocks writes.
+SEASTAR_TEST_CASE(test_hold_limit_is_clamped_to_the_commitlog_limits) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 8 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1024; // far more than the commitlog has
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        auto threshold = log.disk_limit() / 2; // the default flush threshold
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), threshold / 4 * 3);
+        BOOST_REQUIRE_LT(log.segment_hold_limit(), threshold);
+        BOOST_REQUIRE_LT(log.segment_hold_limit(), log.disk_limit());
+        co_return;
+    });
+}
+
+// A limit below the clamp is what was asked for.
+SEASTAR_TEST_CASE(test_hold_limit_below_the_clamp_is_kept) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 8 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), 1024u * 1024u);
+        co_return;
+    });
+}
+
+// An explicit flush threshold is the bound, when it is the lower one.
+SEASTAR_TEST_CASE(test_hold_limit_follows_an_explicit_flush_threshold) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 64 * this_smp_shard_count();
+    cfg.commitlog_flush_threshold_in_mb = 2 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1024;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), (2u * 1024 * 1024) / 4 * 3);
+        co_return;
+    });
+}
+
+// With the hold off there is no limit to watch.
+SEASTAR_TEST_CASE(test_hold_limit_is_zero_without_the_hold) {
+    auto cfg = base_config();
+    cfg.segment_hold_limit_in_mb = 1024;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), 0u);
+        co_return;
     });
 }
 

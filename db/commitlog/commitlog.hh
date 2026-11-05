@@ -159,6 +159,11 @@ public:
         // takes it from there.
         using segment_closed_handler = std::function<void(segment_id_type id, uint64_t used_size, bool failed)>;
         segment_closed_handler segment_closed;
+
+        // Upper bound, in MiB, on the data held for the handler above, before
+        // this shard's own commitlog limits clamp it (see segment_hold_limit).
+        // 0 means "whatever the commitlog's own limits allow".
+        uint64_t segment_hold_limit_in_mb = 0;
     };
 
     struct descriptor {
@@ -355,6 +360,15 @@ public:
      * not counted either, which is why the limit below keeps a margin.
      */
     uint64_t held_bytes() const;
+
+    /**
+     * The effective hold limit in bytes: config::segment_hold_limit_in_mb,
+     * clamped to stay below both this shard's commitlog flush threshold and
+     * its disk limit, so that a consumer watching held_bytes() reacts before
+     * the commitlog starts flushing memtables or blocking writes. 0 when the
+     * hold is off.
+     */
+    uint64_t segment_hold_limit() const;
 
     /**
      * Releases the hold on one segment, so that it can be deleted, and runs a
