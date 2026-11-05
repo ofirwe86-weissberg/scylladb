@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Current task
 
-See `docs-work/assignment.md`.
+See `docs-work/assignment.md`, and `docs-work/handoff.md` for the current state. `docs-work/` is in the main checkout only, not in worktrees, so use its absolute path there.
 
 ## Repo
 
@@ -55,25 +55,32 @@ Upstream: `scylladb/scylladb`. Default branch: `master`. This checkout has two r
 # Sanitizer / debug (slow — use for memory/lifetime-sensitive changes)
 ./tools/toolchain/dbuild ninja build/sanitize/scylla   # or build/debug/...; then ./test.py --mode=sanitize ...
 
-# Format changed lines only
-git clang-format master
+# Format: new files whole, changed lines only in existing files. Never run git inside dbuild (see below)
+./tools/toolchain/dbuild clang-format -i <new_file>
+./tools/toolchain/dbuild clang-format -i --lines=<start>:<end> <existing_file>
 ```
+
+**Don't run git inside `dbuild`.** In a worktree it fails, because the main `.git` isn't mounted. Mounting it with `-v` coincided to the second with Git LFS hooks appearing in the shared `.git/hooks`, which blocked all pushes until `git-lfs` was installed on the VM.
+
+**When builds overlap,** give each its own sccache port, or sccache fails with "No such file": `./tools/toolchain/dbuild --env SCCACHE_SERVER_PORT=<port> -- ninja -j3 <target>`.
 
 Build modes: `debug`, `dev`, `release`, `sanitize`. Agents use `dev` by default. If `test.py` hits cgroup-metrics permission errors, add `--no-gather-metrics`. Logs land in `testlog/<mode>/`. A full build is long (hours on modest hardware, ~2–3 GB RAM per compile/link thread), so build the narrowest target. `configure.py --compiler-cache` defaults to `auto` and picks up the image's `sccache` (`build.ninja`: `cxx_launcher = /usr/bin/sccache`), which is what makes a rebuild in a fresh worktree survivable. Measured here at `-j6`: an incremental `build/dev/scylla` relink took 11m32s.
 
-**Max parallel agents: 3, and only for tasks that don't block each other.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM.
+**Max parallel agents: 3, and only for tasks that don't block each other.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM. The team lead's caution on this 15 GB VM is at most 2 heavy builds at once.
+
+**Before trusting a test result on this Lima VM:** `fs.aio-max-nr` is 1048576, and clangd background indexing is off (`--background-index=false`). Both produced failures with no code at fault.
 
 Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node Python), `cluster` (multi-node, `test/pylib` manager), `cql` (approval tests; review any `.reject` diff before overwriting `.result`), `rest_api`, `nodetool`, `scylla_gdb`; also `vector_search`, `ldap`, `tools`, `perf`, `dist_test`, `manual` and `pylib_test` (`ls test/` for the full set). cqlpy tests should also pass on Cassandra.
 
 ## Conventions
 
-- Formatting: root `.clang-format`; apply to changed lines only (`git clang-format`), never reformat untouched code. Four spaces, braces on all scopes, `snake_case`, `_member` prefix. Follow the Seastar coding style and the surrounding file.
+- Formatting: root `.clang-format`; apply to changed lines only, never reformat untouched code. Four spaces, braces on all scopes, `snake_case`, `_member` prefix. Follow the Seastar coding style and the surrounding file.
 - Error handling: exceptions by default (futures propagate them); in coroutines prefer `co_return coroutine::exception(...)`; on the data path avoid exceptions (`std::expected`/`boost::outcome`). Invariants: `throwing_assert()` (`utils/assert.hh`), `SCYLLA_ASSERT` only where abort is unavoidable, `on_internal_error()` for should-never-happen. Never `new`/`delete`, `std::mutex`, blocking calls, or ad-hoc macros.
 - Memory/ids: `std::unique_ptr` by default, `lw_shared_ptr` within a shard, `foreign_ptr` across shards; new UUID-style ids use `utils::tagged_uuid`; `utils::chunked_vector` for allocations >128KB.
 - Logging: `seastar::logger` per subsystem, structured, never log credentials/PII.
 - Commit messages: `module: imperative summary` (e.g. `sstables: close file-descriptor on error`; `tree:` for whole-tree changes); body explains why; reference issues (`Fixes #N`). Signed-off-by is not consistently used in recent history. Each commit must compile and pass tests (bisectable). See `docs/dev/review-checklist.md`.
 - New files: SPDX header with `LicenseRef-ScyllaDB-Source-Available-1.1`, current year for new files only.
-- Tests: every bug fix comes with a test that fails before and passes after, and cites the GitHub/JIRA issue. New tests must be stable (`--repeat 100 --max-failures 1`), fast, deterministic, and free of sleeps; reduce iterations in debug mode.
+- Tests: every bug fix comes with a test that fails before and passes after, and cites the GitHub/JIRA issue. New tests must be stable (5 of 5 while developing, 100 of 100 after review, as in Development rules), fast, deterministic, and free of sleeps; reduce iterations in debug mode.
 - Question requests rather than implementing blindly; flag trade-offs.
 
 ## Development rules
@@ -176,8 +183,9 @@ For feature work, the order is: requirements (`product-manager`), then a full te
 - **QA models:** planning uses Opus. Implementing Python tests from a detailed plan uses Sonnet, and reviewers stay on Opus.
 - **Start a fresh agent for each PR,** since long-running agents use far more of the session limit. For risky tasks, each PR is reviewed before the next starts; simple tasks may overlap. Change headers once and early, to limit rebuilds. The task's detail is in its issue. A fresh agent can reuse a built worktree.
 - **Keep commits and reviews small: aim for 100-300 product lines per PR,** tests not counted, with 500 as a ceiling. For scale, half the repo's recent PRs are under 47 product lines, and 90% under 543. A larger task is split into smaller self-contained tasks, each with its own commit and PR.
+- **No piece runs longer than foreseen.** Each piece gets a stated time when it starts, from its task's size, with one behaviour per piece. At the limit it stops and reports: ship what passes, split the rest, and tell the human.
 - **One commit and one PR per task.** Each task issue gets its own commit on its own branch and its own PR, opened for review. Agents never merge. Dependent PRs stack on the previous task's branch, so each diff shows only its own task. Each PR title starts with the task ID, and its description states the task, its requirements, what changed, tests run with results, what it depends on, and what's not done.
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.
 - `.claude/hooks/guard-destructive-ops.sh` blocks merges, pushes to the default branch, force pushes, `git reset --hard`, `git clean -fdx`, and wiping the build tree. It is a speed bump, not a security boundary — branch protection is the control that holds.
-- `.claude/hooks/check-cpp-format.sh` checks changed lines of edited C/C++ files against `.clang-format` and asks the agent to fix them. The hook runs on the host, where `git-clang-format` is absent, so it is a silent no-op; `clang-format` and `git-clang-format` live in the toolchain image, so format changed lines with `./tools/toolchain/dbuild git clang-format master` yourself rather than relying on the hook.
+- `.claude/hooks/check-cpp-format.sh` checks changed lines of edited C/C++ files against `.clang-format` and asks the agent to fix them. The hook runs on the host, where `git-clang-format` is absent, so it is a silent no-op; `clang-format` and `git-clang-format` live in the toolchain image, so format changed lines with `./tools/toolchain/dbuild clang-format -i --lines=<start>:<end> <file>` yourself rather than relying on the hook.
