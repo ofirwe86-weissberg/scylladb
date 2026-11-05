@@ -7,9 +7,10 @@
  */
 
 // Tests for the commitlog's point-in-time-recovery hold
-// (commitlog::config::hold_segments) and its segment-closed callback
-// (commitlog::config::segment_closed). The consumer of the callback here is a
-// fake recorder: nothing uploads anything yet. See issue #6.
+// (commitlog::config::hold_segments), its segment-closed callback
+// (commitlog::config::segment_closed) and the limit the hold is clamped to.
+// The consumer of the callback here is a fake recorder: nothing uploads
+// anything yet. See issue #6.
 
 #include <boost/test/unit_test.hpp>
 
@@ -30,6 +31,7 @@
 #include "db/commitlog/commitlog.hh"
 #include "db/commitlog/commitlog_extensions.hh"
 #include "db/commitlog/rp_set.hh"
+#include "db/config.hh"
 #include "db/extensions.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
@@ -147,7 +149,9 @@ public:
     }
 
     std::vector<segment_id_type> ids() const {
-        return _events | std::views::transform([](const event& e) { return e.id; }) | std::ranges::to<std::vector>();
+        return _events | std::views::transform([](const event& e) {
+            return e.id;
+        }) | std::ranges::to<std::vector>();
     }
 
     std::optional<event> find(segment_id_type id, bool failed = false) const {
@@ -746,6 +750,72 @@ SEASTAR_TEST_CASE(test_batch_write_failure_reports_the_segment_failed_and_unheld
         BOOST_REQUIRE(rec.has(id, true));
         auto held = log.held_segments();
         BOOST_REQUIRE(std::ranges::find(held, id) == held.end());
+    });
+}
+
+// ----------------------------------------------------------- the hold limit
+
+// The configured limit is clamped to three quarters of the lower of this
+// shard's flush threshold and its disk limit, so that a consumer watching
+// held_bytes() reacts before the commitlog flushes memtables or blocks writes.
+SEASTAR_TEST_CASE(test_hold_limit_is_clamped_to_the_commitlog_limits) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 8 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1024; // far more than the commitlog has
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        auto threshold = log.disk_limit() / 2; // the default flush threshold
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), threshold / 4 * 3);
+        BOOST_REQUIRE_LT(log.segment_hold_limit(), threshold);
+        BOOST_REQUIRE_LT(log.segment_hold_limit(), log.disk_limit());
+        co_return;
+    });
+}
+
+// A limit below the clamp is what was asked for.
+SEASTAR_TEST_CASE(test_hold_limit_below_the_clamp_is_kept) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 8 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), 1024u * 1024u);
+        co_return;
+    });
+}
+
+// An explicit flush threshold is the bound, when it is the lower one.
+SEASTAR_TEST_CASE(test_hold_limit_follows_an_explicit_flush_threshold) {
+    auto cfg = hold_config();
+    cfg.commitlog_total_space_in_mb = 64 * this_smp_shard_count();
+    cfg.commitlog_flush_threshold_in_mb = 2 * this_smp_shard_count();
+    cfg.segment_hold_limit_in_mb = 1024;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), (2u * 1024 * 1024) / 4 * 3);
+        co_return;
+    });
+}
+
+// The operator's option is the one the commitlog clamps, so the number the
+// consumer watches is the number that was configured.
+SEASTAR_TEST_CASE(test_hold_limit_comes_from_the_pitr_config) {
+    db::config db_cfg;
+    db_cfg.pitr_unshipped_limit_in_mb.set(17);
+
+    auto cfg = commitlog::config::from_db_config(db_cfg, seastar::default_scheduling_group(), memory::stats().total_memory());
+    BOOST_REQUIRE_EQUAL(cfg.segment_hold_limit_in_mb, 17u);
+    co_return;
+}
+
+// With the hold off there is no limit to watch.
+SEASTAR_TEST_CASE(test_hold_limit_is_zero_without_the_hold) {
+    auto cfg = base_config();
+    cfg.segment_hold_limit_in_mb = 1024;
+
+    co_await with_log(std::move(cfg), [](commitlog& log) -> future<> {
+        BOOST_REQUIRE_EQUAL(log.segment_hold_limit(), 0u);
+        co_return;
     });
 }
 

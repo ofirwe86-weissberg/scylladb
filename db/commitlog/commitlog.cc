@@ -112,6 +112,9 @@ db::commitlog::config db::commitlog::config::from_db_config(const db::config& cf
     c.extensions = &cfg.extensions();
     c.use_o_dsync = cfg.commitlog_use_o_dsync();
     c.allow_going_over_size_limit = false;
+    // The hold is off until someone sets config::hold_segments, so this only
+    // decides how much that someone may hold. See segment_hold_limit().
+    c.segment_hold_limit_in_mb = cfg.pitr_unshipped_limit_in_mb();
 
     if (cfg.commitlog_flush_threshold_in_mb() >= 0) {
         c.commitlog_flush_threshold_in_mb = cfg.commitlog_flush_threshold_in_mb();
@@ -260,6 +263,9 @@ public:
     // we distribute stuff more or less equally across shards.
     const uint64_t max_disk_size; // per-shard
     const uint64_t disk_usage_threshold;
+    // Effective limit on the data held. See commitlog::segment_hold_limit().
+    // 0 when the hold is off.
+    const uint64_t segment_hold_limit;
 
     bool _shutdown = false;
     std::optional<shared_promise<>> _shutdown_promise = {};
@@ -549,9 +555,9 @@ private:
     size_t max_request_controller_units() const;
     segment_id_type _ids = 0, _low_id = 0;
     std::vector<sseg_ptr> _segments;
-    // Ids held from deletion, in creation order. Bounded by the commitlog's
-    // own disk limit, since a held segment cannot be deleted and so stays in
-    // _segments.
+    // Ids held from deletion, in creation order. Bounded by
+    // segment_hold_limit, and in any case by the commitlog's own disk limit,
+    // since a held segment cannot be deleted and so stays in _segments.
     std::deque<segment_id_type> _held_segments;
     uint64_t _held_bytes = 0;
     queue<sseg_ptr> _reserve_segments;
@@ -2099,6 +2105,28 @@ db::commitlog::segment_manager::segment_manager(config c)
             return max_disk_size / 2;
         }
     }())
+    // The hold has to trip before the commitlog starts flushing memtables, and
+    // well before it blocks writes waiting for space, or an outage of the
+    // object store would be felt as a flush storm or a write stall first. So
+    // take three quarters of the lower of the two limits, and never more than
+    // what was configured. A limit of zero means unlimited, and is skipped.
+    , segment_hold_limit([&] () -> uint64_t {
+        if (!cfg.hold_segments) {
+            return 0;
+        }
+        uint64_t headroom = 0;
+        for (auto limit : {disk_usage_threshold, max_disk_size}) {
+            if (limit != 0 && (headroom == 0 || limit < headroom)) {
+                headroom = limit;
+            }
+        }
+        headroom = headroom / 4 * 3;
+        auto configured = cfg.segment_hold_limit_in_mb * uint64_t(1024 * 1024);
+        if (headroom == 0) {
+            return configured; // nothing to clamp against
+        }
+        return configured == 0 ? headroom : std::min(configured, headroom);
+    }())
     , _flush_semaphore(cfg.max_active_flushes)
     // That is enough concurrency to allow for our largest mutation (max_mutation_size), plus
     // an existing in-flight buffer. Since we'll force the cycling() of any buffer that is bigger
@@ -2125,7 +2153,9 @@ db::commitlog::segment_manager::segment_manager(config c)
         throw std::invalid_argument("Invalid filename prefix: " + cfg.fname_prefix);
     }
     if (cfg.hold_segments) {
-        clogger.info("Commitlog {} holds its segments from deletion until they are released", cfg.commit_log_location);
+        clogger.info("Commitlog {} holds closed segments for shipping, up to {} MB per shard (configured {} MB, flush threshold {} MB, disk limit {} MB)",
+                cfg.commit_log_location, segment_hold_limit / (1024 * 1024), cfg.segment_hold_limit_in_mb,
+                disk_usage_threshold / (1024 * 1024), max_disk_size / (1024 * 1024));
     }
 }
 
@@ -4158,6 +4188,10 @@ std::vector<db::segment_id_type> db::commitlog::held_segments() const {
 
 uint64_t db::commitlog::held_bytes() const {
     return _segment_manager->held_bytes();
+}
+
+uint64_t db::commitlog::segment_hold_limit() const {
+    return _segment_manager->segment_hold_limit;
 }
 
 void db::commitlog::release_segment(segment_id_type id) {

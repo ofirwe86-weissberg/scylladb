@@ -144,6 +144,10 @@ public:
         // Calls are not ordered by id; held_segments() is.
         using segment_closed_handler = std::function<void(segment_id_type id, uint64_t used_size, bool failed)>;
         segment_closed_handler segment_closed;
+
+        // Upper bound in MiB on what may be held, before the commitlog's own
+        // limits clamp it (see segment_hold_limit()). 0 leaves only those.
+        uint64_t segment_hold_limit_in_mb = 0;
     };
 
     struct descriptor {
@@ -339,6 +343,13 @@ public:
      * written is not counted: it cannot be shipped yet.
      */
     uint64_t held_bytes() const;
+
+    /**
+     * config::segment_hold_limit_in_mb in bytes, clamped below this shard's
+     * commitlog flush threshold and disk limit, so that a consumer watching
+     * held_bytes() reacts first. 0 when the hold is off.
+     */
+    uint64_t segment_hold_limit() const;
 
     /**
      * Releases the hold on one segment and sweeps. An unheld id is ignored.
