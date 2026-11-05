@@ -48,6 +48,7 @@ target_sources(db
     snapshot/cluster_backup.cc
     rate_limiter.cc
     per_partition_rate_limit_options.cc
+    pitr/pitr_shipper.cc
     pitr/t_filter.cc
     row_cache.cc
     tablet_options.cc

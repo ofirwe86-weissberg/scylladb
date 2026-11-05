@@ -69,6 +69,7 @@
 #include "db/commitlog/commitlog.hh"
 #include "db/hints/manager.hh"
 #include "db/commitlog/commitlog_replayer.hh"
+#include "db/pitr/pitr_shipper.hh"
 #include "db/view/view_builder.hh"
 #include "utils/error_injection.hh"
 #include "utils/runtime.hh"
@@ -2401,6 +2402,18 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 });
             }).get();
 
+            // After the commitlog has been replayed and the old segments are
+            // gone, so that the shipper only ever sees segments of this boot,
+            // and before the services that take writes, so that it stops after
+            // them and before the commitlog itself.
+            checkpoint(stop_signal, "starting point-in-time recovery shipper");
+            seastar::sharded<db::pitr::pitr_shipper> pitr_shipper;
+            pitr_shipper.start(std::ref(*cfg)).get();
+            auto stop_pitr_shipper = defer_verbose_shutdown("point-in-time recovery shipper", [&pitr_shipper] {
+                pitr_shipper.stop().get();
+            });
+            pitr_shipper.invoke_on_all(&db::pitr::pitr_shipper::start).get();
+
             checkpoint(stop_signal, "starting column family API");
             api::set_server_column_family(ctx, db).get();
             auto stop_cf_api = defer_verbose_shutdown("column family API", [&ctx] {
@@ -2698,6 +2711,23 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
 
             startlog.info("Verifying that all of the tablet keyspaces use rack list replication factors");
             db.local().check_rack_list_everywhere(cfg->enforce_rack_list());
+
+            // After join_cluster() the local topology holds the cluster this
+            // node knows about, which is the first point single-node PITR can
+            // tell a single node from a cluster. This is a startup check only:
+            // a node joining later in this run is not noticed here. Every node
+            // the topology still holds counts - not just the normal token
+            // owners, which leave out zero-token and bootstrapping nodes - so
+            // that an unexpected shape refuses rather than ships.
+            {
+                size_t node_count = 0;
+                token_metadata.local().get()->get_topology().for_each_node([&node_count] (const locator::node&) {
+                    ++node_count;
+                });
+                pitr_shipper.invoke_on_all([node_count] (db::pitr::pitr_shipper& shipper) {
+                    shipper.note_cluster_size(node_count);
+                }).get();
+            }
 
             // The table-based audit backend needs Raft (via join_cluster)
             // to create its keyspace and table.
