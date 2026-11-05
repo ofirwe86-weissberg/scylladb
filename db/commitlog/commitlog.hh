@@ -129,6 +129,16 @@ public:
         std::optional<segment_id_type> base_segment_id;
 
         const db::extensions * extensions = nullptr;
+
+        // Point-in-time recovery hold, used by db/pitr. Set for the main
+        // commitlog only; hints and the schema commitlog leave it off, which
+        // is the default and leaves the commitlog behaving exactly as it did.
+        //
+        // With it on, every segment that enters the active list - which
+        // happens before it can take a write - is held from deletion until
+        // release_segment() is called for its id. Nothing releases it on its
+        // own, so whoever turns it on owns releasing it.
+        bool hold_segments = false;
     };
 
     struct descriptor {
@@ -312,6 +322,18 @@ public:
      * associated with them
      */
     future<> delete_segments(std::vector<sstring>) const;
+
+    /**
+     * Ids of the segments held from deletion, in creation order. Empty unless
+     * config::hold_segments is set.
+     */
+    std::vector<segment_id_type> held_segments() const;
+
+    /**
+     * Releases the hold on one segment, so that it can be deleted, and runs a
+     * discard sweep. An id that is not held is ignored.
+     */
+    void release_segment(segment_id_type);
 
     uint64_t get_total_size() const;
     uint64_t get_buffer_size() const;

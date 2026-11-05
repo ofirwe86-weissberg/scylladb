@@ -13,6 +13,7 @@
 #include <malloc.h>
 #include <boost/regex.hpp>
 #include <filesystem>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <exception>
@@ -480,7 +481,17 @@ public:
     void discard_unused_segments() noexcept;
     void discard_completed_segments(const cf_id_type&) noexcept;
     void discard_completed_segments(const cf_id_type&, const rp_set&) noexcept;
-    
+
+    // See commitlog::held_segments().
+    bool hold_enabled() const noexcept {
+        return cfg.hold_segments;
+    }
+    void hold_segment(segment&) noexcept;
+    void drop_hold(segment&) noexcept;
+    void release_held_segment(segment_id_type) noexcept;
+    std::vector<segment_id_type> held_segments() const;
+
+
     future<> force_new_active_segment() noexcept;
     future<> wait_for_pending_deletes() noexcept;
 
@@ -534,6 +545,10 @@ private:
     size_t max_request_controller_units() const;
     segment_id_type _ids = 0, _low_id = 0;
     std::vector<sseg_ptr> _segments;
+    // Ids held from deletion, in creation order. Bounded by the commitlog's
+    // own disk limit, since a held segment cannot be deleted and so stays in
+    // _segments.
+    std::deque<segment_id_type> _held_segments;
     queue<sseg_ptr> _reserve_segments;
     queue<named_file> _recycled_segments;
     std::unordered_map<flush_handler_id, flush_handler> _flush_handlers;
@@ -768,6 +783,10 @@ class db::commitlog::segment : public enable_shared_from_this<segment>, public c
     bool _closed = false;
     bool _terminated = false;
 
+    // Held from deletion for segment_manager::cfg.hold_segments. Checked by
+    // can_delete(), which runs often, so it must stay a plain flag.
+    bool _shipping_hold = false;
+
     using buffer_type = segment_manager::buffer_type;
     using sseg_ptr = segment_manager::sseg_ptr;
     using clock_type = segment_manager::clock_type;
@@ -862,6 +881,19 @@ public:
     }
     ~segment() {
         dispose_mode mode = dispose_mode::Keep;
+
+        if (_shipping_hold) {
+            // While the commitlog runs, a held segment cannot get here:
+            // can_delete() is false for it, so no discard path drops its last
+            // reference, and the one path that erases a segment directly (the
+            // oversized-write rollback) drops the hold first. Boot replay and
+            // shutdown do delete held segments, by design - the shipped chain
+            // simply ends there - and that is the only case this covers.
+            if (!_segment_manager->_shutdown) {
+                on_internal_error_noexcept(clogger, format("Segment {} was destroyed while held for shipping", *this));
+            }
+            _segment_manager->drop_hold(*this);
+        }
 
         if (is_clean()) {
             clogger.debug("Segment {} is no longer active and will submitted for delete now", *this);
@@ -1555,7 +1587,7 @@ public:
         return position() <= _flush_pos;
     }
     bool can_delete() const noexcept {
-        return is_unused() && is_flushed();
+        return is_unused() && is_flushed() && !_shipping_hold;
     }
     bool contains(const replay_position& pos) const noexcept {
         return pos.id == _desc.id;
@@ -1962,6 +1994,9 @@ future<> db::commitlog::segment_manager::oversized_allocation(entry_writer& writ
             s->reset_file_position(fp);
             if (fp == 0) {
                 s->mark_clean();
+                // This segment is about to leave _segments and be destroyed,
+                // so it cannot stay held.
+                drop_hold(*s);
                 _segments.erase(std::remove(_segments.begin(), _segments.end(), s), _segments.end());
             }
         }
@@ -2043,6 +2078,9 @@ db::commitlog::segment_manager::segment_manager(config c)
     }
     if (!boost::regex_match(cfg.fname_prefix, allowed_prefix)) {
         throw std::invalid_argument("Invalid filename prefix: " + cfg.fname_prefix);
+    }
+    if (cfg.hold_segments) {
+        clogger.info("Commitlog {} holds its segments from deletion until they are released", cfg.commit_log_location);
     }
 }
 
@@ -2593,6 +2631,10 @@ future<db::commitlog::segment_manager::sseg_ptr> db::commitlog::segment_manager:
     } else {
         _segments.push_back(s);
         _segments.back()->reset_sync_time();
+        // Hold it before it can take a write: a segment only becomes
+        // allocatable once it is in this list, so nothing can be written to a
+        // segment that the hold has not seen.
+        hold_segment(*s);
     }
 
     // Signal to sync with test to verify SCYLLADB-4443
@@ -2704,6 +2746,50 @@ struct fmt::formatter<db::commitlog::segment::cf_mark> {
         return fmt::format_to(ctx.out(), "{}", fmt::join(m.s._cf_dirty | std::views::keys, ", "));
     }
 };
+
+void db::commitlog::segment_manager::hold_segment(segment& s) noexcept {
+    if (!hold_enabled() || s._shipping_hold) {
+        return;
+    }
+    s._shipping_hold = true;
+    _held_segments.push_back(s._desc.id);
+    clogger.debug("Segment {} is held for shipping", s);
+}
+
+void db::commitlog::segment_manager::drop_hold(segment& s) noexcept {
+    if (!s._shipping_hold) {
+        return;
+    }
+    s._shipping_hold = false;
+    auto i = std::find(_held_segments.begin(), _held_segments.end(), s._desc.id);
+    if (i != _held_segments.end()) {
+        _held_segments.erase(i);
+    }
+}
+
+void db::commitlog::segment_manager::release_held_segment(segment_id_type id) noexcept {
+    auto i = std::find(_held_segments.begin(), _held_segments.end(), id);
+    if (i == _held_segments.end()) {
+        clogger.debug("Segment {} is not held; release ignored", id);
+        return;
+    }
+    for (auto& s : _segments) {
+        if (s->_desc.id == id) {
+            drop_hold(*s);
+            break;
+        }
+    }
+    // A held segment stays in _segments, so the loop above has cleared the
+    // flag. Erase the id regardless, so that a stale entry cannot linger.
+    if (auto j = std::find(_held_segments.begin(), _held_segments.end(), id); j != _held_segments.end()) {
+        _held_segments.erase(j);
+    }
+    discard_unused_segments();
+}
+
+std::vector<db::segment_id_type> db::commitlog::segment_manager::held_segments() const {
+    return std::vector<segment_id_type>(_held_segments.begin(), _held_segments.end());
+}
 
 void db::commitlog::segment_manager::discard_unused_segments() noexcept {
     clogger.trace("Checking for unused segments ({} active)", _segments.size());
@@ -3986,6 +4072,14 @@ std::vector<sstring> db::commitlog::get_active_segment_names() const {
 
 uint64_t db::commitlog::disk_limit() const {
     return _segment_manager->max_disk_size;
+}
+
+std::vector<db::segment_id_type> db::commitlog::held_segments() const {
+    return _segment_manager->held_segments();
+}
+
+void db::commitlog::release_segment(segment_id_type id) {
+    _segment_manager->release_held_segment(id);
 }
 
 uint64_t db::commitlog::disk_footprint() const {
