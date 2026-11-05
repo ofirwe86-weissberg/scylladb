@@ -49,6 +49,7 @@ target_sources(db
     rate_limiter.cc
     per_partition_rate_limit_options.cc
     pitr/ledger_entry.cc
+    pitr/ledger_writer.cc
     pitr/pitr_shipper.cc
     pitr/refusal.cc
     pitr/t_filter.cc
