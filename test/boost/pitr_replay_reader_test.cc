@@ -235,14 +235,20 @@ static future<utils::chunked_vector<shipped_segment>> verified_list(const sstrin
     co_return segments;
 }
 
-static future<shard_replay_params> params_for(
-        const sstring& dir, const table_id& table, replay_position bound = {}, replay_position floor = {}, unsigned shard = this_shard_id()) {
+// A bound below every segment a case writes, for the cases that do not care where the replay starts: the reader refuses
+// a default bound, and a segment id starts at 1.
+static replay_position lowest_bound(unsigned shard = this_shard_id()) {
+    return replay_position(shard, segment_id_type(1), 0);
+}
+
+static future<shard_replay_params> params_for(const sstring& dir, const table_id& table, std::optional<replay_position> bound = {},
+        replay_position floor = {}, unsigned shard = this_shard_id()) {
     co_return shard_replay_params{
             .segments = co_await verified_list(dir, shard),
             .filename_prefix = prefix(),
             .shard = shard,
             .source_table = table,
-            .bound = bound,
+            .bound = bound.value_or(lowest_bound(shard)),
             .truncate_floor = floor,
     };
 }
@@ -649,9 +655,11 @@ SEASTAR_TEST_CASE(test_truncate_floor_is_applied_per_shard) {
     BOOST_REQUIRE_EQUAL(remote_rps.front().shard_id(), other_shard);
     BOOST_REQUIRE_NE(local_rps.front().shard_id(), remote_rps.front().shard_id());
 
-    // The higher shard truncated at its first entry, this one at its third.
+    // The higher shard truncated at its first entry, this one at its third. The remote bound is its own shard's first
+    // position, since a default bound is refused.
     capture remote;
-    auto remote_stats = co_await replay_shard_segments(co_await params_for(dir, tid, {}, remote_rps[0], other_shard), remote.consumer());
+    auto remote_stats =
+            co_await replay_shard_segments(co_await params_for(dir, tid, remote_rps[0], remote_rps[0], other_shard), remote.consumer());
     BOOST_REQUIRE_EQUAL(to_str(remote.positions), to_str(std::vector<replay_position>(remote_rps.begin() + 1, remote_rps.end())));
     BOOST_REQUIRE_EQUAL(remote_stats.dropped_at_or_below_truncate_floor, 1u);
 
@@ -661,11 +669,26 @@ SEASTAR_TEST_CASE(test_truncate_floor_is_applied_per_shard) {
     BOOST_REQUIRE_EQUAL(local_stats.dropped_at_or_below_truncate_floor, 3u);
 }
 
+// A bound nobody set would replay everything. No shard can mean the default position, shard 0 included, since a segment
+// id starts at 1.
+SEASTAR_TEST_CASE(test_a_default_bound_is_refused) {
+    capture c;
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = make_schema("cf")->id()};
+
+    BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), invalid_replay_input);
+
+    if (this_smp_shard_count() >= 2) {
+        params.shard = this_shard_id() + 1;
+        BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), invalid_replay_input);
+    }
+}
+
 // Nothing to read is not an error: a shard that took no writes in the window
 // ships no segments.
 SEASTAR_TEST_CASE(test_empty_list_yields_no_entries) {
     capture c;
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = make_schema("cf")->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = make_schema("cf")->id(),
+            .bound = lowest_bound()};
 
     auto stats = co_await replay_shard_segments(params, c.consumer());
 
@@ -682,7 +705,7 @@ SEASTAR_TEST_CASE(test_header_only_segment_is_read_and_delivers_nothing) {
     auto dir = sstring(tmp.path().string());
     auto s = make_schema("cf");
 
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id(), .bound = lowest_bound()};
     params.segments.push_back(co_await write_header_only_segment(dir, replay_position(this_shard_id(), segment_id_type(17), 0).id));
 
     capture c;
@@ -1224,7 +1247,7 @@ SEASTAR_TEST_CASE(test_missing_segment_is_refused) {
     auto dir = sstring(tmp.path().string());
     auto s = make_schema("cf");
 
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id(), .bound = lowest_bound()};
     params.segments.push_back(shipped_segment{.path = sstring(fmt::format("{}/{}{}-{}.log", dir, prefix(), commitlog::descriptor::current_version,
                                                       replay_position(this_shard_id(), segment_id_type(3), 0).id)),
             .used_size = 4096});
@@ -1341,7 +1364,7 @@ SEASTAR_TEST_CASE(test_unparsable_segment_name_is_refused) {
     const auto renamed = dir + "/" + prefix() + "not-a-descriptor.log";
     co_await commitlog::rename_segment(seg.path, renamed);
 
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id(), .bound = lowest_bound()};
     params.segments.push_back(shipped_segment{.path = renamed, .used_size = seg.used_size});
 
     capture c;
@@ -1390,7 +1413,7 @@ SEASTAR_TEST_CASE(test_segment_of_another_shard_is_refused) {
 // would silently keep or drop the wrong entries.
 SEASTAR_TEST_CASE(test_bound_of_another_shard_is_refused) {
     capture c;
-    shard_replay_params params{.filename_prefix = prefix(), .shard = 1, .source_table = make_schema("cf")->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = 1, .source_table = make_schema("cf")->id(), .bound = lowest_bound(1)};
 
     params.bound = replay_position(0u, segment_id_type(5), 10);
     BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), invalid_replay_input);
@@ -1401,7 +1424,7 @@ SEASTAR_TEST_CASE(test_bound_of_another_shard_is_refused) {
 
 SEASTAR_TEST_CASE(test_truncate_floor_of_another_shard_is_refused) {
     capture c;
-    shard_replay_params params{.filename_prefix = prefix(), .shard = 1, .source_table = make_schema("cf")->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = 1, .source_table = make_schema("cf")->id(), .bound = lowest_bound(1)};
 
     params.truncate_floor = replay_position(0u, segment_id_type(5), 10);
     BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), invalid_replay_input);
@@ -1479,7 +1502,7 @@ SEASTAR_TEST_CASE(test_recycled_segment_name_is_refused) {
     const auto renamed = dir + "/Recycled-" + sstring(std::filesystem::path(std::string(seg.path)).filename().string());
     co_await commitlog::rename_segment(seg.path, renamed);
 
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = s->id(), .bound = lowest_bound()};
     params.segments.push_back(shipped_segment{.path = renamed, .used_size = seg.used_size});
 
     capture c;
@@ -1492,7 +1515,8 @@ SEASTAR_TEST_CASE(test_segment_name_with_an_oversized_id_is_refused) {
     tmpdir tmp;
     auto dir = sstring(tmp.path().string());
 
-    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = make_schema("cf")->id()};
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id(), .source_table = make_schema("cf")->id(),
+            .bound = lowest_bound()};
     params.segments.push_back(shipped_segment{.path = dir + "/" + prefix() + "4-99999999999999999999999999.log", .used_size = 4096});
 
     capture c;
