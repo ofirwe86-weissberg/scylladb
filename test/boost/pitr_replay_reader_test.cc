@@ -649,9 +649,11 @@ SEASTAR_TEST_CASE(test_truncate_floor_is_applied_per_shard) {
     BOOST_REQUIRE_EQUAL(remote_rps.front().shard_id(), other_shard);
     BOOST_REQUIRE_NE(local_rps.front().shard_id(), remote_rps.front().shard_id());
 
-    // The higher shard truncated at its first entry, this one at its third.
+    // The higher shard truncated at its first entry, this one at its third. Its bound is its own first position, since a
+    // default bound is refused on any shard but 0.
     capture remote;
-    auto remote_stats = co_await replay_shard_segments(co_await params_for(dir, tid, {}, remote_rps[0], other_shard), remote.consumer());
+    auto remote_stats =
+            co_await replay_shard_segments(co_await params_for(dir, tid, remote_rps[0], remote_rps[0], other_shard), remote.consumer());
     BOOST_REQUIRE_EQUAL(to_str(remote.positions), to_str(std::vector<replay_position>(remote_rps.begin() + 1, remote_rps.end())));
     BOOST_REQUIRE_EQUAL(remote_stats.dropped_at_or_below_truncate_floor, 1u);
 
@@ -659,6 +661,19 @@ SEASTAR_TEST_CASE(test_truncate_floor_is_applied_per_shard) {
     auto local_stats = co_await replay_shard_segments(co_await params_for(dir, tid, {}, local_rps[2]), local.consumer());
     BOOST_REQUIRE_EQUAL(to_str(local.positions), to_str(std::vector<replay_position>{local_rps[3]}));
     BOOST_REQUIRE_EQUAL(local_stats.dropped_at_or_below_truncate_floor, 3u);
+}
+
+// A default position carries shard 0, so on any other shard it is a bound nobody set, and replaying everything is not
+// what the caller meant.
+SEASTAR_TEST_CASE(test_a_default_bound_on_another_shard_is_refused) {
+    if (this_smp_shard_count() < 2) {
+        testlog.warn("test_a_default_bound_on_another_shard_is_refused needs at least two shards; skipped");
+        co_return;
+    }
+    capture c;
+    shard_replay_params params{.filename_prefix = prefix(), .shard = this_shard_id() + 1, .source_table = make_schema("cf")->id()};
+
+    BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), invalid_replay_input);
 }
 
 // Nothing to read is not an error: a shard that took no writes in the window

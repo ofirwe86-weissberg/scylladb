@@ -57,8 +57,10 @@ public:
 
 // Per source shard: the bound, the floor and the reassembly are all per shard.
 struct shard_replay_params {
-    // Read in this order, which must be ascending segment id without duplicates. The caller's chain check builds the list;
-    // the reader never scans a directory, so a segment not listed is not read.
+    // Read in this order, which must be ascending segment id without duplicates, and must all come from one boot of the
+    // source: fragment ids of a split write restart at zero each run, so segments of two boots can reassemble into
+    // nonsense. The caller's chain check builds the list; the reader never scans a directory, so a segment not listed is
+    // not read.
     utils::chunked_vector<shipped_segment> segments;
     sstring filename_prefix;
     // The shard the segments and both positions below belong to.
@@ -66,7 +68,8 @@ struct shard_replay_params {
     // The only table that reaches the consumer, matched on the id before anything resolves a schema: system tables share
     // the commitlog, and a table out of scope may not exist in this node at all.
     table_id source_table;
-    // The lowest position replayed, inclusive; below it is in the snapshot.
+    // The lowest position replayed, inclusive; below it is in the snapshot. Must be set on any shard but 0, since a
+    // default position carries shard 0 and would silently replay everything.
     db::replay_position bound;
     // The source table's latest TRUNCATE position at or below the backup, which nothing may come back from; exclusive, as
     // normal replay has it. Default means no truncation, and drops nothing: no entry sits at position zero.
@@ -92,7 +95,7 @@ struct replay_reader_stats {
 // a size other than the recorded one (so also a file cut anywhere, including to nothing), a file that cannot be opened, a name that does
 // not start with `filename_prefix` or is not a segment descriptor of it, a tag other than the variant one, an id out of order, repeated
 // or too large to parse, another shard, or a header that is zeroed, is not a commitlog header, or names another segment. So is a bound or
-// floor of another shard. Any read error, decode error or consumer failure fails the call, where normal replay counts the damage and
+// floor of another shard, and a bound left at the default position on a shard other than 0. Any read error, decode error or consumer failure fails the call, where normal replay counts the damage and
 // carries on. A split write is reassembled from one state shared by the shard's segments and delivered once, whole. Every entry is
 // decoded, dropped or not, since an entry carries its schema version's mapping only when the segment had forgotten the version: the
 // mappings are kept across the shard's segments, and a surviving entry whose version none of them covers refuses the segment. The caller
@@ -105,7 +108,8 @@ struct replay_reader_stats {
 // rather than only fail the call, because read_log_file reads through the commitlog's own error handler: no production caller may use
 // this until the commitlog read path takes an error handler of its own.
 //
-// Delivered positions are not monotonic: a split write arrives when its last fragment is read, at the position of its first.
+// Positions are delivered in ascending order, as a healthy log writes them, with one exception: a split write arrives
+// when its last fragment is read, at the position of its first, so it can arrive after a position above it.
 //
 // Yields between segments and entries. Decoding one entry does not, and is not bounded here: a write can be as large as the commitlog
 // allows.
