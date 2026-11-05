@@ -58,6 +58,8 @@ add_scylla_test(chunked_vector_test
   KIND BOOST)
 add_scylla_test(clustering_ranges_walker_test
   KIND SEASTAR)
+add_scylla_test(commitlog_hold_test
+  KIND SEASTAR)
 add_scylla_test(compaction_group_test
   KIND SEASTAR)
 add_scylla_test(comparable_bytes_test

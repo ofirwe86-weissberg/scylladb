@@ -561,6 +561,7 @@ scylla_tests = set([
     'test/boost/chunked_managed_vector_test',
     'test/boost/chunked_vector_test',
     'test/boost/clustering_ranges_walker_test',
+    'test/boost/commitlog_hold_test',
     'test/boost/compaction_group_test',
     'test/boost/comparable_bytes_test',
     'test/boost/compound_test',
