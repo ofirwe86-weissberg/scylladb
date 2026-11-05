@@ -61,7 +61,7 @@ git clang-format master
 
 Build modes: `debug`, `dev`, `release`, `sanitize`. Agents use `dev` by default. If `test.py` hits cgroup-metrics permission errors, add `--no-gather-metrics`. Logs land in `testlog/<mode>/`. A full build is long (hours on modest hardware, ~2–3 GB RAM per compile/link thread), so build the narrowest target. `configure.py --compiler-cache` defaults to `auto` and picks up the image's `sccache` (`build.ninja`: `cxx_launcher = /usr/bin/sccache`), which is what makes a rebuild in a fresh worktree survivable. Measured here at `-j6`: an incremental `build/dev/scylla` relink took 11m32s.
 
-**Max parallel agents: 2.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM.
+**Max parallel agents: 3, and only for tasks that don't block each other.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM.
 
 Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node Python), `cluster` (multi-node, `test/pylib` manager), `cql` (approval tests; review any `.reject` diff before overwriting `.result`), `rest_api`, `nodetool`, `scylla_gdb`; also `vector_search`, `ldap`, `tools`, `perf`, `dist_test`, `manual` and `pylib_test` (`ls test/` for the full set). cqlpy tests should also pass on Cassandra.
 
@@ -90,9 +90,18 @@ These apply to all implementation and review on this project.
 **Tests are written with the code, not after it.**
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
 - Don't commit while a test fails, and ask the human if any test fails, even one that looks unrelated. Each commit holds a step's test and code together, so it compiles and passes.
+- New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and 100 of 100 only after review passes, before merge.
+- While developing, build the task's own small test binary and run only relevant cases. Build composite binaries like `combined_tests` once per task, at the end.
 - Show that a test can fail: break the code on purpose, or record its failure before the fix. A test that has never failed proves nothing.
+- QA's tests are checked before and after: each is run without the change and must fail, then with the change and must pass, and both results go in the PR. Failing only because an endpoint doesn't exist isn't enough: the test must also catch wrong behaviour.
 
 **The test bar is p99, not the happy path.** Passing is the minimum. Tests must take the code to its edge cases: boundary values, maximum sizes, empty inputs, failures at each step, restarts, concurrency and reordering. Before finishing, list the edge cases you considered, and say which are tested and which aren't. Random inputs must use a fixed, logged seed so that a failure can be reproduced.
+
+**Comments explain why, and only what isn't obvious.** Match the repo: headers carry the contract (median about 20%, up to about 45% of lines), `.cc` files less (median about 10%, up to about 25%). GitHub issue numbers are fine, but don't reference files or requirement IDs outside the repo.
+
+**The detail lives in the task, not the code or commit.** The GitHub issue holds the full reasoning, decisions, evidence and test notes, and the team lead makes sure it's detailed enough for the developer to work from. Commit bodies stay around 15-30 lines (repo median 13, 90th percentile 32) and refer to the issue. Comment blocks in `.cc` files stay under about 5-10 lines (repo 90th percentile 5), unless they explain an algorithm.
+
+**Keep tests simple.** One behaviour per test, named after that behaviour, with minimal setup, so a failure says what broke. Group them in batches by functionality. Prefer many small tests over one complex scenario.
 
 **Test design is agreed with the human before test code is written** for a new feature: what's tested, at which level, and with which control points.
 
@@ -164,6 +173,10 @@ The session acts as team lead. For feature work, run `product-manager` before re
 
 For feature work, the order is: requirements (`product-manager`), then a full test plan based on them (`tester`, reviewed by `product-manager`, the team lead and `reviewer-qa`), and only then code. The test plan is QA's, and QA implements it as black-box, end-to-end tests against the real system (`tester`, reviewed by `reviewer-qa` and `pr-reviewer` like other code). Unit and integration tests are the developer's work, written with the code, and based on mocking rather than end to end. The design lists the units, their connections, and the integration tests for each. `architect-check` reviews that list from the documents, not the code, to confirm every connection is tested and the design holds together.
 
+- **QA models:** planning uses Opus. Implementing Python tests from a detailed plan uses Sonnet, and reviewers stay on Opus.
+- **Start a fresh agent for each PR,** since long-running agents use far more of the session limit. For risky tasks, each PR is reviewed before the next starts; simple tasks may overlap. Change headers once and early, to limit rebuilds. The task's detail is in its issue. A fresh agent can reuse a built worktree.
+- **Keep commits and reviews small: aim for 100-300 product lines per PR,** tests not counted, with 500 as a ceiling. For scale, half the repo's recent PRs are under 47 product lines, and 90% under 543. A larger task is split into smaller self-contained tasks, each with its own commit and PR.
+- **One commit and one PR per task.** Each task issue gets its own commit on its own branch and its own PR, opened for review. Agents never merge. Dependent PRs stack on the previous task's branch, so each diff shows only its own task. Each PR title starts with the task ID, and its description states the task, its requirements, what changed, tests run with results, what it depends on, and what's not done.
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.
 - `.claude/hooks/guard-destructive-ops.sh` blocks merges, pushes to the default branch, force pushes, `git reset --hard`, `git clean -fdx`, and wiping the build tree. It is a speed bump, not a security boundary — branch protection is the control that holds.
