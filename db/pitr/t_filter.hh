@@ -104,6 +104,15 @@ struct filter_result {
 // schema conversion and apply_in_memory() do not.
 seastar::future<filter_result> filter_at_timestamp(const mutation& m, api::timestamp_type t);
 
+// Which statement a non-frozen collection's tombstone came with. An overwrite
+// writes the tombstone one microsecond before its members
+// (update_parameters::make_tombstone_just_before()), so a member exactly one
+// microsecond above the tombstone carries the timestamp of the statement both
+// came from. These two state that rule once, for the filter and for every
+// caller that must decide the same thing.
+bool is_member_just_above_tombstone(tombstone tomb, api::timestamp_type member_timestamp);
+api::timestamp_type collection_statement_timestamp(tombstone tomb, bool member_just_above_tombstone);
+
 } // namespace db::pitr
 
 template <>
