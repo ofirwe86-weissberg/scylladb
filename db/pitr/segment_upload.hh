@@ -16,6 +16,7 @@
 
 #include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
+#include <seastar/core/semaphore.hh>
 #include <seastar/core/sstring.hh>
 
 namespace seastar {
@@ -129,5 +130,63 @@ using segment_file_opener = std::function<seastar::future<seastar::file>()>;
 // taken for a segment the caller is still shipping.
 seastar::future<upload_result> upload_with_retry(sstables::object_storage_client& client, sstables::object_name name, uint64_t used_size,
         segment_file_opener open_segment_file, retry_policy policy, seastar::abort_source& as);
+
+// Uploads in flight per shard, by default. Each one holds the store client's own
+// upload buffers: about 8 MiB accumulated by the GCS sink, and on S3 a part of
+// at least 5 MiB with more than one part in flight. The bound therefore keeps a
+// shard's upload buffers in the tens of megabytes rather than growing with the
+// segment count.
+//
+// Provisional: the piece that wires this up picks the real default and makes it
+// a db::config option, so this value only serves callers that do not choose.
+inline constexpr size_t default_max_concurrent_uploads = 8;
+
+// Bounds how many uploads run at once on this shard.
+//
+// Without a bound, a store that is down leaves every sealed segment of the shard
+// in upload_with_retry(), each reading its segment at full speed and holding its
+// buffers: at a thousand segments that is hundreds of MiB/s of reads and
+// gigabytes of buffers per shard. A slot therefore covers a whole
+// upload_with_retry() call, the backoff sleeps included, since a segment waiting
+// to be retried is holding its place just as much as one being read.
+//
+// Slots are granted in the semaphore's FIFO order, so calls begin in the order
+// they asked. Nothing beyond that is ordered: calls run concurrently and may
+// finish in any order, and the scheduler may reorder waiters woken together, so
+// a caller that needs segments recorded in order has to order them itself.
+//
+// The limiter must outlive every call it started, the ones still waiting for a
+// slot included, since a waiter holds a reference to the semaphore. The wiring
+// therefore aborts the calls and awaits them all before destroying it.
+class segment_upload_limiter {
+    seastar::semaphore _slots;
+    size_t _limit;
+
+public:
+    // A limit of 0 would stop every upload for ever, so it is raised to 1.
+    explicit segment_upload_limiter(size_t max_concurrent_uploads = default_max_concurrent_uploads);
+
+    size_t max_concurrent_uploads() const noexcept {
+        return _limit;
+    }
+    // Slots free right now, so `max_concurrent_uploads()` minus the uploads in
+    // flight, and the calls waiting for one of them to finish.
+    size_t available_slots() const noexcept {
+        return _slots.available_units();
+    }
+    size_t waiters() const noexcept {
+        return _slots.waiters();
+    }
+
+    // Takes a slot and then runs upload_with_retry() with these arguments,
+    // releasing the slot however the call ends - a success, a permanent failure,
+    // an abort, or an exception from the caller's own callback.
+    //
+    // A call that is still waiting for a slot ends on an abort of `as` like one
+    // already running: with the exception `as` carries, having opened no file
+    // and put nothing, since the abort wins here too.
+    seastar::future<upload_result> upload(sstables::object_storage_client& client, sstables::object_name name, uint64_t used_size,
+            segment_file_opener open_segment_file, retry_policy policy, seastar::abort_source& as);
+};
 
 } // namespace db::pitr
