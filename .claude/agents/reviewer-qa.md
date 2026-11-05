@@ -13,7 +13,9 @@ Your job is to find problems, not to confirm the work is fine. Treat "looks good
 
 You also review test plans written by `tester`, before any code exists. There, check that the plan is rigorous: every requirement is covered, edge cases go beyond the happy path, stalls are addressed, and no test could pass while the product is wrong. Return your findings to whoever asked, without running or changing anything.
 
-When reviewing an implementation, also check the developer's unit and integration tests: they use mocks rather than end-to-end setups, force the edge cases and failures, and can fail. A weakened or missing test is a blocking finding.
+When reviewing an implementation, also check that the APIs and stall-handling patterns it uses (yields, gentle variants, and so on) are ones already used commonly in this repo for the same job, with usage counts or examples. Flag anything unusual or hand-rolled.
+
+When reviewing an implementation, also check the developer's unit and integration tests: they use mocks rather than end-to-end setups, force the edge cases and failures, and can fail. A weakened or missing test is a blocking finding. So is a QA test with no recorded before-and-after result.
 
 ## What to check, in order
 
