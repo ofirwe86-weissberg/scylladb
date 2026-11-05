@@ -23,12 +23,18 @@
 #include "test/lib/scylla_test_case.hh"
 
 #include <algorithm>
+#include <cerrno>
+#include <chrono>
+#include <exception>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <random>
 #include <span>
 #include <string>
+#include <system_error>
 #include <unordered_map>
+#include <vector>
 
 #include <boost/test/unit_test.hpp>
 
@@ -38,6 +44,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shared_ptr.hh>
+#include <seastar/testing/on_internal_error.hh>
 
 #include "db/pitr/segment_upload.hh"
 #include "sstables/object_storage_client.hh"
@@ -75,6 +82,13 @@ public:
     }
 };
 
+class file_close_error : public std::runtime_error {
+public:
+    file_close_error()
+        : std::runtime_error("injected file close failure") {
+    }
+};
+
 // The exception a caller puts on its own abort source, to see it come back.
 class caller_cancelled : public std::runtime_error {
 public:
@@ -99,8 +113,13 @@ constexpr store_kind both_kinds[] = {store_kind::abort_on_close, store_kind::fin
 struct fake_store {
     store_kind kind = store_kind::abort_on_close;
     std::optional<unsigned> fail_put_at;
+    // Fail every put in the first this-many sinks, which is one failed attempt
+    // each for a retry loop.
+    unsigned fail_first_sinks = 0;
     bool fail_flush = false;
     bool fail_close = false;
+    // Fail the close of this sink only, counting from 0.
+    std::optional<unsigned> fail_close_on_sink;
     // Called with the index of each put, before it is applied.
     std::function<void(unsigned)> on_put;
     // Called when the sink is flushed, before the flush is applied.
@@ -143,6 +162,9 @@ class fake_sink_impl final : public data_sink_impl {
     fake_store& _store;
     std::string _name;
     abort_source* _as;
+    // Which upload this is, counting from 0, so that a test can fail the first
+    // few attempts and let a later one through.
+    unsigned _index;
     // Bytes this upload was handed. They reach the store only when the upload
     // is finalized, and they replace the object rather than extending it.
     std::string _pending;
@@ -167,8 +189,8 @@ public:
     fake_sink_impl(fake_store& store, std::string name, abort_source* as)
         : _store(store)
         , _name(std::move(name))
-        , _as(as) {
-        ++_store.sinks_created;
+        , _as(as)
+        , _index(_store.sinks_created++) {
         _store.sink_abort_source = as;
     }
     future<> put(std::span<temporary_buffer<char>> bufs) override {
@@ -176,6 +198,9 @@ public:
             const auto index = _store.puts++;
             if (_store.on_put) {
                 _store.on_put(index);
+            }
+            if (_index < _store.fail_first_sinks) {
+                return make_exception_future<>(store_error());
             }
             if (_store.fail_put_at == index) {
                 return make_exception_future<>(store_error());
@@ -207,7 +232,7 @@ public:
         if (_store.on_close) {
             _store.on_close();
         }
-        if (_store.fail_close) {
+        if (_store.fail_close || _store.fail_close_on_sink == _index) {
             return make_exception_future<>(store_error());
         }
         // Asked before the kinds part ways: either real sink cancels its upload
@@ -292,6 +317,12 @@ struct file_tracker {
     std::optional<size_t> short_read_size;
     // Return no bytes at or past this offset, as a file that shrank does.
     std::optional<uint64_t> empty_read_from;
+    // Fail the handle's close, after the underlying file is really closed.
+    bool fail_close = false;
+    // Called when the handle's size is asked for, before it is answered, and
+    // when it is closed, which is after the sink is.
+    std::function<void()> on_size;
+    std::function<void()> on_close;
     unsigned reads = 0;
     // A read past this many is a loop the code under test should not be in, so
     // the double fails it: a missing guard then shows as a failure, not a hang.
@@ -348,6 +379,9 @@ public:
         return _f.dma_read(pos, std::move(iov), intent);
     }
     future<uint64_t> size() override {
+        if (_tracker.on_size) {
+            _tracker.on_size();
+        }
         return _f.size();
     }
     future<struct stat> stat() override {
@@ -355,7 +389,12 @@ public:
     }
     future<> close() override {
         ++_tracker.closes;
-        return _f.close();
+        if (_tracker.on_close) {
+            _tracker.on_close();
+        }
+        return _f.close().then([this] {
+            return _tracker.fail_close ? make_exception_future<>(file_close_error()) : make_ready_future<>();
+        });
     }
     future<> flush() override {
         return make_ready_future<>();
@@ -453,6 +492,126 @@ uint32_t crc_reference(std::string_view data) {
     }
     return crc;
 }
+
+class open_error : public std::runtime_error {
+public:
+    open_error()
+        : std::runtime_error("injected open failure") {
+    }
+};
+
+// The guard's abort below, so that a loop which should have stopped shows up as
+// a failed assertion rather than as a test that hangs.
+class too_many_attempts : public std::runtime_error {
+public:
+    too_many_attempts()
+        : std::runtime_error("the retry loop made more attempts than the test allows") {
+    }
+};
+
+// Drives upload_with_retry() over one segment file, opening a tracked handle
+// per attempt so that each one can be failed and accounted for on its own.
+struct retry_fixture {
+    tmpdir dir;
+    fake_store store;
+    fake_client client{store};
+    // One per attempt that got as far as opening a file, in order. Held by
+    // pointer so that a reference handed to a handle survives the next
+    // attempt's push_back.
+    std::vector<std::unique_ptr<file_tracker>> trackers;
+    // What the unit reported about each failed attempt, in order.
+    std::vector<std::exception_ptr> failures;
+    std::vector<std::chrono::milliseconds> backoffs;
+    // Called after each failure is reported, to abort or otherwise interfere.
+    std::function<void()> on_failure;
+    // Called when the opener is entered, before it decides what to do, and on
+    // each handle's size and close.
+    std::function<void()> on_open;
+    std::function<void()> file_on_size;
+    std::function<void()> file_on_close;
+    // Short enough that even an unbounded sequence of waits stays in the
+    // milliseconds, since what is checked is the sequence, not its duration.
+    std::chrono::milliseconds base_backoff{1};
+    std::chrono::milliseconds max_backoff{4};
+    // Fail this many opens, from the first, before any file is opened.
+    unsigned fail_opens = 0;
+    // Fail them by throwing before returning a future, not by returning a
+    // failed one.
+    bool fail_opens_synchronously = false;
+    // Fail the open with ENOENT, as a segment deleted by a rollback does.
+    bool opens_fail_with_enoent = false;
+    // Fail every read of this many handles, from the first.
+    unsigned fail_reads_of_handles = 0;
+    // Return no bytes at this offset, as a file truncated mid-upload does.
+    std::optional<uint64_t> empty_read_from;
+    // The loop is unbounded by design, so every test bounds it: the guard
+    // aborts once a run is plainly not going to stop.
+    unsigned max_attempts = 50;
+    unsigned open_calls = 0;
+    fs::path path;
+    abort_source as;
+
+    void write(std::string_view used_content, uint64_t total_size) {
+        path = dir.path() / "segment";
+        write_segment_file(path, used_content, total_size).get();
+    }
+
+    future<file> open_tracked_file() {
+        auto& tracker = *trackers.emplace_back(std::make_unique<file_tracker>());
+        if (trackers.size() <= fail_reads_of_handles) {
+            tracker.fail_read_from = 0;
+        }
+        tracker.empty_read_from = empty_read_from;
+        tracker.on_size = file_on_size;
+        tracker.on_close = file_on_close;
+        auto raw = co_await open_file_dma(path.string(), open_flags::ro);
+        co_return file(seastar::make_shared<tracked_file_impl>(std::move(raw), tracker));
+    }
+
+    // Not a coroutine, so that a failure can also be thrown before the future
+    // exists, which is how open_file_dma() reports a bad path.
+    segment_file_opener opener() {
+        return [this]() -> future<file> {
+            if (on_open) {
+                on_open();
+            }
+            if (++open_calls <= fail_opens) {
+                if (opens_fail_with_enoent) {
+                    return make_exception_future<file>(std::system_error(ENOENT, std::system_category(), "injected missing segment"));
+                }
+                if (fail_opens_synchronously) {
+                    throw open_error();
+                }
+                return make_exception_future<file>(open_error());
+            }
+            return open_tracked_file();
+        };
+    }
+
+    retry_policy policy() {
+        return retry_policy{base_backoff, max_backoff, [this](std::exception_ptr ex, std::chrono::milliseconds wait) {
+                                failures.push_back(std::move(ex));
+                                backoffs.push_back(wait);
+                                if (failures.size() > max_attempts) {
+                                    as.request_abort_ex(too_many_attempts());
+                                } else if (on_failure) {
+                                    on_failure();
+                                }
+                            }};
+    }
+
+    future<upload_result> upload(uint64_t used_size) {
+        return upload_with_retry(client, sstables::object_name("bucket", "segment-1"), used_size, opener(), policy(), as);
+    }
+
+    // Every handle that was opened was closed exactly once.
+    void require_all_handles_closed(unsigned expected_handles) {
+        BOOST_REQUIRE_EQUAL(trackers.size(), expected_handles);
+        for (const auto& tracker : trackers) {
+            BOOST_REQUIRE_EQUAL(tracker->closes, 1u);
+        }
+    }
+};
 
 } // namespace
 
@@ -595,10 +754,39 @@ SEASTAR_THREAD_TEST_CASE(test_a_failing_flush_propagates) {
 }
 
 SEASTAR_THREAD_TEST_CASE(test_a_failing_close_propagates) {
+    // The S3-style upload was finalized by the flush, so the object is there
+    // and complete; a retry only replaces it with the same bytes.
     upload_fixture fx;
     fx.store.fail_close = true;
     const auto content = make_content(2 * chunk);
     BOOST_REQUIRE_THROW(fx.upload(content, 4 * chunk).get(), store_error);
+    BOOST_REQUIRE(fx.store.stored(object) == content);
+    fx.require_closed();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failing_close_leaves_no_object_where_the_close_finalizes) {
+    // On the GCS path the close is the request that finalizes, so a close that
+    // fails as the upload's only error must leave nothing behind.
+    upload_fixture fx;
+    fx.store.kind = store_kind::finalize_on_close;
+    fx.store.fail_close = true;
+    const auto content = make_content(2 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content, 4 * chunk).get(), store_error);
+    BOOST_REQUIRE(!fx.store.has_object(object));
+    fx.require_closed();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_file_close_failure_alone_is_swallowed_by_seastar) {
+    // A canary, not a requirement: seastar::file::close() is noexcept and only
+    // reports a failing close, so the upload never has to keep a close error
+    // from masking its own. Should this test ever fail, the upload needs to
+    // close the file by hand and keep the first error for the retry loop.
+    upload_fixture fx;
+    fx.tracker.fail_close = true;
+    const auto content = make_content(2 * chunk);
+    const auto res = fx.upload(content, 4 * chunk).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE(fx.store.stored(object) == content);
     fx.require_closed();
 }
 
@@ -751,4 +939,394 @@ SEASTAR_THREAD_TEST_CASE(test_an_abort_during_the_upload_propagates) {
     BOOST_REQUIRE_EQUAL(fx.store.puts, 2u);
     BOOST_REQUIRE(!fx.store.has_object(object));
     fx.require_closed();
+}
+
+// --- Retrying a failed upload (issue #8) ---
+
+SEASTAR_THREAD_TEST_CASE(test_a_working_store_is_uploaded_to_once) {
+    retry_fixture fx;
+    const auto content = make_content(3 * chunk);
+    fx.write(content, 4 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE(fx.store.stored(object) == content);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 1u);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_failed_attempts_are_retried_until_one_succeeds) {
+    retry_fixture fx;
+    fx.store.fail_first_sinks = 3;
+    const auto content = make_content(2 * chunk + 99);
+    fx.write(content, 4 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE_EQUAL(res.crc32, crc_reference(content));
+    // The failed attempts left nothing of their own: one object, whole.
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 1u);
+    BOOST_REQUIRE(fx.store.stored(object) == content);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 4u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_closed, 4u);
+    fx.require_all_handles_closed(4);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_every_attempt_opens_its_own_handle) {
+    retry_fixture fx;
+    fx.store.fail_first_sinks = 2;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    // Three handles, each read from and closed on its own: a reused one would
+    // show as fewer handles, or as reads on a handle that was already closed.
+    BOOST_REQUIRE_EQUAL(fx.trackers.size(), 3u);
+    for (const auto& tracker : fx.trackers) {
+        BOOST_REQUIRE_EQUAL(tracker->closes, 1u);
+        BOOST_REQUIRE_GT(tracker->reads, 0u);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_the_backoff_doubles_up_to_its_bound) {
+    retry_fixture fx;
+    fx.store.fail_first_sinks = 5;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    using ms = std::chrono::milliseconds;
+    const std::vector<ms> expected{ms(1), ms(2), ms(4), ms(4), ms(4)};
+    BOOST_REQUIRE(fx.backoffs == expected);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_during_an_attempt_is_not_retried) {
+    retry_fixture fx;
+    const auto content = make_content(6 * chunk);
+    fx.write(content, 8 * chunk);
+    fx.store.on_put = [&fx](unsigned index) {
+        if (index == 1) {
+            fx.as.request_abort_ex(caller_cancelled());
+        }
+    };
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 1u);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    BOOST_REQUIRE(!fx.store.has_object(object));
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_during_a_backoff_is_not_retried) {
+    retry_fixture fx;
+    // Every attempt fails, so only the abort can end the loop.
+    fx.store.fail_first_sinks = 1000;
+    fx.on_failure = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(2 * chunk);
+    fx.write(content, 4 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.backoffs.size(), 1u);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 1u);
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_pre_aborted_source_opens_no_file_at_all) {
+    retry_fixture fx;
+    fx.as.request_abort_ex(caller_cancelled());
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE(fx.trackers.empty());
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+    BOOST_REQUIRE(!fx.store.has_object(object));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_segment_too_short_is_not_retried) {
+    retry_fixture fx;
+    const auto content = make_content(alignment);
+    fx.write(content, content.size());
+    BOOST_REQUIRE_THROW(fx.upload(content.size() + 1).get(), segment_too_short);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_truncated_file_stays_too_short_and_is_not_retried) {
+    // The size check passed and the file lost its bytes while being read, which
+    // is the same permanent answer: no object, no backoff.
+    retry_fixture fx;
+    fx.empty_read_from = 2 * chunk;
+    const auto content = make_content(4 * chunk);
+    fx.write(content, 8 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), segment_too_short);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    BOOST_REQUIRE(!fx.store.has_object(object));
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_missing_segment_file_is_not_retried) {
+    // A rollback can delete a segment that was already reported closed, and no
+    // retry can bring its bytes back.
+    retry_fixture fx;
+    fx.fail_opens = 1000;
+    fx.opens_fail_with_enoent = true;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), std::system_error);
+    BOOST_REQUIRE_EQUAL(fx.open_calls, 1u);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    BOOST_REQUIRE(fx.store.objects.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failed_open_is_retried) {
+    retry_fixture fx;
+    fx.fail_opens = 2;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE_EQUAL(fx.open_calls, 3u);
+    BOOST_REQUIRE_EQUAL(fx.backoffs.size(), 2u);
+    // The failed opens produced no handle at all, and no sink.
+    fx.require_all_handles_closed(1);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 1u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_open_that_throws_before_returning_a_future_is_retried) {
+    retry_fixture fx;
+    fx.fail_opens = 2;
+    fx.fail_opens_synchronously = true;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE_EQUAL(fx.open_calls, 3u);
+    BOOST_REQUIRE_EQUAL(fx.backoffs.size(), 2u);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failed_read_is_retried) {
+    retry_fixture fx;
+    fx.fail_reads_of_handles = 2;
+    const auto content = make_content(2 * chunk);
+    fx.write(content, 4 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE_EQUAL(res.crc32, crc_reference(content));
+    BOOST_REQUIRE(fx.store.stored(object) == content);
+    BOOST_REQUIRE_EQUAL(fx.backoffs.size(), 2u);
+    fx.require_all_handles_closed(3);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_each_failure_is_reported_with_its_own_error) {
+    retry_fixture fx;
+    fx.fail_opens = 1;
+    fx.store.fail_first_sinks = 2;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    // The open failure, then the two store failures, each as itself.
+    BOOST_REQUIRE_EQUAL(fx.failures.size(), 3u);
+    BOOST_REQUIRE_THROW(std::rethrow_exception(fx.failures[0]), open_error);
+    BOOST_REQUIRE_THROW(std::rethrow_exception(fx.failures[1]), store_error);
+    BOOST_REQUIRE_THROW(std::rethrow_exception(fx.failures[2]), store_error);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_success_leaves_the_abort_source_alone) {
+    // The caller keeps using its own source, so a success must not touch it.
+    retry_fixture fx;
+    fx.store.fail_first_sinks = 1;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    BOOST_REQUIRE(!fx.as.abort_requested());
+    fx.as.check();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_segment_with_no_used_bytes_is_an_internal_error) {
+    seastar::testing::scoped_no_abort_on_internal_error abort_guard;
+    retry_fixture fx;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(0).get(), std::runtime_error);
+    BOOST_REQUIRE(fx.store.objects.empty());
+    BOOST_REQUIRE(fx.trackers.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_no_way_to_open_the_segment_is_an_internal_error) {
+    seastar::testing::scoped_no_abort_on_internal_error abort_guard;
+    retry_fixture fx;
+    abort_source as;
+    BOOST_REQUIRE_THROW(upload_with_retry(fx.client, sstables::object_name("bucket", "segment-1"), 4096, segment_file_opener(), retry_policy{}, as).get(),
+            std::runtime_error);
+    BOOST_REQUIRE(fx.store.objects.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_base_backoff_below_a_millisecond_is_raised) {
+    retry_fixture fx;
+    fx.base_backoff = std::chrono::milliseconds(0);
+    fx.max_backoff = std::chrono::milliseconds(4);
+    fx.store.fail_first_sinks = 3;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    using ms = std::chrono::milliseconds;
+    const std::vector<ms> expected{ms(1), ms(2), ms(4)};
+    BOOST_REQUIRE(fx.backoffs == expected);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_zero_bound_is_raised_too_so_the_loop_cannot_spin) {
+    retry_fixture fx;
+    fx.base_backoff = std::chrono::milliseconds(0);
+    fx.max_backoff = std::chrono::milliseconds(0);
+    fx.store.fail_first_sinks = 3;
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    fx.upload(content.size()).get();
+    using ms = std::chrono::milliseconds;
+    const std::vector<ms> expected{ms(1), ms(1), ms(1)};
+    BOOST_REQUIRE(fx.backoffs == expected);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_ends_an_hour_long_backoff) {
+    // A real sleep, an hour long, aborted as it is about to start: the call has
+    // to come back on the abort, so a sleep that ignored it would hang here.
+    retry_fixture fx;
+    fx.base_backoff = std::chrono::hours(1);
+    fx.max_backoff = std::chrono::hours(1);
+    fx.store.fail_first_sinks = 1000;
+    fx.on_failure = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    const auto started = std::chrono::steady_clock::now();
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE_LT(std::chrono::steady_clock::now() - started, std::chrono::seconds(30));
+    BOOST_REQUIRE_EQUAL(fx.backoffs.size(), 1u);
+}
+
+// Split per store kind, because the latest point at which an abort can land and
+// still leave a success to report differs between them: on the S3 path the
+// object is final after the flush, so the sink's close is late enough, while on
+// the GCS path the sink's close is the final request, so only the segment file's
+// own close is later still.
+SEASTAR_THREAD_TEST_CASE(test_an_abort_in_the_sinks_close_beats_a_finished_upload) {
+    retry_fixture fx;
+    fx.store.kind = store_kind::abort_on_close;
+    fx.store.on_close = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(2 * chunk);
+    fx.write(content, 4 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_in_the_files_close_beats_a_finished_upload) {
+    // A rollback can erase a segment that was already reported closed, so an
+    // abort this late must not come back as a success: the handle may have been
+    // reading a newer segment's bytes.
+    retry_fixture fx;
+    fx.store.kind = store_kind::finalize_on_close;
+    fx.file_on_close = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(2 * chunk);
+    fx.write(content, 4 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_beats_a_missing_segment_file) {
+    // A rollback aborts and deletes, and the caller tells the two apart: the
+    // abort means the segment is gone for good reason, while ENOENT alone means
+    // the chain has to be broken.
+    retry_fixture fx;
+    fx.fail_opens = 1000;
+    fx.opens_fail_with_enoent = true;
+    fx.on_open = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(chunk);
+    fx.write(content, 2 * chunk);
+    BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+    BOOST_REQUIRE_EQUAL(fx.open_calls, 1u);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    BOOST_REQUIRE(fx.store.objects.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_an_abort_beats_a_segment_that_is_too_short) {
+    // The abort lands while the file's size is being checked, which is before
+    // the upload looks at the caller's source, and the file really is short.
+    retry_fixture fx;
+    fx.file_on_size = [&fx] {
+        fx.as.request_abort_ex(caller_cancelled());
+    };
+    const auto content = make_content(alignment);
+    fx.write(content, content.size());
+    BOOST_REQUIRE_THROW(fx.upload(content.size() + 1).get(), caller_cancelled);
+    BOOST_REQUIRE(fx.backoffs.empty());
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 0u);
+    fx.require_all_handles_closed(1);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failed_attempt_leaves_no_object_in_either_store) {
+    for (const auto kind : both_kinds) {
+        testlog.info("store kind {}", static_cast<int>(kind));
+        retry_fixture fx;
+        fx.store.kind = kind;
+        fx.store.fail_first_sinks = 1000;
+        // Stop after the first failed attempt, and look at what it left.
+        fx.on_failure = [&fx] {
+            fx.as.request_abort_ex(caller_cancelled());
+        };
+        const auto content = make_content(3 * chunk);
+        fx.write(content, 4 * chunk);
+        BOOST_REQUIRE_THROW(fx.upload(content.size()).get(), caller_cancelled);
+        BOOST_REQUIRE(fx.store.objects.empty());
+        BOOST_REQUIRE_EQUAL(fx.store.sinks_closed, 1u);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failure_after_the_object_landed_leaves_one_object_after_the_retry) {
+    // The S3-style flush finalized the object and then the close failed, so the
+    // attempt reports a failure over an object that is already complete. The
+    // retry writes the same name, so the store keeps exactly one object and the
+    // bytes are counted once.
+    retry_fixture fx;
+    fx.store.fail_close_on_sink = 0;
+    const auto content = make_content(2 * chunk + 5);
+    fx.write(content, 4 * chunk);
+    const auto res = fx.upload(content.size()).get();
+    BOOST_REQUIRE_EQUAL(res.bytes_uploaded, content.size());
+    BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 1u);
+    BOOST_REQUIRE_EQUAL(fx.store.total_bytes(), content.size());
+    BOOST_REQUIRE(fx.store.stored(object) == content);
+    BOOST_REQUIRE_EQUAL(fx.store.sinks_created, 2u);
+    fx.require_all_handles_closed(2);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_a_failing_retry_leaves_an_earlier_good_object_in_place) {
+    // An object from an earlier upload must survive attempts that fail: a
+    // restore reads it, and only a reported success may replace it.
+    for (const auto kind : both_kinds) {
+        testlog.info("store kind {}", static_cast<int>(kind));
+        retry_fixture fx;
+        fx.store.kind = kind;
+        const auto first = make_content(2 * chunk);
+        fx.write(first, 4 * chunk);
+        fx.upload(first.size()).get();
+        BOOST_REQUIRE(fx.store.stored(object) == first);
+
+        // Now every attempt fails, and the caller gives up after the first.
+        fx.store.fail_first_sinks = 1000;
+        fx.on_failure = [&fx] {
+            fx.as.request_abort_ex(caller_cancelled());
+        };
+        const std::string second(3 * chunk, 'z');
+        fx.write(second, 4 * chunk);
+        BOOST_REQUIRE_THROW(fx.upload(second.size()).get(), caller_cancelled);
+        BOOST_REQUIRE_EQUAL(fx.store.objects.size(), 1u);
+        BOOST_REQUIRE(fx.store.stored(object) == first);
+    }
 }
