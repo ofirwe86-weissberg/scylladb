@@ -1810,6 +1810,23 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "Connections are distributed proportionally across scheduling groups based on their shares.")
     , object_storage_clients_memory_fraction(this, "object_storage_clients_memory_fraction", value_status::Unused, 0.01,
         "Fraction of shard memory used as the buffer budget shared by all object storage clients.")
+    , pitr_endpoint(this, "pitr_endpoint", value_status::Used, "",
+        "Experimental, single node only. Object storage endpoint the point-in-time recovery shipper writes commitlog segments to. "
+        "It must name an entry of object_storage_endpoints, which supplies the credentials. "
+        "Shipping is off while this and pitr_bucket are unset, and turning it on takes a restart.")
+    , pitr_bucket(this, "pitr_bucket", value_status::Used, "",
+        "Bucket the point-in-time recovery shipper writes to. Shipping is off while this and pitr_endpoint are unset.")
+    , pitr_prefix(this, "pitr_prefix", value_status::Used, "pitr",
+        "Prefix of every object the point-in-time recovery shipper writes, so that one bucket can hold more than one node's data.")
+    , pitr_seal_interval_in_seconds(this, "pitr_seal_interval_in_seconds", value_status::Used, 60,
+        "How often the point-in-time recovery shipper seals the active commitlog segment, in seconds. "
+        "It is the floor of the recovery point objective: a write is shipped at the earliest one interval after it is acknowledged. "
+        "Must be between 1 and 3600; shipping stays off otherwise.")
+    , pitr_unshipped_limit_in_mb(this, "pitr_unshipped_limit_in_mb", value_status::Used, 256,
+        "How much unshipped commitlog data the point-in-time recovery shipper holds, in MiB, before it gives up on protection "
+        "and releases the held segments so that writes keep succeeding. "
+        "Keep it below half of this shard's commitlog memory budget, or an object storage outage will cause memtable flushes first. "
+        "Must be greater than 0; shipping stays off otherwise.")
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
     , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces. (deprecated)")

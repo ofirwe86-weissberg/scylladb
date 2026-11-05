@@ -635,6 +635,12 @@ public:
     named_value<unsigned> object_storage_connections_per_shard;
     named_value<double> object_storage_clients_memory_fraction;
 
+    named_value<sstring> pitr_endpoint;
+    named_value<sstring> pitr_bucket;
+    named_value<sstring> pitr_prefix;
+    named_value<uint32_t> pitr_seal_interval_in_seconds;
+    named_value<uint32_t> pitr_unshipped_limit_in_mb;
+
     named_value<std::vector<error_injection_at_startup>> error_injections_at_startup;
     named_value<double> topology_barrier_stall_detector_threshold_seconds;
     named_value<bool> enable_tablets;
