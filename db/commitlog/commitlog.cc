@@ -487,9 +487,13 @@ public:
         return cfg.hold_segments;
     }
     void hold_segment(segment&) noexcept;
-    void drop_hold(segment&) noexcept;
+    void drop_hold(segment&, bool notify_failure) noexcept;
+    void on_segment_closed(segment&, bool failed) noexcept;
     void release_held_segment(segment_id_type) noexcept;
     std::vector<segment_id_type> held_segments() const;
+    uint64_t held_bytes() const noexcept {
+        return _held_bytes;
+    }
 
 
     future<> force_new_active_segment() noexcept;
@@ -549,6 +553,7 @@ private:
     // own disk limit, since a held segment cannot be deleted and so stays in
     // _segments.
     std::deque<segment_id_type> _held_segments;
+    uint64_t _held_bytes = 0;
     queue<sseg_ptr> _reserve_segments;
     queue<named_file> _recycled_segments;
     std::unordered_map<flush_handler_id, flush_handler> _flush_handlers;
@@ -786,6 +791,9 @@ class db::commitlog::segment : public enable_shared_from_this<segment>, public c
     // Held from deletion for segment_manager::cfg.hold_segments. Checked by
     // can_delete(), which runs often, so it must stay a plain flag.
     bool _shipping_hold = false;
+    // The bytes this segment contributes to segment_manager::_held_bytes,
+    // so that adding and subtracting cannot drift apart.
+    uint64_t _held_bytes_accounted = 0;
 
     using buffer_type = segment_manager::buffer_type;
     using sseg_ptr = segment_manager::sseg_ptr;
@@ -893,7 +901,7 @@ public:
             if (!_segment_manager->_shutdown) {
                 on_internal_error_noexcept(clogger, format("Segment {} was destroyed while held for shipping", *this));
             }
-            _segment_manager->drop_hold(*this);
+            _segment_manager->drop_hold(*this, false);
         }
 
         if (is_clean()) {
@@ -1081,13 +1089,28 @@ public:
     }
     future<sseg_ptr> close() {
         auto closing = !std::exchange(_closed, true);
-        auto s = co_await sync();
-        co_await flush();
-        co_await terminate();
+        sseg_ptr s;
+        std::exception_ptr ep;
+        try {
+            s = co_await sync();
+            co_await flush();
+            co_await terminate();
+        } catch (...) {
+            ep = std::current_exception();
+        }
         if (closing) {
-            // only update this if we are the closers.
-            _waste = _file.known_size() - file_position();
-            _segment_manager->totals.wasted_size_on_disk += _waste;
+            if (!ep) {
+                // only update this if we are the closers.
+                _waste = _file.known_size() - file_position();
+                _segment_manager->totals.wasted_size_on_disk += _waste;
+            }
+            // Exactly one notification per segment, from whoever closed it,
+            // and only once the data is on disk - or once the close has
+            // failed, in which case the segment is reported as unshippable.
+            _segment_manager->on_segment_closed(*this, bool(ep));
+        }
+        if (ep) {
+            co_return coroutine::exception(std::move(ep));
         }
         co_return s;
     }
@@ -1364,9 +1387,10 @@ public:
             // just mark segment as closed, no writes will be done.
             if (!std::exchange(me->_closed, true)) {
                 // This never reaches close(), so without this the hold would
-                // never be released: the segment cannot be shipped anyway,
-                // since its tail is whatever the failed write left behind.
-                me->_segment_manager->drop_hold(*me);
+                // never be released and the consumer would never hear about
+                // the segment. Report it as unshippable: its tail is whatever
+                // the failed write left behind.
+                me->_segment_manager->on_segment_closed(*me, true);
             }
             throw;
         };
@@ -2017,8 +2041,7 @@ future<> db::commitlog::segment_manager::oversized_allocation(entry_writer& writ
                 // so it cannot stay held. If the handler was already told the
                 // segment closed, tell it the segment is unshippable, so that
                 // the chain breaks instead of pointing at a deleted file.
-                (void)was_closed;
-                drop_hold(*s);
+                drop_hold(*s, was_closed);
                 _segments.erase(std::remove(_segments.begin(), _segments.end(), s), _segments.end());
             }
         }
@@ -2777,14 +2800,49 @@ void db::commitlog::segment_manager::hold_segment(segment& s) noexcept {
     _held_segments.push_back(s._desc.id);
 }
 
-void db::commitlog::segment_manager::drop_hold(segment& s) noexcept {
+void db::commitlog::segment_manager::drop_hold(segment& s, bool notify_failure) noexcept {
     if (!s._shipping_hold) {
         return;
     }
     s._shipping_hold = false;
+    _held_bytes -= std::exchange(s._held_bytes_accounted, 0);
     auto i = std::find(_held_segments.begin(), _held_segments.end(), s._desc.id);
     if (i != _held_segments.end()) {
         _held_segments.erase(i);
+    }
+    if (notify_failure && cfg.segment_closed) {
+        try {
+            cfg.segment_closed(s._desc.id, s.file_position(), true);
+        } catch (...) {
+            clogger.error("Exception from the segment-closed handler for segment {}: {:t}", s._desc.id, std::current_exception());
+        }
+    }
+}
+
+void db::commitlog::segment_manager::on_segment_closed(segment& s, bool failed) noexcept {
+    auto id = s._desc.id;
+    auto used_size = s.file_position();
+    if (failed) {
+        // The tail cannot be trusted, so the segment must not be shipped. Let
+        // it be deleted as it would be without the hold; the handler is told,
+        // so that the chain breaks rather than losing writes silently. This
+        // runs whether or not a handler is set, or a failed segment would stay
+        // held forever.
+        drop_hold(s, false);
+    } else if (s._shipping_hold) {
+        // The whole file counts, not the bytes written: a sealed file keeps
+        // its full size on disk, and that is what fills the commitlog's own
+        // limits.
+        s._held_bytes_accounted = std::max(s.size_on_disk(), used_size);
+        _held_bytes += s._held_bytes_accounted;
+    }
+    if (!cfg.segment_closed) {
+        return;
+    }
+    try {
+        cfg.segment_closed(id, used_size, failed);
+    } catch (...) {
+        clogger.error("Exception from the segment-closed handler for segment {}: {:t}", id, std::current_exception());
     }
 }
 
@@ -2795,7 +2853,7 @@ void db::commitlog::segment_manager::release_held_segment(segment_id_type id) no
     }
     for (auto& s : _segments) {
         if (s->_desc.id == id) {
-            drop_hold(*s);
+            drop_hold(*s, false);
             break;
         }
     }
@@ -4096,6 +4154,10 @@ uint64_t db::commitlog::disk_limit() const {
 
 std::vector<db::segment_id_type> db::commitlog::held_segments() const {
     return _segment_manager->held_segments();
+}
+
+uint64_t db::commitlog::held_bytes() const {
+    return _segment_manager->held_bytes();
 }
 
 void db::commitlog::release_segment(segment_id_type id) {

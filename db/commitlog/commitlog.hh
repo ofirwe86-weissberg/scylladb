@@ -134,6 +134,16 @@ public:
         // for it. Used by db/pitr, for the main commitlog only; off leaves the
         // commitlog as it was. Nothing releases the hold on its own.
         bool hold_segments = false;
+
+        // Called once for every held segment when it closes, from inside the
+        // close, so it must not block, and an exception from it is swallowed.
+        // `used_size` is the bytes written to the file, which is what a replay
+        // reads. `failed` means the segment must not be shipped - a failed
+        // close, or a rollback - and the commitlog has released the hold
+        // itself; it can arrive for a segment reported as closed before.
+        // Calls are not ordered by id; held_segments() is.
+        using segment_closed_handler = std::function<void(segment_id_type id, uint64_t used_size, bool failed)>;
+        segment_closed_handler segment_closed;
     };
 
     struct descriptor {
@@ -323,6 +333,12 @@ public:
      * config::hold_segments is set.
      */
     std::vector<segment_id_type> held_segments() const;
+
+    /**
+     * Size on disk of the held segments that have closed. The one still being
+     * written is not counted: it cannot be shipped yet.
+     */
+    uint64_t held_bytes() const;
 
     /**
      * Releases the hold on one segment and sweeps. An unheld id is ignored.
