@@ -50,6 +50,7 @@ target_sources(db
     per_partition_rate_limit_options.cc
     pitr/pitr_shipper.cc
     pitr/refusal.cc
+    pitr/segment_upload.cc
     pitr/t_filter.cc
     pitr/t_parser.cc
     row_cache.cc
