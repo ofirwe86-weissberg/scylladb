@@ -68,7 +68,10 @@ std::expected<shipper_config, shipping_state> make_shipper_config(const db::conf
 }
 
 pitr_shipper::pitr_shipper(const db::config& cfg) noexcept
-    : _cfg(cfg) {
+    : _cfg(cfg)
+    , _seal_timer([this] {
+        seal_tick();
+    }) {
 }
 
 future<> pitr_shipper::start() {
@@ -110,9 +113,51 @@ future<> pitr_shipper::start() {
 }
 
 future<> pitr_shipper::stop() {
-    // Nothing is held yet. The hold on segments and the uploads of the later
-    // tickets are drained here.
-    return make_ready_future<>();
+    // The uploads of the later tickets are drained here too.
+    _seal_timer.cancel();
+    return _seal_gate.close();
+}
+
+void pitr_shipper::start_sealing(seal_function seal, node_count_function count_nodes) {
+    if (!active()) {
+        return;
+    }
+    _seal = std::move(seal);
+    _count_nodes = std::move(count_nodes);
+    _seal_timer.arm_periodic(_shipper_cfg->seal_interval);
+}
+
+void pitr_shipper::seal_tick() {
+    // A tick during a running seal is dropped rather than queued: the seal in
+    // flight already covers what the dropped tick would have sealed.
+    if (!active() || _seal_running || _seal_gate.is_closed()) {
+        return;
+    }
+    _seal_running = true;
+    // Background: the timer callback cannot wait. The gate tracks the seal, so
+    // stop() waits for it, and seal_cycle() never throws.
+    (void)seal_cycle().finally([this, holder = _seal_gate.hold()] {
+        _seal_running = false;
+    });
+}
+
+future<> pitr_shipper::seal_cycle() {
+    // Every cycle repeats the startup check, because a node can join later.
+    const auto node_count = _count_nodes();
+    if (node_count != 1) {
+        _state = shipping_state::off_multi_node;
+        _break_reason = fmt::format("the node counted {} nodes while shipping, and single-node PITR supports exactly one", node_count);
+        _seal_timer.cancel();
+        if (this_shard_id() == 0) {
+            pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
+        }
+        co_return;
+    }
+    try {
+        co_await _seal();
+    } catch (...) {
+        pitr_logger.warn("Sealing the commitlog segment failed, the next cycle will try again: {}", std::current_exception());
+    }
 }
 
 void pitr_shipper::note_cluster_size(size_t node_count) {
