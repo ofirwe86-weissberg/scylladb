@@ -18,6 +18,7 @@
 #include <chrono>
 #include <optional>
 #include <ostream>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -32,6 +33,7 @@
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
 #include "db/pitr/pitr_shipper.hh"
+#include "service/topology_state_machine.hh"
 #include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
@@ -201,6 +203,16 @@ void wait_for_cycles_on_all_shards(seastar::sharded<pitr_shipper>& shipper) {
             .get();
 }
 
+// One hand-driven tick on every shard, waited out. Used by the tests that need
+// a run of cycles, where the real timer is too slow to drive them.
+void tick_and_wait_on_all_shards(seastar::sharded<pitr_shipper>& shipper) {
+    shipper.invoke_on_all([](pitr_shipper& s) {
+               s.seal_tick();
+           })
+            .get();
+    wait_for_cycles_on_all_shards(shipper);
+}
+
 // Resets the probe on every shard, runs the body, and resets it again so that
 // a failing test cannot leak a held seal into the next one.
 template <typename Func>
@@ -229,6 +241,19 @@ void start_sealing_on_all_shards(seastar::sharded<pitr_shipper>& shipper) {
                s.start_sealing(fake_seal(), fake_node_count());
            })
             .get();
+}
+
+// Adds a node to one of the topology state machine's node maps. Only the state
+// is filled in: the count looks at nothing else.
+void add_node(std::unordered_map<raft::server_id, service::replica_state>& nodes, service::node_state state) {
+    nodes[raft::server_id{utils::UUID_gen::get_time_UUID()}] = service::replica_state{.state = state};
+}
+
+raft::server_id add_left_node(service::topology& topology) {
+    const auto id = raft::server_id{utils::UUID_gen::get_time_UUID()};
+    topology.left_nodes.insert(id);
+    topology.left_nodes_rs[id] = service::replica_state{.state = service::node_state::left};
+    return id;
 }
 
 // Polls until the condition holds. No sleeps of a fixed length: a condition
@@ -687,6 +712,180 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_unreadable_node_count_does_not_seal_or_turn_o
             });
         });
     }
+}
+
+// A topology with nothing in it counts no nodes, which is not one and so
+// refuses shipping rather than reading as a single node.
+SEASTAR_THREAD_TEST_CASE(test_pitr_node_count_of_an_empty_topology_is_zero) {
+    const service::topology topology;
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 0);
+}
+
+// Every node the cluster holds counts, whichever map it sits in, so that a
+// joining or zero-token peer is seen; the nodes that left do not.
+SEASTAR_THREAD_TEST_CASE(test_pitr_node_count_counts_members_but_not_left_nodes) {
+    service::topology topology;
+    add_node(topology.normal_nodes, service::node_state::normal);
+    add_node(topology.normal_nodes, service::node_state::normal);
+    add_node(topology.transition_nodes, service::node_state::bootstrapping);
+    add_node(topology.new_nodes, service::node_state::none);
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 4);
+
+    // Left nodes are held in two places, and neither is part of the cluster.
+    add_left_node(topology);
+    add_left_node(topology);
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 4);
+}
+
+// The decommission of the only peer brings the node back to single, so shipping
+// is not refused for a cluster that no longer exists (issue #7, P23).
+SEASTAR_THREAD_TEST_CASE(test_pitr_node_count_is_one_again_after_the_peer_left) {
+    service::topology topology;
+    add_node(topology.normal_nodes, service::node_state::normal);
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 1);
+
+    add_node(topology.new_nodes, service::node_state::none);
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 2);
+
+    const auto peer = topology.new_nodes.begin()->first;
+    topology.new_nodes.erase(peer);
+    topology.left_nodes.insert(peer);
+    BOOST_REQUIRE_EQUAL(count_cluster_nodes(topology), 1);
+}
+
+// A run of unreadable counts shorter than the allowance costs the user no
+// protection: shipping stays on, and the run is reported as it grows.
+SEASTAR_THREAD_TEST_CASE(test_pitr_unreadable_counts_below_the_allowance_keep_shipping) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        with_probe(shipper, [&] {
+            note_cluster_size_on_all_shards(shipper, 1);
+            start_sealing_on_all_shards(shipper);
+            shipper.invoke_on_all([](pitr_shipper&) {
+                       the_probe.count = probe::count_mode::fails;
+                   })
+                    .get();
+
+            for (unsigned cycle = 1; cycle < max_unreadable_count_cycles; ++cycle) {
+                tick_and_wait_on_all_shards(shipper);
+                shipper.invoke_on_all([cycle](pitr_shipper& s) {
+                           tests::require(s.active());
+                           tests::require(s.sealing_scheduled());
+                           tests::require(!s.break_reason());
+                           tests::require(s.last_outcome() == pitr_shipper::cycle_outcome::count_failed);
+                           tests::require_equal(s.unreadable_count_cycles(), cycle);
+                           tests::require_equal(the_probe.seals_started, 0);
+                       })
+                        .get();
+            }
+        });
+    });
+}
+
+// Once the count has been unreadable for the whole allowance, the chain can no
+// longer be shown to come from one node, so shipping breaks and says so.
+SEASTAR_THREAD_TEST_CASE(test_pitr_unreadable_count_breaks_shipping_at_the_allowance) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        with_probe(shipper, [&] {
+            note_cluster_size_on_all_shards(shipper, 1);
+            start_sealing_on_all_shards(shipper);
+            shipper.invoke_on_all([](pitr_shipper&) {
+                       the_probe.count = probe::count_mode::fails;
+                   })
+                    .get();
+
+            for (unsigned cycle = 0; cycle < max_unreadable_count_cycles; ++cycle) {
+                tick_and_wait_on_all_shards(shipper);
+            }
+            shipper.invoke_on_all([](pitr_shipper& s) {
+                       tests::require_equal(s.state(), shipping_state::off_node_count_unreadable);
+                       tests::require(s.last_outcome() == pitr_shipper::cycle_outcome::shipping_broke);
+                       tests::require(s.break_reason().has_value());
+                       tests::require(s.break_reason()->find("node_count_unreadable") != seastar::sstring::npos);
+                       tests::require(!s.sealing_scheduled());
+                       tests::require_equal(the_probe.seals_started, 0);
+                       // Latched: a readable count does not bring shipping back.
+                       the_probe.count = probe::count_mode::ok;
+                       s.seal_tick();
+                       tests::require_equal(the_probe.seals_started, 0);
+                       tests::require_equal(s.state(), shipping_state::off_node_count_unreadable);
+                   })
+                    .get();
+        });
+    });
+}
+
+// Only an unbroken run breaks shipping: one cycle that reads the count puts the
+// allowance back, so failures spread over a long run never add up.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_readable_count_resets_the_unreadable_run) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        with_probe(shipper, [&] {
+            note_cluster_size_on_all_shards(shipper, 1);
+            start_sealing_on_all_shards(shipper);
+
+            for (int run = 0; run < 2; ++run) {
+                shipper.invoke_on_all([](pitr_shipper&) {
+                           the_probe.count = probe::count_mode::fails;
+                       })
+                        .get();
+                for (unsigned cycle = 1; cycle < max_unreadable_count_cycles; ++cycle) {
+                    tick_and_wait_on_all_shards(shipper);
+                }
+                shipper.invoke_on_all([](pitr_shipper& s) {
+                           tests::require_equal(s.unreadable_count_cycles(), max_unreadable_count_cycles - 1);
+                           tests::require(s.active());
+                           the_probe.count = probe::count_mode::ok;
+                       })
+                        .get();
+                tick_and_wait_on_all_shards(shipper);
+                shipper.invoke_on_all([](pitr_shipper& s) {
+                           tests::require_equal(s.unreadable_count_cycles(), 0u);
+                           tests::require(s.active());
+                           tests::require(s.last_outcome() == pitr_shipper::cycle_outcome::sealed);
+                       })
+                        .get();
+            }
+        });
+    });
+}
+
+// A real second node is not covered by the allowance for an unreadable count:
+// the cycle that counts it breaks shipping at once, for the right reason.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_second_node_breaks_during_an_unreadable_run) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        with_probe(shipper, [&] {
+            note_cluster_size_on_all_shards(shipper, 1);
+            start_sealing_on_all_shards(shipper);
+            shipper.invoke_on_all([](pitr_shipper&) {
+                       the_probe.count = probe::count_mode::fails;
+                   })
+                    .get();
+            tick_and_wait_on_all_shards(shipper);
+
+            shipper.invoke_on_all([](pitr_shipper& s) {
+                       tests::require(s.active());
+                       the_probe.count = probe::count_mode::ok;
+                       the_probe.nodes = 2;
+                   })
+                    .get();
+            tick_and_wait_on_all_shards(shipper);
+            shipper.invoke_on_all([](pitr_shipper& s) {
+                       tests::require_equal(s.state(), shipping_state::off_multi_node);
+                       tests::require(s.break_reason().has_value());
+                       tests::require(s.break_reason()->find("node_count_unreadable") == seastar::sstring::npos);
+                       tests::require(!s.sealing_scheduled());
+                       tests::require_equal(the_probe.seals_started, 0);
+                   })
+                    .get();
+        });
+    });
 }
 
 // stop() has to wait for a seal that is in flight, and must not return while

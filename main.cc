@@ -2405,7 +2405,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             // After the commitlog has been replayed and the old segments are
             // gone, so that the shipper only ever sees segments of this boot,
             // and before the services that take writes, so that it stops after
-            // them and before the commitlog itself.
+            // them and before the commitlog itself. It must also start after
+            // the topology state machine, whose node count its seal cycle
+            // reads: being declared later, it stops and is destroyed first, so
+            // no cycle can read a count of zero from a state machine that is
+            // going away and turn shipping off during shutdown.
             checkpoint(stop_signal, "starting point-in-time recovery shipper");
             seastar::sharded<db::pitr::pitr_shipper> pitr_shipper;
             pitr_shipper.start(std::ref(*cfg)).get();
@@ -2712,21 +2716,43 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             startlog.info("Verifying that all of the tablet keyspaces use rack list replication factors");
             db.local().check_rack_list_everywhere(cfg->enforce_rack_list());
 
-            // After join_cluster() the local topology holds the cluster this
-            // node knows about, which is the first point single-node PITR can
-            // tell a single node from a cluster. This is a startup check only:
-            // a node joining later in this run is not noticed here. Every node
-            // the topology still holds counts - not just the normal token
-            // owners, which leave out zero-token and bootstrapping nodes - so
-            // that an unexpected shape refuses rather than ships.
-            {
-                size_t node_count = 0;
-                token_metadata.local().get()->get_topology().for_each_node([&node_count] (const locator::node&) {
-                    ++node_count;
+            // After join_cluster() the topology state machine holds the cluster
+            // this node knows about, which is the first point single-node PITR
+            // can tell a single node from a cluster. The startup check below and
+            // every seal cycle count through this one function: a node that once
+            // had a peer must not pass the check here and turn shipping off an
+            // interval later. Only shard 0 loads the topology, so the count is
+            // read there, and a count that cannot be read fails the future
+            // rather than reading as a cluster of zero.
+            auto count_pitr_nodes = [&tsm]() -> future<size_t> {
+                return tsm.invoke_on(0, [](service::topology_state_machine& sm) {
+                    return db::pitr::count_cluster_nodes(sm._topology);
                 });
-                pitr_shipper.invoke_on_all([node_count] (db::pitr::pitr_shipper& shipper) {
-                    shipper.note_cluster_size(node_count);
-                }).get();
+            };
+            // Only the main commitlog is sealed: the schema commitlog is not
+            // part of the shipped chain. A null log means the commitlog is
+            // disabled or the pre-shutdown drain already took it away, and
+            // there is nothing to seal either way.
+            auto seal_pitr_segment = [&db]() -> future<> {
+                auto* log = db.local().commitlog();
+                if (!log) {
+                    return make_ready_future<>();
+                }
+                return log->force_new_active_segment();
+            };
+            {
+                const auto node_count = count_pitr_nodes().get();
+                // Arming the seal timer needs shipping to be on already, so it
+                // follows note_cluster_size() and does nothing unless the count
+                // allowed shipping. Both captured services outlive the shipper:
+                // it is declared after them, and its stop() closes the gate
+                // every seal cycle runs inside.
+                pitr_shipper
+                        .invoke_on_all([&](db::pitr::pitr_shipper& shipper) {
+                            shipper.note_cluster_size(node_count);
+                            shipper.start_sealing(seal_pitr_segment, count_pitr_nodes);
+                        })
+                        .get();
             }
 
             // The table-based audit backend needs Raft (via join_cluster)
