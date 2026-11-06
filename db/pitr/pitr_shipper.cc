@@ -15,10 +15,17 @@
 #include <seastar/util/defer.hh>
 
 #include "db/config.hh"
+#include "service/topology_state_machine.hh"
 
 namespace db::pitr {
 
 seastar::logger pitr_logger("pitr");
+
+size_t count_cluster_nodes(const service::topology& topology) noexcept {
+    // left_nodes and left_nodes_rs are left out on purpose: they are the nodes
+    // the cluster no longer has.
+    return topology.normal_nodes.size() + topology.transition_nodes.size() + topology.new_nodes.size();
+}
 
 std::string_view format_as(shipping_state state) noexcept {
     switch (state) {
@@ -30,6 +37,10 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_invalid_config";
     case shipping_state::off_multi_node:
         return "off_multi_node";
+    case shipping_state::off_node_count_unreadable:
+        return "off_node_count_unreadable";
+    case shipping_state::off_commitlog_disabled:
+        return "off_commitlog_disabled";
     case shipping_state::waiting_for_cluster_size:
         return "waiting_for_cluster_size";
     case shipping_state::active:
@@ -192,15 +203,39 @@ future<> pitr_shipper::wait_for_cycles(std::chrono::milliseconds timeout) {
     });
 }
 
+// Turns shipping off for good and records why, for the status report to read.
+void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
+    _state = state;
+    _break_reason = std::move(reason);
+    _last_outcome = cycle_outcome::shipping_broke;
+    _last_failure = _break_reason;
+    _seal_timer.cancel();
+    // Every shard keeps its own latch, so the shard that breaks is the one that
+    // has to say so: a break happens at most once per shard per boot.
+    pitr_logger.error("Point-in-time recovery shipping is off on shard {}: {}", this_shard_id(), *_break_reason);
+}
+
 // Records every failure instead of throwing, so seal_loop() always finishes.
 future<> pitr_shipper::seal_cycle() {
     // Every cycle repeats the startup check, because a node can join later.
     size_t node_count = 0;
     try {
         node_count = co_await _count_nodes();
+        _unreadable_counts = 0;
     } catch (...) {
-        _last_outcome = cycle_outcome::count_failed;
         _last_failure = fmt::format("reading the node count failed: {}", std::current_exception());
+        // A count nobody can read is not a count of one. Shipping rides out a
+        // run of failures, because a restart is the only way back, and breaks
+        // once the run is long enough that the chain cannot be vouched for.
+        if (++_unreadable_counts >= max_unreadable_count_cycles && !_seal_gate.is_closed()) {
+            break_shipping(shipping_state::off_node_count_unreadable,
+                    fmt::format(
+                            "node_count_unreadable: the node count could not be read in {} seal cycles in a row, so the shipped chain can no longer be shown "
+                            "to come from a single node ({}). Fix the cause and restart the node to ship again",
+                            _unreadable_counts, *_last_failure));
+            co_return;
+        }
+        _last_outcome = cycle_outcome::count_failed;
         if (!_seal_gate.is_closed()) {
             // Silent during shutdown, where there is no next cycle to promise.
             static thread_local seastar::logger::rate_limit count_failed_rate_limit(std::chrono::seconds(30));
@@ -215,14 +250,12 @@ future<> pitr_shipper::seal_cycle() {
         co_return;
     }
     if (node_count != 1) {
-        _state = shipping_state::off_multi_node;
-        _break_reason = fmt::format("the node counted {} nodes while shipping, and single-node PITR supports exactly one", node_count);
-        _last_outcome = cycle_outcome::shipping_broke;
-        _last_failure = _break_reason;
-        _seal_timer.cancel();
-        if (this_shard_id() == 0) {
-            pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
-        }
+        // TODO(#7, PM-52): a join can move ranges well inside one seal
+        // interval, so the break has to be stamped with the join's own time
+        // from topology rather than the time this cycle noticed it. Pending the
+        // decision on PM-52.
+        break_shipping(
+                shipping_state::off_multi_node, fmt::format("the node counted {} nodes while shipping, and single-node PITR supports exactly one", node_count));
         co_return;
     }
     try {
@@ -258,6 +291,17 @@ void pitr_shipper::note_cluster_size(size_t node_count) {
     _state = shipping_state::active;
     if (this_shard_id() == 0) {
         pitr_logger.info("Point-in-time recovery shipping is on");
+    }
+}
+
+void pitr_shipper::note_commitlog_disabled() {
+    if (_state != shipping_state::waiting_for_cluster_size) {
+        return;
+    }
+    _state = shipping_state::off_commitlog_disabled;
+    _break_reason = "commitlog_disabled: the commitlog is disabled, so there is nothing to ship. Enable the commitlog and restart the node to ship again";
+    if (this_shard_id() == 0) {
+        pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
     }
 }
 

@@ -2402,10 +2402,10 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 });
             }).get();
 
-            // After the commitlog has been replayed and the old segments are
-            // gone, so that the shipper only ever sees segments of this boot,
-            // and before the services that take writes, so that it stops after
-            // them and before the commitlog itself.
+            // After the commitlog's replay, so the shipper only sees segments
+            // of this boot, and before the services that take writes. It must
+            // also stay after tsm and db, which the seal and count functions
+            // capture: declared later, it stops and is destroyed first.
             checkpoint(stop_signal, "starting point-in-time recovery shipper");
             seastar::sharded<db::pitr::pitr_shipper> pitr_shipper;
             pitr_shipper.start(std::ref(*cfg)).get();
@@ -2712,21 +2712,40 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
             startlog.info("Verifying that all of the tablet keyspaces use rack list replication factors");
             db.local().check_rack_list_everywhere(cfg->enforce_rack_list());
 
-            // After join_cluster() the local topology holds the cluster this
-            // node knows about, which is the first point single-node PITR can
-            // tell a single node from a cluster. This is a startup check only:
-            // a node joining later in this run is not noticed here. Every node
-            // the topology still holds counts - not just the normal token
-            // owners, which leave out zero-token and bootstrapping nodes - so
-            // that an unexpected shape refuses rather than ships.
-            {
-                size_t node_count = 0;
-                token_metadata.local().get()->get_topology().for_each_node([&node_count] (const locator::node&) {
-                    ++node_count;
+            // After join_cluster() the topology state machine holds the cluster
+            // this node knows about. The startup check and every seal cycle
+            // count through this one function, or a node that once had a peer
+            // would pass here and turn shipping off an interval later.
+            auto count_pitr_nodes = [&tsm]() -> future<size_t> {
+                return tsm.invoke_on(0, [](service::topology_state_machine& sm) {
+                    return db::pitr::count_cluster_nodes(sm._topology);
                 });
-                pitr_shipper.invoke_on_all([node_count] (db::pitr::pitr_shipper& shipper) {
-                    shipper.note_cluster_size(node_count);
-                }).get();
+            };
+            // Only the main commitlog is sealed: the schema commitlog is not
+            // part of the shipped chain.
+            auto seal_pitr_segment = [&db]() -> future<> {
+                auto* log = db.local().commitlog();
+                if (!log) {
+                    // Only a disabled commitlog gives null, and that refuses
+                    // shipping below; drain() and shutdown() keep the pointer.
+                    return make_ready_future<>();
+                }
+                return log->force_new_active_segment();
+            };
+            {
+                const auto commitlog_disabled = db.local().commitlog() == nullptr;
+                const size_t node_count = commitlog_disabled ? 0 : count_pitr_nodes().get();
+                pitr_shipper
+                        .invoke_on_all([&](db::pitr::pitr_shipper& shipper) {
+                            if (commitlog_disabled) {
+                                shipper.note_commitlog_disabled();
+                                return;
+                            }
+                            // The timer arms only once shipping is on.
+                            shipper.note_cluster_size(node_count);
+                            shipper.start_sealing(seal_pitr_segment, count_pitr_nodes);
+                        })
+                        .get();
             }
 
             // The table-based audit backend needs Raft (via join_cluster)
