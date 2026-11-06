@@ -198,6 +198,8 @@ bound_file decode_bound_file(std::string_view in) {
     // newline that ends the line before it. Nothing may follow the checksum
     // line, which holds by construction: anything that does becomes the line
     // read as the checksum, and is refused as the wrong key.
+    // A file of one newline wraps `size - 2` and so finds that newline as the
+    // body: the empty line it leaves is what refuses it a line later.
     auto body_end = in.rfind('\n', in.size() - 2);
     if (body_end == std::string_view::npos) {
         refuse("pitr bound file: holds one line, so it has no body and no checksum");

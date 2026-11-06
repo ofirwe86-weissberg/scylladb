@@ -34,8 +34,10 @@ constexpr const char* bound_file_name = "pitr-bound.txt";
 
 // Every shard the replay position can address: it packs the shard into the id.
 constexpr size_t max_shards_in_a_bound_file = size_t(1) << db::replay_position::max_cpu_bits;
-// A row with a chain and full-width values, measured: under 300 bytes.
-constexpr size_t max_bound_file_row_size = 300;
+// A row with a chain and full-width values, measured at 305 bytes: shard 1023,
+// a segment id and a floor at 2^64-1, a position at 2^32-1 and both times at
+// INT64_MAX. Rounded up, so a field that grows by a digit does not break it.
+constexpr size_t max_bound_file_row_size = 320;
 // Refused before a byte is read, and decode allocates nothing per line. Never
 // raised: a version 1 reader refuses a larger file, so raising it needs a new
 // version.

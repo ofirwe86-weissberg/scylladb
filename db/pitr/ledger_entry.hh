@@ -20,7 +20,6 @@
 
 namespace db::pitr {
 
-
 // The ledger is a persisted format, read by a later version on restore, so a
 // reader that does not understand an entry must say so rather than guess.
 class ledger_format_error : public std::runtime_error {
