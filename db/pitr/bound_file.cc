@@ -13,7 +13,6 @@
 #include <string_view>
 
 #include <fmt/format.h>
-#include <seastar/core/format.hh>
 
 #include "utils/crc.hh"
 
@@ -24,6 +23,7 @@ namespace {
 constexpr std::string_view format_key = "format";
 constexpr std::string_view format_value = "pitr-bound";
 constexpr std::string_view crc_key = "crc32";
+constexpr std::string_view none_value = "none";
 
 [[noreturn]] void refuse(sstring what) {
     throw bound_file_format_error(std::move(what));
@@ -47,42 +47,58 @@ void check_id(const utils::UUID& id, std::string_view what) {
     }
 }
 
-// The lines, each without its '\n'. A line that is not terminated, an empty
-// line and anything after the last '\n' are refused, so the byte count a reader
-// checksums is exactly the one the writer produced.
-std::vector<std::string_view> split_lines(std::string_view in) {
-    std::vector<std::string_view> lines;
-    size_t at = 0;
-    while (at < in.size()) {
-        auto end = in.find('\n', at);
-        if (end == std::string_view::npos) {
-            refuse(fmt::format("pitr bound file: the last of {} bytes is not a newline", in.size()));
-        }
-        if (end == at) {
-            refuse(fmt::format("pitr bound file: line {} is empty", lines.size() + 1));
-        }
-        lines.push_back(in.substr(at, end - at));
-        at = end + 1;
+void check_floor(const std::optional<uint64_t>& floor) {
+    // 0 is no segment's id, so it is never a stand-in for "none" or "unknown":
+    // a restore comparing a bound against it would pass every chain.
+    if (floor && *floor == 0) {
+        refuse("pitr bound file: a chain's floor segment id is never 0; a chain with no floor records 'none'");
     }
-    return lines;
 }
 
-// Positional: the key has to be the one the format puts here, which is what
-// refuses an unknown key, a duplicate, a missing one and a reordering alike.
-std::string_view value_of(const std::vector<std::string_view>& lines, size_t at, std::string_view key) {
-    if (at >= lines.size()) {
-        refuse(fmt::format("pitr bound file: ends before the '{}' line", key));
+// Walks the lines of a newline-terminated body without copying or collecting
+// them, so nothing is allocated in proportion to the line count.
+class line_cursor {
+    std::string_view _rest;
+    size_t _line = 0;
+
+public:
+    explicit line_cursor(std::string_view body) noexcept
+        : _rest(body) {
     }
-    auto line = lines[at];
-    auto eq = line.find('=');
-    if (eq == std::string_view::npos) {
-        refuse(fmt::format("pitr bound file: line {} is not key=value: '{}'", at + 1, line));
+
+    bool at_end() const noexcept {
+        return _rest.empty();
     }
-    if (line.substr(0, eq) != key) {
-        refuse(fmt::format("pitr bound file: line {} is '{}', expected key '{}'", at + 1, line.substr(0, eq), key));
+
+    size_t lines_read() const noexcept {
+        return _line;
     }
-    return line.substr(eq + 1);
-}
+
+    // The next line's value. Positional: the key has to be the one the format
+    // puts here, which refuses an unknown key, a duplicate, a missing one and a
+    // reordering alike.
+    std::string_view value_of(std::string_view key) {
+        if (_rest.empty()) {
+            refuse(fmt::format("pitr bound file: ends before the '{}' line", key));
+        }
+        ++_line;
+        // The body always ends in '\n', so every line here is terminated.
+        auto end = _rest.find('\n');
+        auto line = _rest.substr(0, end);
+        _rest.remove_prefix(end + 1);
+        if (line.empty()) {
+            refuse(fmt::format("pitr bound file: line {} is empty", _line));
+        }
+        auto eq = line.find('=');
+        if (eq == std::string_view::npos) {
+            refuse(fmt::format("pitr bound file: line {} is not key=value: '{}'", _line, line));
+        }
+        if (line.substr(0, eq) != key) {
+            refuse(fmt::format("pitr bound file: line {} is '{}', expected key '{}'", _line, line.substr(0, eq), key));
+        }
+        return line.substr(eq + 1);
+    }
+};
 
 template <typename T>
 T parse_decimal(std::string_view s, std::string_view what) {
@@ -127,17 +143,23 @@ sstring encode(const bound_file& f) {
     if (f.shards.empty()) {
         refuse("pitr bound file: a snapshot always covers at least one shard");
     }
+    // Before a byte is formatted, so a count no replay position could name
+    // never builds a file no reader would take.
+    if (f.shards.size() > max_shards_in_a_bound_file) {
+        refuse(fmt::format("pitr bound file: {} shards is more than the {} a replay position can name", f.shards.size(), max_shards_in_a_bound_file));
+    }
 
-    sstring out = seastar::format("{}={}\nversion={}\ncapture_time_us={}\nschema_version={}\nshard_count={}\n", format_key, format_value, bound_file_version_1,
-            f.capture_time_us, f.schema_version.uuid(), f.shards.size());
+    fmt::memory_buffer out;
+    fmt::format_to(std::back_inserter(out), "{}={}\nversion={}\ncapture_time_us={}\nschema_version={}\nshard_count={}\n", format_key, format_value,
+            bound_file_version_1, f.capture_time_us, f.schema_version.uuid(), f.shards.size());
     for (size_t shard = 0; shard < f.shards.size(); ++shard) {
         const auto& b = f.shards[shard];
         if (b.shard != shard) {
             refuse(fmt::format("pitr bound file: row {} is shard {}, so a shard would be missing or recorded twice", shard, b.shard));
         }
-        out += seastar::format("shard={}\nbound_segment_id={}\nbound_position={}\n", b.shard, b.bound.id, b.bound.pos);
+        fmt::format_to(std::back_inserter(out), "shard={}\nbound_segment_id={}\nbound_position={}\n", b.shard, b.bound.id, b.bound.pos);
         if (!b.chain) {
-            out += "chain=none\n";
+            fmt::format_to(std::back_inserter(out), "chain={}\n", none_value);
             continue;
         }
         const auto& c = *b.chain;
@@ -145,17 +167,23 @@ sstring encode(const bound_file& f) {
         check_time(c.chain_start_us, "chain start");
         check_id(c.host_id, "host id");
         check_id(c.chain.uuid(), "chain id");
-        out += seastar::format("chain=present\nchain_host_id={}\nchain_boot_epoch_us={}\nchain_start_us={}\nchain_id={}\nchain_floor_segment_id={}\n",
-                c.host_id, c.boot_epoch_us, c.chain_start_us, c.chain.uuid(), c.floor_segment_id);
+        check_floor(c.floor_segment_id);
+        fmt::format_to(std::back_inserter(out), "chain=present\nchain_host_id={}\nchain_boot_epoch_us={}\nchain_start_us={}\nchain_id={}\n", c.host_id,
+                c.boot_epoch_us, c.chain_start_us, c.chain.uuid());
+        if (c.floor_segment_id) {
+            fmt::format_to(std::back_inserter(out), "chain_floor_segment_id={}\n", *c.floor_segment_id);
+        } else {
+            fmt::format_to(std::back_inserter(out), "chain_floor_segment_id={}\n", none_value);
+        }
     }
-    out += seastar::format("{}={:08x}\n", crc_key, checksum(out));
-    // A node with more shards than the cap leaves room for would otherwise
-    // write a file every reader refuses as oversize. Failing the snapshot says
-    // so; see max_shards_in_a_bound_file.
+    fmt::format_to(std::back_inserter(out), "{}={:08x}\n", crc_key, checksum(std::string_view(out.data(), out.size())));
+    // The static_assert in the header makes this unreachable for any shard
+    // count a replay position can name; it stays because the cap is what every
+    // reader relies on.
     if (out.size() > max_bound_file_size) {
         refuse(fmt::format("pitr bound file: {} shards need {} bytes, over the {}-byte maximum", f.shards.size(), out.size(), max_bound_file_size));
     }
-    return out;
+    return sstring(out.data(), out.size());
 }
 
 bound_file decode_bound_file(std::string_view in) {
@@ -163,65 +191,85 @@ bound_file decode_bound_file(std::string_view in) {
     if (in.size() > max_bound_file_size) {
         refuse(fmt::format("pitr bound file: {} bytes is larger than the {}-byte maximum", in.size(), max_bound_file_size));
     }
-    auto lines = split_lines(in);
+    if (in.empty() || in.back() != '\n') {
+        refuse(fmt::format("pitr bound file: {} bytes, the last of which is not a newline", in.size()));
+    }
+    // The checksum line is the last one, so the body is everything up to the
+    // newline that ends the line before it. Nothing may follow the checksum
+    // line, which holds by construction: anything that does becomes the line
+    // read as the checksum, and is refused as the wrong key.
+    auto body_end = in.rfind('\n', in.size() - 2);
+    if (body_end == std::string_view::npos) {
+        refuse("pitr bound file: holds one line, so it has no body and no checksum");
+    }
+    auto body = in.substr(0, body_end + 1);
+    auto crc_line = in.substr(body_end + 1);
+
+    line_cursor cursor(body);
     // 2. What the file is, so one that is not a bound file at all is refused
     //    before anything in it is believed.
-    if (auto f = value_of(lines, 0, format_key); f != format_value) {
+    if (auto f = cursor.value_of(format_key); f != format_value) {
         refuse(fmt::format("pitr bound file: format is '{}', not '{}'", f, format_value));
     }
-    // 3. The checksum, over every byte before the last line, and before the
-    //    version, so damage is never reported as a format this node cannot read.
-    auto crc_line = lines.back();
-    auto body_size = in.size() - (crc_line.size() + 1);
-    auto stored = value_of(lines, lines.size() - 1, crc_key);
-    auto computed = fmt::format("{:08x}", checksum(in.substr(0, body_size)));
+    // 3. The checksum, before the version, so damage is never reported as a
+    //    format this node cannot read.
+    auto stored = line_cursor(crc_line).value_of(crc_key);
+    auto computed = fmt::format("{:08x}", checksum(body));
     if (stored != computed) {
         refuse(fmt::format("pitr bound file: checksum is '{}', computed '{}'", stored, computed));
     }
-    // 4. The version. A newer one is intact but unreadable here, so the remedy
-    //    is an upgrade and not another backup.
-    auto version = parse_decimal<uint32_t>(value_of(lines, 1, "version"), "version");
+    // 4. The version. A higher one is intact but unreadable here, so the remedy
+    //    is an upgrade and not another backup. Version 0 was never written, so
+    //    it is damage.
+    auto version = parse_decimal<uint32_t>(cursor.value_of("version"), "version");
+    if (version == 0) {
+        refuse("pitr bound file: version 0 was never written by any Scylla");
+    }
     if (version != bound_file_version_1) {
         throw bound_file_unknown_version(
                 fmt::format("pitr bound file: version {} was written by a newer Scylla; this node reads version {}", version, bound_file_version_1));
     }
 
     bound_file f;
-    f.capture_time_us = parse_decimal<int64_t>(value_of(lines, 2, "capture_time_us"), "capture time");
-    f.schema_version = table_schema_version(parse_uuid(value_of(lines, 3, "schema_version"), "schema version"));
-    auto shard_count = parse_decimal<uint32_t>(value_of(lines, 4, "shard_count"), "shard count");
+    f.capture_time_us = parse_decimal<int64_t>(cursor.value_of("capture_time_us"), "capture time");
+    f.schema_version = table_schema_version(parse_uuid(cursor.value_of("schema_version"), "schema version"));
+    auto shard_count = parse_decimal<uint32_t>(cursor.value_of("shard_count"), "shard count");
     if (shard_count == 0) {
         refuse("pitr bound file: a snapshot always covers at least one shard");
     }
+    if (shard_count > max_shards_in_a_bound_file) {
+        refuse(fmt::format("pitr bound file: {} shards is more than the {} a replay position can name", shard_count, max_shards_in_a_bound_file));
+    }
 
-    // Nothing is reserved from the declared count: a count far above what the
-    // file holds must cost a reader nothing before the rows refute it.
-    size_t at = 5;
+    f.shards.reserve(shard_count);
     for (uint32_t shard = 0; shard < shard_count; ++shard) {
         shard_bound b;
-        b.shard = parse_decimal<uint32_t>(value_of(lines, at++, "shard"), "shard");
+        b.shard = parse_decimal<uint32_t>(cursor.value_of("shard"), "shard");
         if (b.shard != shard) {
             refuse(fmt::format("pitr bound file: row {} is shard {}, so a shard is missing, recorded twice or out of order", shard, b.shard));
         }
-        b.bound.id = parse_decimal<uint64_t>(value_of(lines, at++, "bound_segment_id"), "bound segment id");
-        b.bound.pos = parse_decimal<uint32_t>(value_of(lines, at++, "bound_position"), "bound position");
-        auto chain = value_of(lines, at++, "chain");
+        b.bound.id = parse_decimal<uint64_t>(cursor.value_of("bound_segment_id"), "bound segment id");
+        b.bound.pos = parse_decimal<uint32_t>(cursor.value_of("bound_position"), "bound position");
+        auto chain = cursor.value_of("chain");
         if (chain == "present") {
             shard_chain c;
-            c.host_id = parse_uuid(value_of(lines, at++, "chain_host_id"), "host id");
-            c.boot_epoch_us = parse_decimal<int64_t>(value_of(lines, at++, "chain_boot_epoch_us"), "chain boot epoch");
-            c.chain_start_us = parse_decimal<int64_t>(value_of(lines, at++, "chain_start_us"), "chain start");
-            c.chain = chain_id(parse_uuid(value_of(lines, at++, "chain_id"), "chain id"));
-            c.floor_segment_id = parse_decimal<uint64_t>(value_of(lines, at++, "chain_floor_segment_id"), "chain floor segment id");
+            c.host_id = parse_uuid(cursor.value_of("chain_host_id"), "host id");
+            c.boot_epoch_us = parse_decimal<int64_t>(cursor.value_of("chain_boot_epoch_us"), "chain boot epoch");
+            c.chain_start_us = parse_decimal<int64_t>(cursor.value_of("chain_start_us"), "chain start");
+            c.chain = chain_id(parse_uuid(cursor.value_of("chain_id"), "chain id"));
+            if (auto floor = cursor.value_of("chain_floor_segment_id"); floor != none_value) {
+                c.floor_segment_id = parse_decimal<uint64_t>(floor, "chain floor segment id");
+                check_floor(c.floor_segment_id);
+            }
             b.chain = std::move(c);
-        } else if (chain != "none") {
-            refuse(fmt::format("pitr bound file: chain is '{}', not 'present' or 'none'", chain));
+        } else if (chain != none_value) {
+            refuse(fmt::format("pitr bound file: chain is '{}', not 'present' or '{}'", chain, none_value));
         }
         f.shards.push_back(std::move(b));
     }
-    // 5. Nothing may follow the rows but the checksum line.
-    if (at != lines.size() - 1) {
-        refuse(fmt::format("pitr bound file: {} lines follow the last shard row and the checksum", lines.size() - 1 - at));
+    // 5. Nothing may stand between the last row and the checksum.
+    if (!cursor.at_end()) {
+        refuse(fmt::format("pitr bound file: lines follow the last shard row, which holds {} rows", shard_count));
     }
     return f;
 }

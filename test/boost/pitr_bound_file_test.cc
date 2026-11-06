@@ -18,6 +18,7 @@
 #include "test/lib/scylla_test_case.hh"
 
 #include <filesystem>
+#include <limits>
 
 #include <boost/test/unit_test.hpp>
 
@@ -27,8 +28,9 @@
 #include "db/config.hh"
 #include "db/pitr/bound_file.hh"
 #include "replica/database.hh"
-#include "sstables/open_info.hh"
+#include "replica/distributed_loader.hh"
 #include "sstables/sstables.hh"
+#include "test/lib/cql_assertions.hh"
 #include "test/lib/cql_test_env.hh"
 #include "test/lib/test_utils.hh"
 #include "utils/crc.hh"
@@ -45,18 +47,19 @@ const utils::UUID test_host_id{"a1b2c3d4-0000-4000-8000-00000000000f"};
 const chain_id test_chain{utils::UUID("11112222-0000-4000-8000-00000000000a")};
 const table_schema_version test_schema_version{utils::UUID("33334444-0000-4000-8000-00000000000b")};
 
-shard_chain make_chain() {
-    return shard_chain{test_host_id, 1762300000000000LL, 1762300001000000LL, test_chain, 7000};
+shard_chain make_chain(std::optional<uint64_t> floor = 2) {
+    return shard_chain{test_host_id, 1762300000000000LL, 1762300001000000LL, test_chain, floor};
 }
 
 // Shard 0 has a chain, shard 1 has none: both rows are exercised by every codec
-// test that does not need something else.
+// test that does not need something else. The bounds carry their shard in the
+// segment id, the way a real capture does.
 bound_file make_file() {
     bound_file f;
     f.capture_time_us = 1762400000000000LL;
     f.schema_version = test_schema_version;
-    f.shards.push_back(shard_bound{0, db::replay_position(uint64_t(3), uint32_t(128)), make_chain()});
-    f.shards.push_back(shard_bound{1, db::replay_position(uint64_t(4), uint32_t(0)), std::nullopt});
+    f.shards.push_back(shard_bound{0, db::replay_position(0u, 3, 128), make_chain()});
+    f.shards.push_back(shard_bound{1, db::replay_position(1u, 4, 0), std::nullopt});
     return f;
 }
 
@@ -76,12 +79,12 @@ constexpr std::string_view golden = "format=pitr-bound\n"
                                     "chain_boot_epoch_us=1762300000000000\n"
                                     "chain_start_us=1762300001000000\n"
                                     "chain_id=11112222-0000-4000-8000-00000000000a\n"
-                                    "chain_floor_segment_id=7000\n"
+                                    "chain_floor_segment_id=2\n"
                                     "shard=1\n"
-                                    "bound_segment_id=4\n"
+                                    "bound_segment_id=18014398509481988\n"
                                     "bound_position=0\n"
                                     "chain=none\n"
-                                    "crc32=1460b4e8\n";
+                                    "crc32=30c3489d\n";
 
 // The length of the checksum line, which several tests cut off.
 constexpr size_t crc_line_size = sizeof("crc32=00000000\n") - 1;
@@ -131,9 +134,85 @@ BOOST_AUTO_TEST_CASE(test_a_single_shard_file_round_trips) {
     bound_file f;
     f.capture_time_us = 0;
     f.schema_version = test_schema_version;
-    f.shards.push_back(shard_bound{0, db::replay_position(uint64_t(1), uint32_t(0)), std::nullopt});
+    f.shards.push_back(shard_bound{0, db::replay_position(0u, 1, 0), std::nullopt});
 
     BOOST_REQUIRE(decode_bound_file(encode(f)) == f);
+}
+
+// A present chain carries its D27 floor, or records that it has none; both have
+// to survive the round trip, because restore treats them differently.
+BOOST_AUTO_TEST_CASE(test_a_chain_round_trips_with_a_floor_and_without_one) {
+    auto with_floor = make_file();
+    BOOST_REQUIRE(decode_bound_file(encode(with_floor)) == with_floor);
+
+    auto without = make_file();
+    without.shards[0].chain = make_chain(std::nullopt);
+    auto decoded = decode_bound_file(encode(without));
+    BOOST_REQUIRE(decoded == without);
+    BOOST_REQUIRE(!decoded.shards[0].chain->floor_segment_id);
+}
+
+// 0 is no segment's id, so it is never a stand-in for "none": a restore
+// comparing a bound against it would accept every chain.
+BOOST_AUTO_TEST_CASE(test_a_chain_floor_of_zero_is_refused) {
+    auto f = make_file();
+    f.shards[0].chain = make_chain(0);
+    BOOST_REQUIRE_THROW(encode(f), bound_file_format_error);
+
+    require_refused(golden_with_line("chain_floor_segment_id=2\n", "chain_floor_segment_id=0\n"), "a floor of 0 in the file");
+}
+
+// The widest machine a replay position can name, with the widest value every
+// field can take: the file is what every reader's size cap is derived from.
+BOOST_AUTO_TEST_CASE(test_the_widest_file_a_replay_position_can_name_round_trips) {
+    bound_file f;
+    f.capture_time_us = std::numeric_limits<int64_t>::max();
+    f.schema_version = test_schema_version;
+    for (uint32_t shard = 0; shard < max_shards_in_a_bound_file; ++shard) {
+        auto c = make_chain(std::numeric_limits<uint64_t>::max());
+        c.boot_epoch_us = std::numeric_limits<int64_t>::max();
+        c.chain_start_us = std::numeric_limits<int64_t>::max();
+        // Every shard's bound is the highest position its own shard can hold.
+        f.shards.push_back(shard_bound{shard, db::replay_position(shard, db::replay_position::ts_mask, std::numeric_limits<db::position_type>::max()), c});
+    }
+
+    auto content = encode(f);
+
+    BOOST_REQUIRE_LE(content.size(), max_bound_file_size);
+    BOOST_REQUIRE(decode_bound_file(content) == f);
+}
+
+// Past that the writer refuses: a count no replay position can name must not
+// produce a file every reader would then refuse as oversize.
+BOOST_AUTO_TEST_CASE(test_encoding_more_shards_than_a_replay_position_can_name_is_refused) {
+    bound_file f;
+    f.schema_version = test_schema_version;
+    for (uint32_t shard = 0; shard <= max_shards_in_a_bound_file; ++shard) {
+        f.shards.push_back(shard_bound{shard, db::replay_position(0u, 1, 0), std::nullopt});
+    }
+
+    BOOST_REQUIRE_THROW(encode(f), bound_file_format_error);
+}
+
+// The writer refuses what the reader would: a row for the wrong shard means a
+// shard is missing or recorded twice, and no file may say so.
+BOOST_AUTO_TEST_CASE(test_encoding_shard_rows_out_of_order_is_refused) {
+    auto swapped = make_file();
+    std::swap(swapped.shards[0].shard, swapped.shards[1].shard);
+    BOOST_REQUIRE_THROW(encode(swapped), bound_file_format_error);
+
+    bound_file none;
+    none.schema_version = test_schema_version;
+    BOOST_REQUIRE_THROW(encode(none), bound_file_format_error);
+}
+
+// A file that claims no shard at all, with no row to contradict it: a snapshot
+// always covers at least one shard, so this is damage and not an empty backup.
+BOOST_AUTO_TEST_CASE(test_a_shard_count_of_zero_with_no_rows_is_refused) {
+    auto head = golden_body();
+    head = head.substr(0, head.find("shard=0\n"));
+    head = head.substr(0, head.find("shard_count=2\n")) + "shard_count=0\n";
+    require_refused(with_fresh_crc(head), "no shards and no rows");
 }
 
 BOOST_AUTO_TEST_CASE(test_a_truncated_file_is_refused) {
@@ -208,8 +287,9 @@ BOOST_AUTO_TEST_CASE(test_a_null_or_non_canonical_uuid_is_refused) {
             "the null schema version");
     require_refused(golden_with_line("chain_host_id=a1b2c3d4-0000-4000-8000-00000000000f\n", "chain_host_id=A1B2C3D4-0000-4000-8000-00000000000F\n"),
             "upper case, which UUID's own parser takes");
-    require_refused(golden_with_line("chain_host_id=a1b2c3d4-0000-4000-8000-00000000000f\n", "chain_host_id=a1b2c3d40000400080000000000000 0f\n"),
-            "dashes moved, which UUID's own parser takes");
+    require_refused(golden_with_line("chain_host_id=a1b2c3d4-0000-4000-8000-00000000000f\n", "chain_host_id=a1b2c3d4000040008000"
+                                                                                             "00000000000f\n"),
+            "the 32-hex form with no dashes, which UUID's own parser takes");
     require_refused(golden_with_line("chain_host_id=a1b2c3d4-0000-4000-8000-00000000000f\n", "chain_host_id=not-a-uuid\n"), "not a uuid at all");
 }
 
@@ -240,20 +320,23 @@ BOOST_AUTO_TEST_CASE(test_a_newer_version_is_refused_as_newer) {
     }
 }
 
+// Version 0 was never written, so it is damage: reporting it as newer would
+// send an operator upgrading instead of taking another backup.
+BOOST_AUTO_TEST_CASE(test_version_zero_is_damage_and_not_a_newer_version) {
+    auto zero = golden_with_line("version=1\n", "version=0\n");
+    try {
+        decode_bound_file(zero);
+        BOOST_FAIL("version 0 was accepted");
+    } catch (const bound_file_unknown_version&) {
+        BOOST_FAIL("version 0 was reported as a newer version");
+    } catch (const bound_file_format_error&) {
+    }
+}
+
 BOOST_AUTO_TEST_CASE(test_a_file_that_is_not_a_bound_file_is_refused) {
     require_refused("", "an empty file");
     require_refused("{\"manifest\": {}}\n", "a manifest");
     require_refused(golden_with_line("format=pitr-bound\n", "format=pitr-ledger\n"), "another pitr format");
-}
-
-// The restored snapshot is loaded as a table directory, so a name that parses
-// as an sstable component would be opened as one.
-BOOST_AUTO_TEST_CASE(test_the_file_name_does_not_parse_as_an_sstable) {
-    const std::filesystem::path dir{"/data/ks/cf-123/"};
-    BOOST_REQUIRE(!sstables::parse_path(dir / bound_file_name, ks_name, cf_name).has_value());
-    // The same call takes a real component, so the refusal above is the name's
-    // and not the path's.
-    BOOST_REQUIRE(sstables::parse_path(dir / "md-3g9r_04ux_4be4w2d7t8bg6u7nok-big-Data.db", ks_name, cf_name).has_value());
 }
 
 namespace {
@@ -273,11 +356,11 @@ std::filesystem::path snapshot_dir(cql_test_env& e) {
     return tests::table_dir(cf) / sstables::snapshots_dir / snapshot_name;
 }
 
-void take_snapshot(cql_test_env& e) {
+// skip_flush by default, so that the commitlog position the snapshot records
+// can be sandwiched between two observations of it.
+void take_snapshot(cql_test_env& e, bool skip_flush = true) {
     auto uuid = e.db().local().find_uuid(ks_name, cf_name);
-    // No flush, so that the commitlog position the snapshot records can be
-    // sandwiched between two observations of it.
-    replica::database::snapshot_table_on_all_shards(e.db(), uuid, snapshot_name, db::snapshot_options{.skip_flush = true}).get();
+    replica::database::snapshot_table_on_all_shards(e.db(), uuid, snapshot_name, db::snapshot_options{.skip_flush = skip_flush}).get();
 }
 
 void create_and_fill(cql_test_env& e) {
@@ -295,6 +378,28 @@ cql_test_config pitr_config() {
 }
 
 } // namespace
+
+// The restored snapshot is loaded as a table directory, and the bound file is
+// not an sstable component: the lister refuses a name it cannot parse rather
+// than ignoring it, so without manifest_json_filter skipping this name the load
+// fails with "invalid version for file pitr-bound.txt". Nobody can restore a
+// PITR backup if its own bound file stops the load.
+SEASTAR_TEST_CASE(test_a_snapshot_holding_the_bound_file_loads_through_the_upload_dir) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+                // With a flush, so the snapshot holds sstables to load.
+                take_snapshot(e, false);
+                BOOST_REQUIRE(std::filesystem::exists(snapshot_dir(e) / bound_file_name));
+
+                auto& t = e.local_db().find_column_family(ks_name, cf_name);
+                tests::copy_directory(snapshot_dir(e), tests::table_dir(t) / sstables::upload_dir);
+                replica::distributed_loader::process_upload_dir(e.db(), e.view_builder(), e.view_building_worker(), ks_name, cf_name, false, false).get();
+
+                assert_that(e.execute_cql(seastar::format("select * from {}.{};", ks_name, cf_name)).get()).is_rows().with_size(8);
+            },
+            pitr_config());
+}
 
 // The file holds one row per shard, and each row's bound is that shard's own:
 // a bound taken from another shard, or from another moment, falls outside the
@@ -362,6 +467,49 @@ SEASTAR_TEST_CASE(test_a_provider_that_throws_fails_the_snapshot_and_writes_noth
             pitr_config());
 }
 
+// The manifest is the last file a snapshot writes, so a bound file that cannot
+// be written must stop the snapshot before it: a manifest beside a missing
+// bound file would look like a snapshot a restore can replay from. The failure
+// is forced through the provider, which hands back a chain no file can record.
+SEASTAR_TEST_CASE(test_a_bound_file_that_cannot_be_written_leaves_no_manifest) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+                e.db().invoke_on_all([](replica::database& db) {
+                          db.set_pitr_chain_provider([]() -> std::optional<shard_chain> {
+                              // A floor of 0 is refused by the codec.
+                              return shard_chain{test_host_id, 1, 1, test_chain, 0};
+                          });
+                      }).get();
+
+                BOOST_REQUIRE_THROW(take_snapshot(e), bound_file_format_error);
+
+                BOOST_REQUIRE(!std::filesystem::exists(snapshot_dir(e) / "manifest.json"));
+                BOOST_REQUIRE(!std::filesystem::exists(snapshot_dir(e) / bound_file_name));
+            },
+            pitr_config());
+}
+
+// The bound file is not data: counting it would make every snapshot of an
+// empty table look as if it held some, and nodetool would report it as live.
+SEASTAR_TEST_CASE(test_the_bound_file_is_not_counted_as_snapshot_data) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+                take_snapshot(e);
+                BOOST_REQUIRE(std::filesystem::exists(snapshot_dir(e) / bound_file_name));
+
+                auto details = e.local_db().find_column_family(ks_name, cf_name).get_snapshot_details().get();
+
+                BOOST_REQUIRE_EQUAL(details.size(), 1);
+                // Nothing was flushed, so the snapshot holds no sstable: every
+                // file in it is one of the three that do not count.
+                BOOST_REQUIRE_EQUAL(details.at(snapshot_name).total, 0);
+                BOOST_REQUIRE_EQUAL(details.at(snapshot_name).live, 0);
+            },
+            pitr_config());
+}
+
 // The chain a shard reports reaches the file whole: the host id, the two times,
 // the chain id and the floor, which is all restore needs to find the chain.
 SEASTAR_TEST_CASE(test_an_installed_provider_reaches_every_row) {
@@ -370,11 +518,9 @@ SEASTAR_TEST_CASE(test_an_installed_provider_reaches_every_row) {
                 create_and_fill(e);
                 e.db().invoke_on_all([](replica::database& db) {
                           db.set_pitr_chain_provider([]() -> std::optional<shard_chain> {
-                              auto c = make_chain();
-                              // One value per shard, so a row copied from
+                              // One floor per shard, so a row copied from
                               // another shard is visible.
-                              c.floor_segment_id += this_shard_id();
-                              return c;
+                              return make_chain(2 + this_shard_id());
                           });
                       }).get();
 
@@ -385,9 +531,7 @@ SEASTAR_TEST_CASE(test_an_installed_provider_reaches_every_row) {
                 BOOST_REQUIRE_EQUAL(f.shards.size(), this_smp_shard_count());
                 for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
                     BOOST_TEST_CONTEXT("shard " << shard) {
-                        auto expected = make_chain();
-                        expected.floor_segment_id += shard;
-                        BOOST_REQUIRE(f.shards[shard].chain == expected);
+                        BOOST_REQUIRE(f.shards[shard].chain == make_chain(2 + shard));
                     }
                 }
             },

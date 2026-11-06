@@ -36,6 +36,7 @@
 #include "db/system_distributed_keyspace.hh"
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "db/pitr/chain_provider.hh"
 #include "db/pitr/pitr_shipper.hh"
 #include "audit/audit.hh"
 #include "db/extensions.hh"
@@ -945,6 +946,11 @@ static auto add_fragmented_listeners(const gms::feature& f, db::commitlog& cl) {
             cl.update_configuration(cfg);
         }
     });
+}
+
+std::optional<db::pitr::shard_chain>
+database::pitr_chain() const {
+    return _pitr_chain_provider ? _pitr_chain_provider() : std::nullopt;
 }
 
 future<>

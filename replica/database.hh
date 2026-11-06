@@ -39,7 +39,7 @@
 #include <seastar/core/condition-variable.hh>
 #include "db/commitlog/replay_position.hh"
 #include "db/commitlog/commitlog_types.hh"
-#include "db/pitr/bound_file.hh"
+#include "db/pitr/chain_provider.hh"
 #include "schema/schema_fwd.hh"
 #include "mutation/frozen_mutation.hh"
 #include "db/snapshot-ctl.hh"
@@ -2045,9 +2045,7 @@ public:
     }
     // The chain this shard is shipping, or nothing when it has none or no
     // provider is installed. Must not block: a snapshot calls it on each shard.
-    std::optional<db::pitr::shard_chain> pitr_chain() const {
-        return _pitr_chain_provider ? _pitr_chain_provider() : std::nullopt;
-    }
+    std::optional<db::pitr::shard_chain> pitr_chain() const;
     replica::cf_stats* cf_stats() {
         return &_cf_stats;
     }
