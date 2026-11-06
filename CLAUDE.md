@@ -185,7 +185,11 @@ Every task issue carries one level label, `team:full` or `team:light`. `tl-intak
 
 **`team:light`** is everything else: a confined change to a settled design, such as a refusal check, a parser, wiring of a reviewed design, tests, docs or tooling.
 
-When in doubt, use full. Anyone (the team lead, `reviewer-qa`, `architect-check`) can raise a task to full when the work shows risk: a lifetime question, a possible stall, or an overrun of its time box. Lowering a level needs the human.
+When in doubt, use full.
+
+**The label is where a task starts, not a fixed decision.** The team lead checks the level again at every step: after the implementer's diff, after `architect-check`, and after each `reviewer-qa` round. Each sub-task or piece has its own level, so one risky piece of a light issue goes full without moving the rest.
+- **Raising** is done at once by anyone who sees the risk (the team lead, `implementer`, `reviewer-qa`, `architect-check`): a lifetime or concurrency question, a possible stall, a silent-wrong-data path, a structural change, or an overrun of the time box. The remaining steps switch to the full column straight away. The team lead updates the label and adds a signed issue comment saying what triggered it.
+- **Lowering**, mid-task or not, needs the human's OK.
 
 | | `team:full` | `team:light` |
 |---|---|---|
