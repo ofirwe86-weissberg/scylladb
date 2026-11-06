@@ -14,6 +14,14 @@ std::string_view reason_code(refusal_reason reason) noexcept {
     switch (reason) {
     case refusal_reason::t_invalid:
         return "t_invalid";
+    case refusal_reason::t_past_coverage:
+        return "t_past_coverage";
+    case refusal_reason::protection_records_missing:
+        return "protection_records_missing";
+    case refusal_reason::protection_records_damaged:
+        return "protection_records_damaged";
+    case refusal_reason::backup_before_shipping:
+        return "backup_before_shipping";
     }
     return "unknown";
 }
