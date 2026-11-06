@@ -57,6 +57,8 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_commitlog_disabled";
     case shipping_state::off_unknown_endpoint:
         return "off_unknown_endpoint";
+    case shipping_state::off_store_client_failed:
+        return "off_store_client_failed";
     case shipping_state::off_upload_failed:
         return "off_upload_failed";
     case shipping_state::waiting_for_cluster_size:
@@ -652,7 +654,7 @@ void pitr_shipper::note_store_client_failed(std::string_view cause) {
     if (!active()) {
         return;
     }
-    _state = shipping_state::off_unknown_endpoint;
+    _state = shipping_state::off_store_client_failed;
     _break_reason = fmt::format("store_client_failed: no store client could be built for pitr_endpoint '{}' ({}). Fix the endpoint's configuration and restart "
                                 "the node to ship again",
             _cfg.pitr_endpoint(), cause);

@@ -2596,13 +2596,13 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_store_client_that_cannot_be_built_refuses_s
         shipper.note_cluster_size(1);
         shipper.note_store_client_failed("endpoint http://localhost:9000 not found");
 
-        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_unknown_endpoint);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_store_client_failed);
         BOOST_REQUIRE(shipper.break_reason().has_value());
         BOOST_REQUIRE(shipper.break_reason()->find("not found") != seastar::sstring::npos);
         BOOST_REQUIRE(shipper.break_reason()->find("restart") != seastar::sstring::npos);
         // Latched, and a close after it releases its hold at once.
         shipper.note_cluster_size(1);
-        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_unknown_endpoint);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_store_client_failed);
         shipper.segment_closed(45, 4096, false);
         BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{45});
         BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);

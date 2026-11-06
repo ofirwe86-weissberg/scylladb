@@ -18,6 +18,7 @@
 
 #include <boost/test/unit_test.hpp>
 #include <algorithm>
+#include <cstdlib>
 #include <filesystem>
 #include <string>
 #include <tuple>
@@ -45,6 +46,8 @@ BOOST_AUTO_TEST_SUITE(pitr_shipper_wiring_test)
 namespace {
 
 constexpr const char* pitr_test_endpoint = "https://pitr-store.test";
+// What the wiring passes in, fixed so that a chain can be asserted on.
+constexpr int64_t test_boot_epoch_us = 1762300000000000LL;
 
 // `known_endpoint` decides whether the node was configured with the endpoint
 // pitr_endpoint names. Nothing talks to it: building a client does no I/O.
@@ -53,6 +56,13 @@ cql_test_config pitr_config(bool known_endpoint = false) {
     cfg.db_config->pitr_endpoint.set(pitr_test_endpoint);
     cfg.db_config->pitr_bucket.set("pitr-bucket");
     if (known_endpoint) {
+        // Static credentials, so that building the client never reaches the AWS
+        // credential chain: without them the client's teardown waits for the
+        // instance-metadata lookups, about 50 s per test. Already set when the
+        // S3 mock runs, so an existing value wins.
+        ::setenv("AWS_ACCESS_KEY_ID", "pitr-test-key", 0);
+        ::setenv("AWS_SECRET_ACCESS_KEY", "pitr-test-secret", 0);
+        ::setenv("AWS_DEFAULT_REGION", "local", 0);
         cfg.db_config->object_storage_endpoints({db::object_storage_endpoint_param(db::object_storage_endpoint_param::s3_storage{
                 .endpoint = pitr_test_endpoint,
                 .region = "local",
@@ -118,17 +128,27 @@ void with_a_held_closed_segment(cql_test_env& e, Func&& f) {
     });
 
     e.execute_cql("create table ks.cf (pk int primary key, v int)").get();
-    // Twice, so that a held id is not always the first segment the commitlog
-    // holds: a path lookup that ignores the id would answer with the wrong one.
-    for (int i = 0; i < 2; ++i) {
-        e.execute_cql(seastar::format("insert into ks.cf (pk, v) values ({}, {})", i, i)).get();
+    // Two closed segments, so that a held id is not always the first segment
+    // the commitlog holds: a path lookup that ignores the id would answer with
+    // the wrong one. A row lands on the shard its token belongs to and only
+    // this shard's log is under test, so it takes as many rows as it takes,
+    // whatever the shard count is; the seal does nothing on an unused segment.
+    constexpr int max_rows = 500;
+    int pk = 0;
+    while (closed.size() < 2 && pk < max_rows) {
+        e.execute_cql(seastar::format("insert into ks.cf (pk, v) values ({}, {})", pk, pk)).get();
+        ++pk;
         log->force_new_active_segment().get();
     }
-    // One more write, so that the segment being written is held too, as it is
-    // on a node that takes writes: the hold starts with the first write to it.
-    e.execute_cql("insert into ks.cf (pk, v) values (2, 2)").get();
-
     BOOST_REQUIRE_EQUAL(closed.size(), 2u);
+    // One more row for this shard, so that the segment being written is held
+    // too, as it is on a node that takes writes: the hold starts with the
+    // first write to the segment.
+    while (log->held_segments().size() < closed.size() + 1 && pk < max_rows) {
+        e.execute_cql(seastar::format("insert into ks.cf (pk, v) values ({}, {})", pk, pk)).get();
+        ++pk;
+    }
+    BOOST_REQUIRE_EQUAL(log->held_segments().size(), closed.size() + 1);
     for (const auto& [id, used_size, failed] : closed) {
         BOOST_REQUIRE(!failed);
         BOOST_REQUIRE_GT(used_size, 0u);
@@ -271,7 +291,10 @@ SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
             [](cql_test_env& e) {
                 with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
                     with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
-                        db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), 1, [] {
+                        const auto host_id = utils::UUID_gen::get_time_UUID();
+                        int flushes = 0;
+                        db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), log, host_id, test_boot_epoch_us, [&flushes] {
+                            ++flushes;
                             return make_ready_future<>();
                         });
 
@@ -279,6 +302,12 @@ SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
                         BOOST_REQUIRE(shipper.chain());
                         BOOST_REQUIRE_EQUAL(shipper.chain()->shard, seastar::this_shard_id());
                         BOOST_REQUIRE_EQUAL(shipper.chain()->prefix, e.local_db().get_config().pitr_prefix());
+                        // The identity the wiring passed in, which the chain's
+                        // key and every ledger entry are read against.
+                        BOOST_REQUIRE_EQUAL(shipper.chain()->host_id, host_id);
+                        BOOST_REQUIRE_EQUAL(shipper.chain()->boot_epoch_us, test_boot_epoch_us);
+                        // The flush the start owes, run once and no more.
+                        BOOST_REQUIRE_EQUAL(flushes, 1);
 
                         // The key is this chain's, keeping the commitlog's own
                         // file name rather than one a test made up.
@@ -305,10 +334,14 @@ SEASTAR_TEST_CASE(test_the_chain_floor_is_the_newest_held_segment) {
                         const auto held = log.held_segments();
                         // The two that closed plus the one being written.
                         BOOST_REQUIRE_EQUAL(held.size(), 3u);
-                        db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), 1, [] {
-                            return make_ready_future<>();
-                        });
+                        int flushes = 0;
+                        db::pitr::start_shipping_on_shard(
+                                shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), test_boot_epoch_us, [&flushes] {
+                                    ++flushes;
+                                    return make_ready_future<>();
+                                });
 
+                        BOOST_REQUIRE_EQUAL(flushes, 1);
                         BOOST_REQUIRE(shipper.chain_floor());
                         BOOST_REQUIRE_EQUAL(*shipper.chain_floor(), held.back());
                         // Every segment that closed before the chain is below

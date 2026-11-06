@@ -92,9 +92,10 @@ enum class shipping_state {
     off_node_count_unreadable,
     // The commitlog is disabled: nothing to seal, so refused at startup.
     off_commitlog_disabled,
-    // There is no usable store client for pitr_endpoint: no
-    // object_storage_endpoints entry for it, or one the client refused.
+    // pitr_endpoint has no object_storage_endpoints entry.
     off_unknown_endpoint,
+    // It has one, but no store client could be built from it.
+    off_store_client_failed,
     // An upload failed in a way no retry can fix, so the chain has a hole:
     // shipping stops for good and every hold is released (D25).
     off_upload_failed,
