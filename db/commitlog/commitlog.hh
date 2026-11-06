@@ -514,8 +514,24 @@ public:
 
     class replay_state {
     public:
+        // One split write this state still holds fragments of: the reads done with it ended inside the write, so
+        // nothing of it was handed to the consumer. A healthy log leaves these too, for instance a write rolled back
+        // after it was allocated, or one whose head or tail is in a segment the reads did not cover.
+        struct pending_write {
+            // The position of the lowest fragment held, which is the write's own position when head_present. An
+            // incomplete write cannot be decoded, so its mutation timestamp is not available here.
+            replay_position position;
+            // Whether the fragment at offset 0 was read, that is whether the reads covered the write's start.
+            bool head_present = false;
+        };
+
         replay_state();
         ~replay_state();
+
+        // Walks the state: one step per pending write, and no preemption point. Every pending write holds its fragments
+        // in memory, so the shard's memory bounds how many there can be.
+        std::vector<pending_write> pending() const;
+
     private:
         friend class commitlog;
         class impl;

@@ -146,11 +146,15 @@ void check_bound_is_set(const db::replay_position& bound, unsigned shard) {
 using mapping_table = std::unordered_map<table_schema_version, column_mapping>;
 
 future<> consume_entry(const shard_replay_params& params, const shipped_segment& seg, const replay_consumer& consume, replay_reader_stats& stats,
-        mapping_table& mappings, ::detail::commitlog_entry_serialization_format format, commitlog::buffer_and_replay_position buf_rp) {
+        mapping_table& mappings, db::replay_position& highest_read, ::detail::commitlog_entry_serialization_format format,
+        commitlog::buffer_and_replay_position buf_rp) {
     co_await coroutine::maybe_yield();
 
     const auto rp = buf_rp.position;
     ++stats.entries_read;
+    // Before every filter, and of every table: a split write still pending with an entry read above it was rolled back
+    // (see replay_shard_segments).
+    highest_read = std::max(highest_read, rp);
 
     // Every entry is decoded, dropped or not, because the mapping an entry below
     // the bound carries is the mapping the entries above it need. Normal replay
@@ -214,6 +218,8 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
     // segments is reassembled and handed over once.
     const commitlog::replay_state state;
     std::optional<segment_id_type> previous_id;
+    // The highest position of any entry decoded, used to rule out rolled-back writes below.
+    db::replay_position highest_read;
 
     rlogger.info("strict replay of {} segment(s) for shard {} of table {}, bound {}, truncation floor {}", params.segments.size(), params.shard,
             params.source_table, params.bound, params.truncate_floor);
@@ -234,7 +240,7 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
             co_await commitlog::read_log_file(
                     state, seg.path, params.filename_prefix,
                     [&](commitlog::buffer_and_replay_position buf_rp) {
-                        return consume_entry(params, seg, consume, stats, mappings, entry_fmt, std::move(buf_rp));
+                        return consume_entry(params, seg, consume, stats, mappings, highest_read, entry_fmt, std::move(buf_rp));
                     },
                     0, params.extensions);
         } catch (...) {
@@ -245,6 +251,26 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
         }
         ++stats.segments_read;
         co_await coroutine::maybe_yield();
+    }
+
+    // Fragments still held are split writes a read ended inside: nothing of them reached the consumer, and the caller
+    // reports them rather than failing (P22). Two shapes are left out, because the source cannot have acknowledged
+    // them. A write whose head was never read starts before the first segment of the list, and the list's bound is the
+    // source's min_position, so the backup holds that write already. A write that any later entry follows was rolled
+    // back: an oversized write takes every request-controller permit, so its fragments are contiguous and exclusive in
+    // the stream, and it is acknowledged only once all of them are written.
+    for (const auto& p : state.pending()) {
+        if (!p.head_present || highest_read > p.position) {
+            continue;
+        }
+        if (stats.incomplete_split_writes == 0 || p.position < stats.earliest_incomplete_split_write) {
+            stats.earliest_incomplete_split_write = p.position;
+        }
+        ++stats.incomplete_split_writes;
+    }
+    if (stats.incomplete_split_writes) {
+        rlogger.warn("strict replay of shard {} ended inside {} split write(s), earliest at {}: none of them was applied", params.shard,
+                stats.incomplete_split_writes, stats.earliest_incomplete_split_write);
     }
 
     co_return stats;
