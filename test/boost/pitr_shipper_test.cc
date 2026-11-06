@@ -24,6 +24,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -202,6 +203,14 @@ pitr_shipper::node_count_function fake_node_count() {
         }
         return node_count_result();
     };
+}
+
+// A full, valid PITR configuration plus one option of its own, which is how the
+// cases that turn the commitlog itself off are built.
+std::vector<option> full_config_with(option extra) {
+    auto options = full_config();
+    options.push_back(std::move(extra));
+    return options;
 }
 
 // Hand-driven tests use the longest interval the options allow, so that the
@@ -1531,13 +1540,14 @@ struct ship_probe {
                         [](db::segment_id_type id) {
                             return sstables::object_name("pitr-bucket", seastar::format("chains/segments/CommitLog-4-{}.log", id));
                         },
-                .release_segment =
-                        [this](db::segment_id_type id) {
-                            if (on_release) {
-                                on_release(id);
-                            }
-                            released.push_back(id);
-                        },
+        };
+    }
+    db::pitr::release_hook release_hook() {
+        return [this](db::segment_id_type id) {
+            if (on_release) {
+                on_release(id);
+            }
+            released.push_back(id);
         };
     }
     const std::string& object_of(db::segment_id_type id) const {
@@ -1571,6 +1581,7 @@ void with_shipping(ship_probe& probe, Func&& f) {
             BOOST_ERROR(seastar::format("stopping the shipper failed: {}", std::current_exception()));
         }
     });
+    shipper.set_release_hook(probe.release_hook());
     shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
     f(shipper);
 }
@@ -1719,6 +1730,7 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_during_an_upload_aborts_it_and_keeps
     pitr_shipper shipper(*cfg);
     shipper.start().get();
     shipper.note_cluster_size(1);
+    shipper.set_release_hook(probe.release_hook());
     shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
 
     constexpr size_t used = 4096;
@@ -1755,6 +1767,7 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_with_many_uploads_keeps_every_hold) 
     pitr_shipper shipper(*cfg);
     shipper.start().get();
     shipper.note_cluster_size(1);
+    shipper.set_release_hook(probe.release_hook());
     shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
 
     constexpr size_t used = 4096;
@@ -2105,7 +2118,7 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_repeated_close_with_no_used_bytes_does_not_
     });
 }
 
-SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_without_a_store_client_ships_nothing) {
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_without_a_release_hook_does_nothing) {
     ship_probe probe;
     tmpdir dir;
     probe.dir = dir.path().string();
@@ -2117,12 +2130,206 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_without_a_store_client_ships_nothing)
         shipper.stop().get();
     });
 
-    // start_shipping() was never called: the hold and this notification are
-    // configured together, so there is nothing to release either.
+    // Neither the hook nor the client is installed, which is a node that takes
+    // no hold at all: there is nothing to release and nothing to ship.
     probe.paths[18] = make_segment_file(probe.dir, 18, 4096);
     shipper.segment_closed(18, 4096, false);
     shipper.segment_closed(18, 0, false);
 
     BOOST_REQUIRE(probe.released.empty());
     BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+}
+
+// A shipper with the release hook installed and no store client, which is what
+// the wiring leaves behind from startup until start_shipping() runs. Issue #8:
+// the commitlog's hold is fixed when it is built, so these closes carry a hold
+// that only this shipper can drop.
+template <typename Func>
+void with_a_shipper_not_shipping_yet(ship_probe& probe, Func&& f) {
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    auto stop = seastar::defer([&shipper]() noexcept {
+        try {
+            shipper.stop().get();
+        } catch (...) {
+            BOOST_ERROR(seastar::format("stopping the shipper failed: {}", std::current_exception()));
+        }
+    });
+    shipper.set_release_hook(probe.release_hook());
+    f(shipper);
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_while_waiting_for_the_cluster_size_releases_the_hold) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::waiting_for_cluster_size);
+        shipper.segment_closed(7, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{7});
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_while_shipping_is_refused_releases_the_hold) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.note_cluster_size(2);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_multi_node);
+        shipper.segment_closed(8, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{8});
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_a_break_before_shipping_releases_the_hold) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.note_cluster_size(1);
+        break_shipping_with_a_second_node(shipper);
+        shipper.segment_closed(9, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{9});
+    });
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_close_before_shipping_releases_nothing) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        // A failed close is the commitlog's to drop, and it has (D26): the
+        // shipper has no hold left to release.
+        shipper.segment_closed(10, 4096, true);
+        BOOST_REQUIRE(probe.released.empty());
+    });
+}
+
+// A rollback reports a segment that was already reported as closed, and the
+// one before shipping started has been released already. Each close releases,
+// because commitlog::release_segment() of an id that is not held is a no-op
+// and the shipper cannot tell the two apart.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_repeated_close_before_shipping_releases_again) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.segment_closed(11, 4096, false);
+        shipper.segment_closed(11, 4096, false);
+        BOOST_REQUIRE((probe.released == std::vector<db::segment_id_type>{11, 11}));
+    });
+}
+
+// Once shipping starts, a close is shipped rather than released at once, which
+// is piece 1's behaviour: installing the hook earlier does not change it.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_once_shipping_started_is_still_uploaded_first) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[12] = make_segment_file(probe.dir, 12, used);
+        probe.store.hold_put.emplace();
+        shipper.segment_closed(12, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 1;
+        });
+        BOOST_REQUIRE(probe.released.empty());
+
+        probe.store.hold_put->set_value();
+        probe.store.hold_put.reset();
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{12});
+    });
+}
+
+// The slot the commitlog's close notification goes through.
+
+namespace {
+
+// What the slot did: the ids it released directly, and the closes it forwarded.
+struct slot_probe {
+    std::vector<db::segment_id_type> released;
+    std::vector<std::tuple<db::segment_id_type, uint64_t, bool>> forwarded;
+
+    db::pitr::segment_closed_slot make_slot() {
+        return db::pitr::segment_closed_slot([this](db::segment_id_type id) {
+            released.push_back(id);
+        });
+    }
+    segment_closed_slot::handler handler() {
+        return [this](db::segment_id_type id, uint64_t used_size, bool failed) {
+            forwarded.emplace_back(id, used_size, failed);
+        };
+    }
+};
+
+} // namespace
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_empty_slot_releases_the_hold_directly) {
+    slot_probe probe;
+    auto slot = probe.make_slot();
+    BOOST_REQUIRE(!slot.filled());
+    slot.segment_closed(3, 4096, false);
+    BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{3});
+    BOOST_REQUIRE(probe.forwarded.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_close_with_an_empty_slot_releases_nothing) {
+    slot_probe probe;
+    auto slot = probe.make_slot();
+    slot.segment_closed(4, 4096, true);
+    BOOST_REQUIRE(probe.released.empty());
+}
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_filled_slot_forwards_the_close_and_releases_nothing) {
+    slot_probe probe;
+    auto slot = probe.make_slot();
+    slot.fill(probe.handler());
+    BOOST_REQUIRE(slot.filled());
+    slot.segment_closed(5, 8192, false);
+    BOOST_REQUIRE(probe.released.empty());
+    BOOST_REQUIRE_EQUAL(probe.forwarded.size(), 1u);
+    BOOST_REQUIRE(probe.forwarded[0] == std::make_tuple(db::segment_id_type(5), uint64_t(8192), false));
+}
+
+// A rollback has to reach the consumer: it is what aborts the upload of a
+// segment whose file the rollback may have erased.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_filled_slot_forwards_a_failed_close) {
+    slot_probe probe;
+    auto slot = probe.make_slot();
+    slot.fill(probe.handler());
+    slot.segment_closed(6, 4096, true);
+    BOOST_REQUIRE(probe.released.empty());
+    BOOST_REQUIRE_EQUAL(probe.forwarded.size(), 1u);
+    BOOST_REQUIRE(probe.forwarded[0] == std::make_tuple(db::segment_id_type(6), uint64_t(4096), true));
+}
+
+// Cleared before the consumer stops, which is where a close reported during
+// the shutdown lands.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_cleared_slot_falls_back_to_the_direct_release) {
+    slot_probe probe;
+    auto slot = probe.make_slot();
+    slot.fill(probe.handler());
+    slot.clear();
+    BOOST_REQUIRE(!slot.filled());
+    slot.segment_closed(7, 4096, false);
+    BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{7});
+    BOOST_REQUIRE(probe.forwarded.empty());
+}
+
+// Whether the commitlog holds its segments at all. It is decided once, when the
+// commitlog is built, so anything but a usable store with a commitlog to ship
+// from must leave the commitlog as it was.
+SEASTAR_THREAD_TEST_CASE(test_pitr_segments_are_held_only_for_a_usable_store_and_commitlog) {
+    struct test_case {
+        const char* what;
+        std::vector<option> options;
+        bool expected;
+    };
+    const std::vector<test_case> cases = {
+            {"no PITR options at all", {}, false},
+            {"only the endpoint", {{"pitr_endpoint", "http://localhost:9000"}}, false},
+            {"a seal interval out of range", full_config(option{"pitr_seal_interval_in_seconds", "0"}), false},
+            {"a valid store", full_config(), true},
+            {"a valid store with the commitlog off", full_config_with(option{"enable_commitlog", "false"}), false},
+            {"a valid store with an in-memory data store", full_config_with(option{"enable_in_memory_data_store", "true"}), false},
+    };
+    for (const auto& c : cases) {
+        auto cfg = make_config(c.options);
+        BOOST_REQUIRE_MESSAGE(db::pitr::should_hold_segments(*cfg) == c.expected, c.what);
+    }
 }

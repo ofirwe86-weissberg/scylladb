@@ -2413,6 +2413,34 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 pitr_shipper.stop().get();
             });
             pitr_shipper.invoke_on_all(&db::pitr::pitr_shipper::start).get();
+            // Declared after stop_pitr_shipper, so it runs before it, and
+            // before the fill below, so a fill that throws part way through
+            // cannot leave a shard pointing at a shipper that is gone.
+            auto clear_pitr_segment_closed = defer_verbose_shutdown("point-in-time recovery close handler", [&db] {
+                db.invoke_on_all([](replica::database& db) {
+                      if (auto* slot = db.pitr_segment_closed_slot()) {
+                          slot->clear();
+                      }
+                  }).get();
+            });
+            // From here on the shipper takes the closes, and releases a hold at
+            // once until start_shipping() runs: see pitr_shipper.hh.
+            pitr_shipper
+                    .invoke_on_all([&db](db::pitr::pitr_shipper& shipper) {
+                        auto* slot = db.local().pitr_segment_closed_slot();
+                        if (!slot) {
+                            // This node holds nothing, so nothing is reported.
+                            return;
+                        }
+                        auto* log = db.local().commitlog();
+                        shipper.set_release_hook([log](db::segment_id_type id) {
+                            log->release_segment(id);
+                        });
+                        slot->fill([&shipper](db::segment_id_type id, uint64_t used_size, bool failed) {
+                            shipper.segment_closed(id, used_size, failed);
+                        });
+                    })
+                    .get();
 
             checkpoint(stop_signal, "starting column family API");
             api::set_server_column_family(ctx, db).get();

@@ -638,6 +638,7 @@ scylla_tests = set([
     'test/boost/pitr_replay_reader_test',
     'test/boost/pitr_segment_upload_test',
     'test/boost/pitr_shipper_test',
+    'test/boost/pitr_shipper_wiring_test',
     'test/boost/pitr_t_filter_test',
     'test/boost/pitr_t_parser_test',
     'test/boost/pretty_printers_test',
