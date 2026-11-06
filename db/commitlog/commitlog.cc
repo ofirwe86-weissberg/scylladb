@@ -3642,6 +3642,30 @@ db::commitlog::replay_state::replay_state()
 db::commitlog::replay_state::~replay_state()
 {}
 
+bool db::commitlog::replay_state::has_pending_fragments() const {
+    return std::ranges::any_of(_impl->fragment_states, [](const auto& e) {
+        return !e.second.empty();
+    });
+}
+
+db::commitlog::replay_state::pending_fragments db::commitlog::replay_state::pending() const {
+    pending_fragments p;
+    for (const auto& [shard, by_id] : _impl->fragment_states) {
+        for (const auto& [id, fragments] : by_id) {
+            if (fragments.empty()) {
+                continue;
+            }
+            // Sorted by offset, so the front one is the lowest part of the write that was read.
+            const auto& rp = fragments.front().rpbuf.position;
+            if (p.writes == 0 || rp < p.earliest) {
+                p.earliest = rp;
+            }
+            ++p.writes;
+        }
+    }
+    return p;
+}
+
 future<>
 db::commitlog::read_log_file(sstring filename, sstring pfx, commit_load_reader_func next, position_type off, const db::extensions* exts) {
     co_await read_log_file(replay_state{}, std::move(filename), std::move(pfx), std::move(next), off, exts);

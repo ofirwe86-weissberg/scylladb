@@ -247,6 +247,17 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
         co_await coroutine::maybe_yield();
     }
 
+    // Fragments still held are split writes the list ended inside. Nothing of them reached the consumer, and the caller
+    // reports them rather than failing (P22): a healthy chain can leave one, and which of them the source acknowledged
+    // cannot be told apart here.
+    const auto pending = state.pending();
+    stats.incomplete_split_writes = pending.writes;
+    stats.earliest_incomplete_split_write = pending.earliest;
+    if (pending.writes) {
+        rlogger.warn("strict replay of shard {} ended inside {} split write(s), earliest at {}: none of them was applied", params.shard, pending.writes,
+                pending.earliest);
+    }
+
     co_return stats;
 }
 

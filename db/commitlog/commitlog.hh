@@ -514,8 +514,25 @@ public:
 
     class replay_state {
     public:
+        // The split writes this state still holds fragments of: the reads done with it ended inside them, so they were
+        // never handed to the consumer. A healthy log can leave them too, for instance a write rolled back after it was
+        // allocated, or one whose tail is in a segment the read did not cover, and nothing here tells those apart from
+        // a write the source acknowledged.
+        struct pending_fragments {
+            uint64_t writes = 0;
+            // The position of the lowest fragment of the earliest such write; the default position when there are none.
+            // An incomplete write cannot be decoded, so its own mutation timestamp is not available here.
+            replay_position earliest;
+        };
+
         replay_state();
         ~replay_state();
+
+        bool has_pending_fragments() const;
+        // Walks the state: one step per pending write, and no preemption point. See db/pitr/replay_reader.hh on how big
+        // that can get.
+        pending_fragments pending() const;
+
     private:
         friend class commitlog;
         class impl;

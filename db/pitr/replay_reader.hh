@@ -85,6 +85,16 @@ struct replay_reader_stats {
     uint64_t dropped_at_or_below_truncate_floor = 0;
     uint64_t dropped_other_table = 0;
     uint64_t raft_batches_skipped = 0;
+    // Split writes the list ended inside: their fragments never completed, so nothing of them reached the consumer and
+    // nothing of them is applied. Not a failure, by decision P22: the caller reports them as not verified, with the
+    // position below as the place to pick an earlier T from. They are counted whether or not the source ever
+    // acknowledged the write, because nothing in the reassembly state tells a rolled-back or out-of-list write apart
+    // from one the source acknowledged, so the count is an upper bound.
+    uint64_t incomplete_split_writes = 0;
+    // The position of the earliest incomplete split write, or the default position when there are none. A position, not
+    // a timestamp: an incomplete write cannot be decoded, so its write timestamp is not readable, and the caller turns
+    // the position's segment into a time through the ledger.
+    db::replay_position earliest_incomplete_split_write;
 
     bool operator==(const replay_reader_stats&) const = default;
 };
@@ -104,7 +114,8 @@ struct replay_reader_stats {
 // Not guaranteed, and known open (#17): a zeroed sector in the middle of a segment of the recorded size with an intact header is not
 // detected, and the call still succeeds. read_log_file skips the sector checksum for an all-zero sector, so such a sector can end the
 // segment early, leave a hole with the entries after it still delivered, or hand the consumer a wrong mutation assembled across the
-// hole. A split write whose fragments never complete raises nothing here either. A disk error during the read can also isolate the node
+// hole. A split write whose fragments never complete is counted, not refused, and the count cannot say which of them the source
+// acknowledged (see incomplete_split_writes). A disk error during the read can also isolate the node
 // rather than only fail the call, because read_log_file reads through the commitlog's own error handler: no production caller may use
 // this until the commitlog read path takes an error handler of its own.
 //
@@ -112,7 +123,8 @@ struct replay_reader_stats {
 // when its last fragment is read, at the position of its first, so it can arrive after a position above it.
 //
 // Yields between segments and entries. Decoding one entry does not, and is not bounded here: a write can be as large as the commitlog
-// allows.
+// allows. Counting the incomplete split writes at the end does not yield either: it is one step per write still pending, and every
+// pending write holds its fragments in memory, so the shard's own memory bounds the count.
 future<replay_reader_stats> replay_shard_segments(const shard_replay_params& params, replay_consumer consume);
 
 } // namespace db::pitr

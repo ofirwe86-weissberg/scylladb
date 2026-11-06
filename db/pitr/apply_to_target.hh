@@ -26,8 +26,10 @@ class database;
 namespace db::pitr {
 
 // The target cannot hold what the source wrote, so applying the entry would lose it. The converting applier skips such a
-// cell in silence (mutation/converting_mutation_partition_applier.cc:38), and a target built from the backup's schema has
-// every column of every version replayed into it, so this is an operator error, not data to count and carry on from.
+// cell in silence (mutation/converting_mutation_partition_applier.cc:38), so the check runs before it. It asks only
+// whether the target has a live column of that name with a compatible type, and reads no dropped-column record of the
+// target: a cell of a column the source dropped before the backup and never re-added is refused too, although the source
+// itself would hide it (#18).
 class target_schema_mismatch : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
@@ -71,8 +73,10 @@ public:
 // tablet migration can produce, is converted and applied on each of them and counted once; vnodes with RF=1, which is
 // all this restore allows, never give more than one owner, so no test here covers that.
 //
-// Refuses, rather than applying part of an entry: a key invalid for the target's schema, and a cell at or below T whose
-// column the target lacks or holds with an incompatible type. Above T such a cell is counted as dropped after T and
+// Refuses one entry whole, rather than applying part of it, but the replay as a whole is not atomic: everything applied
+// before a refusal stays in the target, and a refusal can come at any entry, so the caller must have the target durably
+// marked incomplete before the first apply (#19). What is refused: a key invalid for the target's schema, and a cell at
+// or below T whose column the target lacks or holds with an incompatible type. Above T such a cell is counted as dropped after T and
 // skipped, since the filter would drop it anyway and a column added after T is expected to be missing from the target
 // (REF-9). A column the target dropped and re-added is not refused: the converting applier hides cells at or below its
 // dropped_at, which is what the source does too, so the answer at T is right. The target must therefore carry the
