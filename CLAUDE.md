@@ -101,7 +101,7 @@ These apply to all implementation and review on this project.
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
 - Don't commit while a test fails, and ask the human if any test fails, even one that looks unrelated. Each commit holds a step's test and code together, so it compiles and passes.
 - New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and, at the full level, 100 of 100 after review passes, before merge (see "Team level per task").
-- While developing, build the task's own small test binary and run only relevant cases. Build composite binaries like `combined_tests` once per task, at the end.
+- While developing, build the task's own small test binary and run only relevant cases. Build composite binaries like `combined_tests` once per task, at the end, at the full level; light tasks get them in the post-merge cycle.
 - Show that a test can fail: break the code on purpose, or record its failure before the fix. A test that has never failed proves nothing.
 - QA's tests are checked before and after: each is run without the change and must fail, then with the change and must pass, and both results go in the PR. Failing only because an endpoint doesn't exist isn't enough: the test must also catch wrong behaviour.
 
@@ -195,10 +195,14 @@ When in doubt, use full.
 |---|---|---|
 | Requirements | `product-manager` first, for feature work and product decisions | `product-manager` only if user-visible text changes |
 | Test plan | `tester` plan before code, for feature work | Tests written with the code |
-| Review | `implementer` → `architect-check` if structural → `reviewer-qa` → PR → `pr-reviewer` | `implementer` → `reviewer-qa` → PR; the team lead checks the description's claims instead of `pr-reviewer` |
+| Models | Opus for development and QA | Opus for development. Sonnet only for QA tests implemented from a detailed plan, reviewed by Opus |
+| Developer's tests before merge | The task's tests 5 of 5, composite binaries, then 100 of 100 | The task's own test binary and relevant cases, 5 of 5, plus one deliberate-break run; both outputs pasted into the PR |
+| Review | `implementer` → `architect-check` if structural → `reviewer-qa` (builds and runs tests, rounds as needed) → PR → `pr-reviewer` | `implementer` → `reviewer-qa` (reads the diff and the pasted test output, never builds; one round, nits go to a follow-up issue) → PR; the team lead checks the description's claims instead of `pr-reviewer` |
 | PR size | 100-300 product lines, ceiling 500 | Up to ~400 product lines, ceiling 500 |
 | Sequencing | Each PR reviewed before the next starts | May overlap; stacked, merged in batches |
-| Test repeats | 5 of 5 while developing, 100 of 100 before merge | 5 of 5 |
+| Full testing cycle | Before merge | After merge, once on the whole merged set (below) |
+
+**Post-merge cycle for light tasks.** The human merges PRs in sets of 4-5, one after the other. After the set, the team lead runs the full cycle once on the integration branch, in one dedicated built worktree so it never adds a third heavy build: composite binaries such as `combined_tests`, the cluster tests for the feature, 100 of 100 on the set's new tests, and sanitize mode when the CPU is free. If it passes, the whole set is verified. If anything fails, bisect by commit within the set, tell the human which task caused it, and let the human choose between reverting it and fixing forward. A fix-forward issue is `team:full`, since that code has proven risky. Each commit is still built and passes its own tests before merge, so the history stays bisectable.
 
 Flow at the full level: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
 - **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
