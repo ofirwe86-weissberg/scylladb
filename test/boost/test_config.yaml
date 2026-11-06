@@ -49,6 +49,9 @@ custom_args:
         - '-c1 -m2G'
     bloom_filter_test:
         - '-c1'
+    # One shard, so that every write lands in the table the test captures from.
+    pitr_bound_capture_test:
+        - '-c1 -m2G'
     s3_test:
         - '-c2 -m2G --logger-log-level s3=trace --logger-log-level http=trace --logger-log-level default_http_retry_strategy=trace'
     gcp_object_storage_test:

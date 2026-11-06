@@ -632,6 +632,7 @@ scylla_tests = set([
     'test/boost/object_storage_upload_test',
     'test/boost/observable_test',
     'test/boost/partitioner_test',
+    'test/boost/pitr_bound_capture_test',
     'test/boost/pitr_ledger_entry_test',
     'test/boost/pitr_ledger_writer_test',
     'test/boost/pitr_segment_upload_test',

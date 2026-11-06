@@ -4433,11 +4433,15 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         tlogger.debug("Taking snapshot of {}.{}: name={}", s->ks_name(), s->cf_name(), name);
 
         std::vector<snapshot_sstable_set> sstable_sets(this_smp_shard_count());
+        // Per-shard commitlog bound, each taken together with that shard's sstable
+        // list. Point-in-time recovery records these with the snapshot (#12).
+        std::vector<db::replay_position> commitlog_bounds(this_smp_shard_count());
 
         co_await writer->init();
         co_await smp::invoke_on_all([&] -> future<> {
             auto& t = *table_shards;
-            auto [tables, permit] = co_await t.snapshot_sstables();
+            auto [tables, bound, permit] = co_await t.snapshot_sstables();
+            commitlog_bounds[this_shard_id()] = bound;
             auto sstables_metadata = co_await t.get_sstables_manager().take_snapshot(std::move(tables), name);
             sstable_sets[this_shard_id()] = make_foreign(std::make_unique<utils::chunked_vector<sstables::sstable_snapshot_metadata>>(std::move(sstables_metadata)));
         });
@@ -4445,6 +4449,7 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
 
         std::exception_ptr ex;
 
+        tlogger.debug("snapshot {}: commitlog bounds [{}]", name, fmt::join(commitlog_bounds, ", "));
         tlogger.debug("snapshot {}: writing schema.cql", name);
         // With internals, so that schema.cql records the table's dropped columns: without them, an
         // sstable that still holds a dropped column's data is unreadable once restored.
@@ -4526,10 +4531,18 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
     });
 }
 
-future<std::pair<std::vector<sstables::shared_sstable>, table::sstable_list_permit>> table::snapshot_sstables() {
+future<table::snapshot_sstable_list> table::snapshot_sstables() {
     auto permit = co_await get_sstable_list_permit();
+    // What makes the two reads one observation is the sstable-list permit: flush and
+    // compaction take it too, so no sstable can join the list while it is held. Not
+    // yielding between the reads is what keeps the permit held across both. A flush
+    // completing in between would add an sstable this list misses and let the
+    // commitlog release that sstable's segments, lifting the bound above writes the
+    // snapshot does not hold. Read the member, not commitlog(), which refuses a
+    // readonly table. #12
+    auto bound = _commitlog ? _commitlog->min_position() : db::replay_position();
     auto tables = *_sstables->all() | std::ranges::to<std::vector<sstables::shared_sstable>>();
-    co_return std::make_pair(std::move(tables), std::move(permit));
+    co_return snapshot_sstable_list{std::move(tables), bound, std::move(permit)};
 }
 
 future<bool> table::snapshot_exists(sstring tag) {
