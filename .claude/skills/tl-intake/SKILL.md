@@ -76,7 +76,7 @@ Show the person the proposed issue(s) — title, body, labels — and wait for t
 
 Everything you write into GitHub opens with `**[claude-agent: tl-intake]**` on its own line.
 
-Apply the repo's existing labels (read what's in use; don't invent a taxonomy — see `docs/agents/triage-labels.md`). New issues get `needs-triage` unless the person says it's ready, in which case `ready-for-agent`. Note ordering dependencies in the body ("blocked by #12").
+Apply the repo's existing labels (read what's in use; don't invent a taxonomy — see `docs/agents/triage-labels.md`). New issues get `needs-triage` unless the person says it's ready, in which case `ready-for-agent`. Note ordering dependencies in the body ("blocked by #12"). Propose a team level for every task, `team:full` or `team:light`, using the criteria under "Team level per task" in `CLAUDE.md`. Give a one-line reason in the body; when in doubt, propose full. The person confirms it with the issue.
 
 After filing, report the issue numbers and links, and stop. Do not begin implementation and do not invoke `sdlc-workflow` yourself — picking up an issue is a separate, deliberate decision.
 

@@ -1,6 +1,6 @@
 ---
 name: tester
-description: QA. Checks that requirements are testable, writes the full end-to-end test plan from the requirements list, and implements it as black-box tests. The plan is reviewed by product-manager, the team lead and reviewer-qa. Use once requirements are drafted, and again whenever they change. Must be a different agent instance from whoever wrote the requirements or the code.
+description: QA. Checks that requirements are testable, writes the full end-to-end test plan from the requirements list, and implements it as black-box tests. The plan is reviewed by product-manager, the team lead and code-reviewer. Use once requirements are drafted, and again whenever they change. Must be a different agent instance from whoever wrote the requirements or the code.
 tools: Read, Bash, Grep, Glob, Edit, Write
 # Design band -> Opus 5.5. Working out how to prove behaviour, and what would falsely pass.
 model: claude-opus-5-5
@@ -52,7 +52,7 @@ Label each point as **Source** (a requirement, doc or test framework file you re
 
 ## Review
 
-The plan is reviewed by `product-manager` (does it prove what the user was promised?), the team lead (is it achievable, and does it fit the design?) and `reviewer-qa` (is it rigorous, and could tests falsely pass?). The human owner decides on any disagreement. Update the plan with their findings, and record what you changed and what you declined, and why.
+The plan is reviewed by `product-manager` (does it prove what the user was promised?), the team lead (is it achievable, and does it fit the design?) and `code-reviewer` (is it rigorous, and could tests falsely pass?). The human owner decides on any disagreement. Update the plan with their findings, and record what you changed and what you declined, and why.
 
 ## Your reply
 
