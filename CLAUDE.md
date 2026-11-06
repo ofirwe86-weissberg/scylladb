@@ -169,7 +169,7 @@ These apply to all implementation and review on this project.
 
 ## SDLC workflow
 
-Subagents in `.claude/agents/` (`product-manager`, `tester`, `implementer`, `architect-check`, `reviewer-qa`, `pr-reviewer`) take work from request to reviewed PR, orchestrated by `/tl-intake` (request → issue) and `/sdlc-workflow` (issue → PR). The session acts as team lead. Roles, models, the feature-work order and PR rules at the full level: `docs/agents/sdlc-workflow.md`.
+Subagents in `.claude/agents/` (`product-manager`, `tester`, `implementer`, `architect-check`, `code-reviewer`, `pr-reviewer`) take work from request to reviewed PR, orchestrated by `/tl-intake` (request → issue) and `/sdlc-workflow` (issue → PR). The session acts as team lead. Roles, models, the feature-work order and PR rules at the full level: `docs/agents/sdlc-workflow.md`.
 
 ### Team level per task
 
@@ -178,17 +178,17 @@ Every task issue carries one level label, `team:full` or `team:light`. `tl-intak
 **`team:full`** applies if any of these is true:
 - the change is structural (see "Architecture constraints"): a format, RPC, public API or config change, a feature flag, threading or sharding, or a dependency;
 - it changes concurrency, lifetimes, shutdown or drain, cross-shard work, or code whose worst-case input could stall;
-- a bug in it could give silently wrong data, for example restore correctness, tombstones, the replay bound or the chain checks;
+- a bug in it could give silently wrong data, for example restore correctness, tombstones, the replay bound, the chain checks, or a refusal whose absence lets a restore go ahead;
 - it touches an "Out of scope for agents" area that the ticket explicitly scopes;
 - it is new user-visible behaviour that needs requirements, or its design isn't settled;
 - it is expected to exceed ~300 product lines.
 
-**`team:light`** is everything else: a confined change to a settled design, such as a refusal check, a parser, wiring of a reviewed design, tests, docs or tooling.
+**`team:light`** is everything else: a confined change to a settled design, such as a parser, wiring of a reviewed design, tests, docs or tooling.
 
 When in doubt, use full.
 
-**The label is where a task starts, not a fixed decision.** The team lead checks the level again at every step: after the implementer's diff, after `architect-check`, and after each `reviewer-qa` round. Each sub-task or piece has its own level, so one risky piece of a light issue goes full without moving the rest.
-- **Raising** is done at once by anyone who sees the risk (the team lead, `implementer`, `reviewer-qa`, `architect-check`): a lifetime or concurrency question, a possible stall, a silent-wrong-data path, a structural change, or an overrun of the time box. The remaining steps switch to the full column straight away. The team lead updates the label and adds a signed issue comment saying what triggered it.
+**The label is where a task starts, not a fixed decision.** The team lead checks the level again at every step: after the implementer's diff, after `architect-check`, and after each `code-reviewer` round. Each sub-task or piece has its own level, so one risky piece of a light issue goes full without moving the rest.
+- **Raising** is done at once by anyone who sees the risk (the team lead, `implementer`, `code-reviewer`, `pr-reviewer`, `architect-check`): a lifetime or concurrency question, a possible stall, a silent-wrong-data path, a structural change, or an overrun of the time box. The remaining steps switch to the full column straight away. The team lead updates the label and adds a signed issue comment saying what triggered it.
 - **Lowering**, mid-task or not, needs the human's OK.
 
 | | `team:full` | `team:light` |
@@ -196,17 +196,20 @@ When in doubt, use full.
 | Requirements | `product-manager` first, for feature work and product decisions | `product-manager` only if user-visible text changes |
 | Test plan | `tester` plan before code, for feature work | Tests written with the code |
 | Models | Opus for development and QA | Opus for development. Sonnet only for QA tests implemented from a detailed plan, reviewed by Opus |
-| Developer's tests before merge | The task's tests 5 of 5, composite binaries, then 100 of 100 | The task's own test binary and relevant cases, 5 of 5, plus one deliberate-break run; both outputs pasted into the PR |
-| Review | `implementer` → `architect-check` if structural → `reviewer-qa` (builds and runs tests, rounds as needed) → PR → `pr-reviewer` | `implementer` → `reviewer-qa` (reads the diff and the pasted test output, never builds; one round, nits go to a follow-up issue) → PR; the team lead checks the description's claims instead of `pr-reviewer` |
+| Developer's tests before merge | The task's tests 5 of 5, composite binaries, then 100 of 100 | The task's own test binary and relevant cases, 5 of 5, plus one deliberate-break run; both outputs in the PR description |
+| Review | `implementer` → `architect-check` if structural → `code-reviewer` (builds and runs tests, rounds as needed) → PR → `pr-reviewer` | `implementer` → PR → `pr-reviewer` only: a cold read of the pushed head, which runs the task's test binary 5 of 5 plus one break of its own on a reused worktree (pasted output isn't trusted: twice it described code that wasn't pushed). A blocking finding gets a re-check of the fix only; nits go to a follow-up issue |
 | PR size | 100-300 product lines, ceiling 500 | Up to ~400 product lines, ceiling 500 |
 | Sequencing | Each PR reviewed before the next starts | May overlap; stacked, merged in batches |
 | Full testing cycle | Before merge | After merge, once on the whole merged set (below) |
 
 **Post-merge cycle for light tasks.** The human merges PRs in sets of 4-5, one after the other. After the set, the team lead runs the full cycle once on the integration branch, in one dedicated built worktree so it never adds a third heavy build: composite binaries such as `combined_tests`, the cluster tests for the feature, 100 of 100 on the set's new tests, and sanitize mode when the CPU is free. If it passes, the whole set is verified. If anything fails, bisect by commit within the set, tell the human which task caused it, and let the human choose between reverting it and fixing forward. A fix-forward issue is `team:full`, since that code has proven risky. Each commit is still built and passes its own tests before merge, so the history stays bisectable.
 
-Flow at the full level: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
+The evidence behind this split, with what each step caught on the PITR work, is in `docs-work/catch-log.md`; its "New catches" table gets a row whenever a review, test run or post-merge cycle finds something.
+
+Flow at the full level: intake → implement → architect-check *if structural* → code-reviewer → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
 - **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
 - **One commit and one PR per task,** on its own branch, with the PR title starting with the task ID. Dependent PRs stack on the previous task's branch.
+- **Review fixes go on the same branch,** as new commits pushed to the open PR (a normal push, not a force push), and the human squashes on merge. Don't open a replacement `-vN` PR for a review round: on PITR that cost 9 replacement PRs, each with its own description, re-review and retargeting.
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
 - **No piece runs longer than foreseen.** Each piece gets a stated time; at the limit it stops and reports: ship what passes, split the rest, and tell the human.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.

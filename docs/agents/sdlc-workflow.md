@@ -7,19 +7,19 @@ A team of subagents in `.claude/agents/` takes work from request to reviewed PR.
 | Piece | Model | Role |
 |---|---|---|
 | `product-manager` (agent) | Opus 5.5 | Peer of the team lead, not a report. Owns the requirements (the what; the dev team owns the how). Works from documents, not code, and raises issues in the product issue register. |
-| `tester` (agent) | Opus 5.5 | QA. Checks requirements are testable, writes the full end-to-end test plan from them, and implements it as black-box tests. Plan reviewed by `product-manager`, the team lead and `reviewer-qa`. |
+| `tester` (agent) | Opus 5.5 | QA. Checks requirements are testable, writes the full end-to-end test plan from them, and implements it as black-box tests. Plan reviewed by `product-manager`, the team lead and `code-reviewer`. |
 | `tl-intake` (skill) | session model | Conversation → well-scoped GitHub issues. Stops at the issue. |
 | `sdlc-workflow` (skill) | session model | Issue → PR. Delegates, sequences, decides whether to open the PR. |
 | `implementer` (agent) | Opus 5 | Builds one issue into tested code. Flags structural changes. |
 | `architect-check` (agent) | Opus 5.5 | Runs on structural changes, against "Architecture constraints". Also reviews integration test coverage across units, from documents only. |
-| `reviewer-qa` (agent) | Opus 5.5 | Adversarial review of the diff before a human sees it. Builds and runs tests. |
+| `code-reviewer` (agent) | Opus 5.5 | Adversarial review of the diff before a human sees it. Builds and runs tests. |
 | `pr-reviewer` (agent) | Opus 5.5 | Cold read of the opened PR — diff, commit message, and whether the description's claims are true. Posts a GitHub review. Always a different instance from the two above. |
 
-Flow: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. **Nothing is merged automatically**; the PR still gets human review.
+Flow: intake → implement → architect-check *if structural* → code-reviewer → PR → pr-reviewer. **Nothing is merged automatically**; the PR still gets human review.
 
 The session acts as team lead. For feature work, run `product-manager` before requirements go to the tester and before bringing a product decision to the human. It doesn't report to the team lead: it writes its issues to the register directly, the team lead relays every new issue to the human without filtering, and only the human closes one. `product-manager` reviews documents, including the test plan, and doesn't review the implementation.
 
-For feature work, the order is: requirements (`product-manager`), then a full test plan based on them (`tester`, reviewed by `product-manager`, the team lead and `reviewer-qa`), and only then code. The test plan is QA's, and QA implements it as black-box, end-to-end tests against the real system (`tester`, reviewed by `reviewer-qa` and `pr-reviewer` like other code). Unit and integration tests are the developer's work, written with the code, and based on mocking rather than end to end. The design lists the units, their connections, and the integration tests for each. `architect-check` reviews that list from the documents, not the code, to confirm every connection is tested and the design holds together.
+For feature work, the order is: requirements (`product-manager`), then a full test plan based on them (`tester`, reviewed by `product-manager`, the team lead and `code-reviewer`), and only then code. The test plan is QA's, and QA implements it as black-box, end-to-end tests against the real system (`tester`, reviewed by `code-reviewer` and `pr-reviewer` like other code). Unit and integration tests are the developer's work, written with the code, and based on mocking rather than end to end. The design lists the units, their connections, and the integration tests for each. `architect-check` reviews that list from the documents, not the code, to confirm every connection is tested and the design holds together.
 
 - **Models:** development always uses Opus; Sonnet didn't hold up there. QA planning uses Opus. Implementing tests from a detailed plan uses Sonnet at `team:light` and Opus at `team:full`, and reviewers stay on Opus.
 - **Start a fresh agent for each PR,** since long-running agents use far more of the session limit. For risky tasks, each PR is reviewed before the next starts; simple tasks may overlap. Change headers once and early, to limit rebuilds. The task's detail is in its issue. A fresh agent can reuse a built worktree.

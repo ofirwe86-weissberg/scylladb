@@ -1,6 +1,6 @@
 ---
 name: sdlc-workflow
-description: Use this skill whenever you are asked to take a GitHub issue (or an in-chat feature request that should become one) through to an implemented, reviewed pull request using the implementer, reviewer-qa, architect-check and pr-reviewer subagents. Triggers include being @mentioned on a GitHub issue/PR, being assigned an issue, or a person asking to "build", "implement", "fix" or "pick up" a ticket. Do not use this for quick one-off edits with no issue behind them, or for pure Q&A about the codebase.
+description: Use this skill whenever you are asked to take a GitHub issue (or an in-chat feature request that should become one) through to an implemented, reviewed pull request using the implementer, code-reviewer, architect-check and pr-reviewer subagents. Triggers include being @mentioned on a GitHub issue/PR, being assigned an issue, or a person asking to "build", "implement", "fix" or "pick up" a ticket. Do not use this for quick one-off edits with no issue behind them, or for pure Q&A about the codebase.
 ---
 
 # SDLC workflow
@@ -9,7 +9,7 @@ This skill defines how the subagents in `.claude/agents/` work together on one t
 
 ## Process
 
-1. **Scope the ticket.** Read the GitHub issue (`gh issue view <n> --comments`). If acceptance criteria are missing or contradictory, either ask a clarifying question (if a human is available) or proceed with a best-effort interpretation and state it clearly in the PR description — never invent scope silently. If the issue touches a surface listed under "Out of scope for agents" in `CLAUDE.md`, stop and say so unless the issue explicitly scopes it. Read its level label, `team:full` or `team:light` ("Team level per task" in `CLAUDE.md`). If it has none, ask the human before starting. The label is only the starting level: check it again after the implementer's diff, after `architect-check` and after each `reviewer-qa` round, and per sub-task. If any piece turns out riskier, raise it to full at once: the remaining steps use the full flow, update the label, and post a signed issue comment saying what triggered it. Never lower a level without the human's OK.
+1. **Scope the ticket.** Read the GitHub issue (`gh issue view <n> --comments`). If acceptance criteria are missing or contradictory, either ask a clarifying question (if a human is available) or proceed with a best-effort interpretation and state it clearly in the PR description — never invent scope silently. If the issue touches a surface listed under "Out of scope for agents" in `CLAUDE.md`, stop and say so unless the issue explicitly scopes it. Read its level label, `team:full` or `team:light` ("Team level per task" in `CLAUDE.md`). If it has none, ask the human before starting. The label is only the starting level: check it again after the implementer's diff, after `architect-check` and after each `code-reviewer` round, and per sub-task. If any piece turns out riskier, raise it to full at once: the remaining steps use the full flow, update the label, and post a signed issue comment saying what triggered it. Never lower a level without the human's OK.
 
 2. **Delegate to `implementer`.** Hand it the issue number, its level, and point it at `CLAUDE.md`. At `team:light`, tell it to run only the task's own test binary 5 of 5 and one deliberate-break run, and paste both outputs into the PR description; the full cycle runs after merge. Wait for its summary and pushed branch.
 
@@ -21,16 +21,16 @@ This skill defines how the subagents in `.claude/agents/` work together on one t
 
 3. **Check whether the change is structural**, using the implementer's flag as a starting signal, not the final word — look at the diff yourself. Structural means: new third-party dependency or submodule bump, build-system change, on-disk/wire/protocol/schema format change, public API/ABI or config change, new feature flag / upgrade-path requirement, or a change to the threading/sharding model. If yes, delegate to `architect-check`. If it comes back with a conflict, do not proceed to review — send it back to `implementer` with the conflict and re-run this step after the fix.
 
-4. **Delegate to `reviewer-qa`.** Give it the issue number and the branch/diff — **not** the implementer's summary, so its review stays independent. At `team:full`, it runs from the implementer's worktree (or its own checkout of the branch) so it can build and test. At `team:light`, tell it not to build: it reviews the diff and the test output the implementer pasted (the task's tests 5 of 5 and one deliberate-break run), gives one round, and lists nits for a follow-up issue rather than another round. If it sees concurrency, lifetime, stall or silent-wrong-data risk, it raises the task to full and the full review applies.
-   - **Request changes**: send the concrete blocking items back to `implementer`, get an updated branch, and re-run `reviewer-qa`. Keep iterating while the fixes are mechanical; escalate to a human when the disagreement is about design, or after the third round without convergence.
+4. **Delegate to `code-reviewer`.** Give it the issue number and the branch/diff — **not** the implementer's summary, so its review stays independent. At `team:full`, it runs from the implementer's worktree (or its own checkout of the branch) so it can build and test. **At `team:light`, skip this step** and go to step 5: the one reviewer is `pr-reviewer`, in step 6.
+   - **Request changes**: send the concrete blocking items back to `implementer`, have it push fix commits to the same branch (never a replacement `-vN` branch or PR), and re-run `code-reviewer`. Keep iterating while the fixes are mechanical; escalate to a human when the disagreement is about design, or after the third round without convergence.
    - **Approve** / **Approve with nits**: proceed.
 
-5. **Verify the pushed head, then open the PR.** Before opening, confirm the worktree's `HEAD` equals `origin/<branch>` — resumed agents sometimes leave fixes committed but unpushed, or on a detached HEAD. Never merge. The PR description includes: what the issue asked for, what was built, which build modes/targets and tests were actually run, scope deliberately excluded, the QA verdict and any non-blocking nits, the architect-check result if it ran, and `Fixes #<n>` (or the project's equivalent).
+5. **Verify the pushed head, then open the PR.** Before opening, confirm the worktree's `HEAD` equals `origin/<branch>` — resumed agents sometimes leave fixes committed but unpushed, or on a detached HEAD. Never merge. The PR description includes: what the issue asked for, what was built, which build modes/targets and tests were actually run, scope deliberately excluded, the code-review verdict (at `team:full`) and any non-blocking nits, the architect-check result if it ran, and `Fixes #<n>` (or the project's equivalent).
 
-6. **At `team:light`, skip this step:** check yourself that the PR description's claims are true (tests run, results, what's not done), and say so in a signed PR comment. **At `team:full`, delegate to `pr-reviewer`** — a cold read of the PR now that it is open. It must be a *different agent instance* from the implementer and from the `reviewer-qa` that negotiated fixes, because by then `reviewer-qa` is reviewing a solution it co-authored.
+6. **At `team:light`, `pr-reviewer` is the only reviewer.** Tell it the level, and to run the task's own test binary 5 of 5 on the pushed head plus one break of its own, on a reused worktree, rather than trust the pasted output, and to skip composite binaries (they run in the post-merge cycle). Nits go to a follow-up issue. If it sees concurrency, lifetime, stall or silent-wrong-data risk, it raises the task to full, and `code-reviewer` then reviews with the full flow. **At `team:full`, delegate to `pr-reviewer`** — a cold read of the PR now that it is open. It must be a *different agent instance* from the implementer and from the `code-reviewer` that negotiated fixes, because by then `code-reviewer` is reviewing a solution it co-authored.
 
    Give it the PR number and the issue number and nothing else — no summaries, no prior verdicts. One `pr-reviewer` instance per PR. It posts its verdict as a GitHub review.
-   - **Request changes**: send the items back to `implementer`, push the fix, re-run `pr-reviewer`.
+   - **Request changes**: send the items back to `implementer`, have it push fix commits to the same branch, and re-run `pr-reviewer`. At `team:light`, it re-checks only the fix.
    - **Approve** / **Approve with nits**: the PR is ready for its human reviewer. Say so, with the review URL.
 
    If it finds the PR description overstates what was done, fix the description — that is a real defect.
@@ -44,7 +44,7 @@ Set in each agent's frontmatter as an exact model ID (`claude-opus-5`, `claude-o
 | Band | Model | Agents |
 |---|---|---|
 | **Implementation** | Opus 5 | `implementer` |
-| **Verification** | Opus 5.5 | `reviewer-qa`, `pr-reviewer` |
+| **Verification** | Opus 5.5 | `code-reviewer`, `pr-reviewer` |
 | **Design / architecture** | Opus 5.5 | `architect-check` |
 
 Every band runs on an Opus model: in C/C++ the expensive defects — lifetime bugs, UB, races, compatibility breaks — need cross-file reasoning, both to avoid writing them and to catch them, and a missed one costs far more than the review.
@@ -59,7 +59,7 @@ Everything an agent writes into GitHub — an issue, an issue comment, a PR desc
 **[claude-agent: pr-reviewer]**
 ```
 
-Use the role name: `implementer`, `reviewer-qa`, `architect-check`, `pr-reviewer`, `tl-intake`, or `sdlc-workflow` for what the orchestrating session writes itself (PR descriptions, its own issue comments).
+Use the role name: `implementer`, `code-reviewer`, `architect-check`, `pr-reviewer`, `tl-intake`, or `sdlc-workflow` for what the orchestrating session writes itself (PR descriptions, its own issue comments).
 
 `gh` authenticates as a human account, so without the line every one of these lands under that person's name and avatar, and nobody can later tell whose words were whose — or which agent's verdict a finding came from.
 
