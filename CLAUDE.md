@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 See `docs-work/assignment.md`, and `docs-work/handoff.md` for the current state. `docs-work/` is in the main checkout only, not in worktrees, so use its absolute path there.
 
+- **Scope:** a home assignment meant for 2-3 days, deadline 2026-11-09. Build the minimum that gives a correct restore of one table to time T, or a clear refusal. Everything else becomes a stated limit or future work in the README. The one exception is anything whose absence would give a silently wrong restore: that stays.
+- **Process until 2026-11-09:** the process cuts P1-P4 in `docs-work/implementation-plan.md` ("Estimate and corner cuts") override "SDLC workflow" and `docs/agents/sdlc-workflow.md`. pr-reviewer runs only on the risky PRs, PRs go up to ~400 product lines (ceiling 500), there's one stack merged in batches, and the documents stay frozen unless an issue means silent wrong data.
+- **Test repeats for PITR:** 5 of 5 (`--repeat 5 --max-failures 1`) is the bar. The 100-of-100 runs in "Development rules" and `.github/copilot-instructions.md` are future work for this assignment.
+
 ## Repo
 
 **ofirwe86-weissberg/scylladb** — a fork of ScyllaDB, a Cassandra/DynamoDB-compatible, shared-nothing NoSQL database written in C++ on the Seastar framework. Core values: performance, correctness, readability.
@@ -97,7 +101,7 @@ These apply to all implementation and review on this project.
 **Tests are written with the code, not after it.**
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
 - Don't commit while a test fails, and ask the human if any test fails, even one that looks unrelated. Each commit holds a step's test and code together, so it compiles and passes.
-- New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and 100 of 100 only after review passes, before merge.
+- New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and 100 of 100 only after review passes, before merge (not for PITR until 2026-11-09, see "Current task").
 - While developing, build the task's own small test binary and run only relevant cases. Build composite binaries like `combined_tests` once per task, at the end.
 - Show that a test can fail: break the code on purpose, or record its failure before the fix. A test that has never failed proves nothing.
 - QA's tests are checked before and after: each is run without the change and must fail, then with the change and must pass, and both results go in the PR. Failing only because an endpoint doesn't exist isn't enough: the test must also catch wrong behaviour.
@@ -119,13 +123,18 @@ These apply to all implementation and review on this project.
 - **Coordination**: `service/storage_proxy` (coordinator read/write path), `storage_service` (node lifecycle), topology coordinator. Cluster metadata (schema, topology, auth) is replicated through **Raft group0** (`raft/` library + `service/raft/`); see `docs/dev/raft-in-scylla.md` and `docs/dev/topology-over-raft.md`. `locator/` holds replication strategies and **tablets** (vs. vnodes in `dht/`); `gms/` gossip; `message/` RPC with wire types in `idl/*.idl.hh` compiled by `idl-compiler.py`.
 - **Storage engine**: `replica/` (database, table, memtables, row cache) → `mutation/` → `readers/` → `sstables/` + commitlog (`db/`) + `compaction/`, `repair/`, `streaming/`. Reads are bounded by `reader_concurrency_semaphore`.
 - **Layered features**: `cdc/`, materialized views, `index/`, `vector_search/`, `auth/`, `audit/`, `tracing/`, `tasks/`, `node_ops/`, `lang/` (UDFs), `tools/` (nodetool, `scylla sstable`), `types/`, `utils/`.
+- **PITR** (this fork, `db/pitr/` on `ow/pitr/v1`; design in `docs-work/design-must.md`):
+  - *Ship path:* `pitr_shipper` (config, states, seal timer, upload with retry and release) → `segment_upload` → `ledger_writer` / `ledger_entry` (format frozen; kind 1 entries, kind 2 reserved, kind 3 planned). It hooks into the commitlog's segment hold, close callback and clamp in `db/commitlog/`.
+  - *Backup side:* the replay bound is captured together with the snapshot in `replica/table.cc` `snapshot_sstables()`.
+  - *Restore path:* `t_parser` (T) → `chain_check` (dense chain of ledger entries, or a refusal) → `replay_reader` (strict replay of the shipped segments, counting split writes) → `t_filter` → `apply_to_target`. `refusal` holds the refusal reasons.
+  - Not built yet: shipping wired to a real object-storage client, ledger writes from the shipper, and the `replay_to(T)` REST endpoint.
 - Debugging: `scylla-gdb.py`, `docs/dev/debugging.md`. Other docs: `HACKING.md`, `docs/dev/building.md`, `docs/dev/testing.md`.
 
 ## Architecture constraints
 
 > Decisions already made that a change must not silently override. `architect-check` compares
 > structural changes against this list; `tl-intake` checks incoming requests against it.
-> **Proposed by the installer from the codebase and docs — the owner must confirm or edit.**
+> Confirmed by the owner on 2026-11-06. The owner edits this list.
 
 **Concurrency model**
 - Shared-nothing per shard: no shared mutable state across shards; cross-shard work goes through `smp::submit_to` / `sharded<>` / `foreign_ptr`.
@@ -161,31 +170,14 @@ These apply to all implementation and review on this project.
 
 ## SDLC workflow
 
-A team of subagents in `.claude/agents/` takes work from request to reviewed PR. Skills in `.claude/skills/` orchestrate them. Use `/tl-intake` to turn a request into an issue and `/sdlc-workflow` to take an issue to a PR.
+Subagents in `.claude/agents/` (`product-manager`, `tester`, `implementer`, `architect-check`, `reviewer-qa`, `pr-reviewer`) take work from request to reviewed PR, orchestrated by `/tl-intake` (request → issue) and `/sdlc-workflow` (issue → PR). The session acts as team lead. Roles, models, the feature-work order and PR rules: `docs/agents/sdlc-workflow.md`. **During the PITR assignment, P1-P4 override it** (see "Current task").
 
-| Piece | Model | Role |
-|---|---|---|
-| `product-manager` (agent) | Opus 5.5 | Peer of the team lead, not a report. Owns the requirements (the what; the dev team owns the how). Works from documents, not code, and raises issues in the product issue register. |
-| `tester` (agent) | Opus 5.5 | QA. Checks requirements are testable, writes the full end-to-end test plan from them, and implements it as black-box tests. Plan reviewed by `product-manager`, the team lead and `reviewer-qa`. |
-| `tl-intake` (skill) | session model | Conversation → well-scoped GitHub issues. Stops at the issue. |
-| `sdlc-workflow` (skill) | session model | Issue → PR. Delegates, sequences, decides whether to open the PR. |
-| `implementer` (agent) | Opus 5 | Builds one issue into tested code. Flags structural changes. |
-| `architect-check` (agent) | Opus 5.5 | Runs on structural changes, against "Architecture constraints". Also reviews integration test coverage across units, from documents only. |
-| `reviewer-qa` (agent) | Opus 5.5 | Adversarial review of the diff before a human sees it. Builds and runs tests. |
-| `pr-reviewer` (agent) | Opus 5.5 | Cold read of the opened PR — diff, commit message, and whether the description's claims are true. Posts a GitHub review. Always a different instance from the two above. |
-
-Flow: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. **Nothing is merged automatically**; the PR still gets human review.
-
-The session acts as team lead. For feature work, run `product-manager` before requirements go to the tester and before bringing a product decision to the human. It doesn't report to the team lead: it writes its issues to the register directly, the team lead relays every new issue to the human without filtering, and only the human closes one. `product-manager` reviews documents, including the test plan, and doesn't review the implementation.
-
-For feature work, the order is: requirements (`product-manager`), then a full test plan based on them (`tester`, reviewed by `product-manager`, the team lead and `reviewer-qa`), and only then code. The test plan is QA's, and QA implements it as black-box, end-to-end tests against the real system (`tester`, reviewed by `reviewer-qa` and `pr-reviewer` like other code). Unit and integration tests are the developer's work, written with the code, and based on mocking rather than end to end. The design lists the units, their connections, and the integration tests for each. `architect-check` reviews that list from the documents, not the code, to confirm every connection is tested and the design holds together.
-
-- **QA models:** planning uses Opus. Implementing Python tests from a detailed plan uses Sonnet, and reviewers stay on Opus.
-- **Start a fresh agent for each PR,** since long-running agents use far more of the session limit. For risky tasks, each PR is reviewed before the next starts; simple tasks may overlap. Change headers once and early, to limit rebuilds. The task's detail is in its issue. A fresh agent can reuse a built worktree.
-- **Keep commits and reviews small: aim for 100-300 product lines per PR,** tests not counted, with 500 as a ceiling. For scale, half the repo's recent PRs are under 47 product lines, and 90% under 543. A larger task is split into smaller self-contained tasks, each with its own commit and PR.
-- **No piece runs longer than foreseen.** Each piece gets a stated time when it starts, from its task's size, with one behaviour per piece. At the limit it stops and reports: ship what passes, split the rest, and tell the human.
-- **One commit and one PR per task.** Each task issue gets its own commit on its own branch and its own PR, opened for review. Agents never merge. Dependent PRs stack on the previous task's branch, so each diff shows only its own task. Each PR title starts with the task ID, and its description states the task, its requirements, what changed, tests run with results, what it depends on, and what's not done.
+Flow: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. Rules that always hold:
+- **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
+- **One commit and one PR per task,** on its own branch, with the PR title starting with the task ID. Dependent PRs stack on the previous task's branch.
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
+- **No piece runs longer than foreseen.** Each piece gets a stated time; at the limit it stops and reports: ship what passes, split the rest, and tell the human.
 - **Everything an agent writes into GitHub is signed** — it opens with `**[claude-agent: <role>]**` on its own line, because `gh` posts under a human's account.
+- **`product-manager` is a peer, not a report.** The team lead relays every issue it raises to the human without filtering, and only the human closes one.
 - `.claude/hooks/guard-destructive-ops.sh` blocks merges, pushes to the default branch, force pushes, `git reset --hard`, `git clean -fdx`, and wiping the build tree. It is a speed bump, not a security boundary — branch protection is the control that holds.
 - `.claude/hooks/check-cpp-format.sh` checks changed lines of edited C/C++ files against `.clang-format` and asks the agent to fix them. The hook runs on the host, where `git-clang-format` is absent, so it is a silent no-op; `clang-format` and `git-clang-format` live in the toolchain image, so format changed lines with `./tools/toolchain/dbuild clang-format -i --lines=<start>:<end> <file>` yourself rather than relying on the hook.
