@@ -10,12 +10,15 @@
 
 #include <fmt/format.h>
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/on_internal_error.hh>
 #include <seastar/core/shard_id.hh>
+#include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
 
 #include "db/config.hh"
 #include "service/topology_state_machine.hh"
+#include "sstables/object_storage_client.hh"
 
 namespace db::pitr {
 
@@ -45,6 +48,8 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_node_count_unreadable";
     case shipping_state::off_commitlog_disabled:
         return "off_commitlog_disabled";
+    case shipping_state::off_upload_failed:
+        return "off_upload_failed";
     case shipping_state::waiting_for_cluster_size:
         return "waiting_for_cluster_size";
     case shipping_state::active:
@@ -128,10 +133,146 @@ future<> pitr_shipper::start() {
     return make_ready_future<>();
 }
 
+// Not a coroutine on purpose: a co_await on a ready future can still suspend
+// when the reactor wants to preempt, and stop() has to stay ready when there is
+// nothing to wait for.
 future<> pitr_shipper::stop() {
-    // The uploads of the later tickets are drained here too.
     _seal_timer.cancel();
-    return _seal_gate.close();
+    // Closing marks the gate at once, so no close reported from here on starts
+    // an upload and nothing is added to _uploading while it is walked. An abort
+    // only resolves the waiter's promise, which schedules its continuation
+    // rather than running it, so no upload erases its entry under this loop -
+    // which is also why the loop cannot yield. Each iteration is O(1), and
+    // there is one per upload in flight.
+    auto uploads_closed = _upload_gate.close();
+    for (auto& [id, as] : _uploading) {
+        pitr_logger.debug("Aborting the upload of segment {} for shutdown", id);
+        as->request_abort();
+    }
+    // The limiter outlives every call it started, waiters included, because
+    // every one of them unwinds through the upload gate.
+    return when_all_succeed(_seal_gate.close(), std::move(uploads_closed)).discard_result();
+}
+
+void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks) {
+    if (!active() || _client || _upload_gate.is_closed()) {
+        return;
+    }
+    if (!client || !hooks.open_segment || !hooks.object_name_of || !hooks.release_segment) {
+        seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client and all three hooks");
+        return;
+    }
+    _client = std::move(client);
+    _hooks = std::move(hooks);
+}
+
+void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bool failed) {
+    if (!_client) {
+        // start_shipping() has not run, so hold_segments is not set either and
+        // there is no hold to release.
+        return;
+    }
+    if (!active()) {
+        // Shipping has broken: nothing is uploaded, and the hold goes at once
+        // rather than pinning the segment for the rest of the node's life. A
+        // failed close has no hold left to release.
+        if (!failed) {
+            pitr_logger.debug("Not shipping segment {}: shipping is off ({}), releasing its hold", id, _state);
+            _hooks.release_segment(id);
+        }
+        return;
+    }
+    if (failed) {
+        // A failed close or a rollback: the bytes are not shippable and the
+        // commitlog has dropped the hold itself. The chain this breaks is the
+        // ledger's, which #9 and #11 own.
+        ++_segments_unshipped;
+        if (auto it = _uploading.find(id); it != _uploading.end()) {
+            // A rollback of a segment already reported as closed: the file may
+            // be gone, so the upload must not record a success for it.
+            it->second->request_abort();
+        }
+        pitr_logger.warn("Segment {} will not be shipped: the commitlog reported its close as failed", id);
+        return;
+    }
+    if (used_size == 0) {
+        // A forced seal leaves segments with nothing in them, and an empty
+        // object would describe a segment that holds no writes.
+        pitr_logger.debug("Segment {} closed with no used bytes, releasing its hold", id);
+        _hooks.release_segment(id);
+        return;
+    }
+    if (_uploading.contains(id)) {
+        pitr_logger.debug("Segment {} is already being shipped, ignoring the repeated close", id);
+        return;
+    }
+    if (_upload_gate.is_closed()) {
+        pitr_logger.debug("Not shipping segment {}: shutdown has begun", id);
+        return;
+    }
+    // Background: the close this runs inside cannot wait. The gate is what
+    // stop() waits for, and every continuation below runs inside it.
+    (void)seastar::try_with_gate(_upload_gate, [this, id, used_size] {
+        return ship_segment(id, used_size);
+    }).handle_exception([id](std::exception_ptr ex) {
+        // ship_segment() reports its own failures, so only a release hook that
+        // broke its contract, or a closed gate, can land here.
+        pitr_logger.error("Shipping segment {} ended unexpectedly: {}", id, ex);
+    });
+}
+
+future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) {
+    abort_source as;
+    _uploading.emplace(id, &as);
+    auto forget = seastar::defer([this, id]() noexcept {
+        _uploading.erase(id);
+    });
+    retry_policy policy{
+            .on_attempt_failed =
+                    [id](std::exception_ptr ex, std::chrono::milliseconds wait) {
+                        pitr_logger.debug("Upload of segment {} failed, retrying in {}: {}", id, wait, ex);
+                    },
+    };
+    try {
+        co_await _uploads.upload(
+                *_client, _hooks.object_name_of(id), used_size,
+                [this, id] {
+                    return _hooks.open_segment(id);
+                },
+                std::move(policy), as);
+    } catch (const seastar::abort_requested_exception&) {
+        // The abort wins over an attempt that had already finished, so nothing
+        // records this segment. sleep_aborted, which a plain request_abort()
+        // during the backoff gives, is one of these. The hold is kept for a
+        // shutdown, which deletes the held segments anyway, and for a rollback,
+        // where the commitlog has dropped it; a break releases it, since no
+        // chain is left to hold it for.
+        if (!active() && !_upload_gate.is_closed()) {
+            pitr_logger.info("Upload of segment {} was aborted by the break, releasing its hold", id);
+            _hooks.release_segment(id);
+            co_return;
+        }
+        pitr_logger.info("Upload of segment {} was aborted, its hold is kept", id);
+        co_return;
+    } catch (...) {
+        // Everything that is not an abort: a missing segment file, a segment
+        // shorter than its used size, and anything else no retry could fix.
+        // The chain now has a hole in it, so shipping breaks and the hold goes.
+        // Provisional, pending the decision on the outage policy (#11).
+        ++_segments_unshipped;
+        auto ex = std::current_exception();
+        break_shipping(shipping_state::off_upload_failed,
+                fmt::format(
+                        "upload_failed: uploading segment {} failed in a way no retry can fix ({}). Fix the cause and restart the node to ship again", id, ex));
+        _hooks.release_segment(id);
+        co_return;
+    }
+    // Nothing is awaited between the upload and the release, so an abort
+    // landing in that gap cannot find a success recorded for a segment whose
+    // file may since have been recycled.
+    ++_segments_shipped;
+    _hooks.release_segment(id);
+    pitr_logger.debug("Shipped segment {} ({} bytes) and released its hold", id, used_size);
 }
 
 void pitr_shipper::start_sealing(seal_function seal, node_count_function count_nodes) {
@@ -207,6 +348,14 @@ void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
     _last_outcome = cycle_outcome::shipping_broke;
     _last_failure = _break_reason;
     _seal_timer.cancel();
+    // No chain is left to keep segments for, so every upload in flight is
+    // aborted and its hold released by ship_segment()'s abort path, which sees
+    // that shipping is off. O(1) per upload and no yield, so nothing erases its
+    // entry under this loop.
+    for (auto& [id, as] : _uploading) {
+        pitr_logger.debug("Aborting the upload of segment {}: shipping broke", id);
+        as->request_abort();
+    }
     // Every shard keeps its own latch, so the shard that breaks is the one that
     // has to say so: a break happens at most once per shard per boot.
     pitr_logger.error("Point-in-time recovery shipping is off on shard {}: {}", this_shard_id(), *_break_reason);
