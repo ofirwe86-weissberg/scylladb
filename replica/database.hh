@@ -1857,8 +1857,10 @@ private:
     flat_hash_map<sstring, std::unique_ptr<keyspace>> _keyspaces;
     tables_metadata _tables_metadata;
     // Set only when the commitlog holds its segments for point-in-time
-    // recovery, and declared ahead of it, so a close reported while the
-    // commitlog is destroyed still finds the slot (issue #8).
+    // recovery. Declared before the commitlog, so it is destroyed after it:
+    // the closes the commitlog's own destruction reports still find a live
+    // slot, which by then has been cleared and releases their holds itself
+    // (issue #8).
     std::unique_ptr<db::pitr::segment_closed_slot> _pitr_segment_closed;
     std::unique_ptr<db::commitlog> _commitlog;
     std::unique_ptr<db::commitlog> _schema_commitlog;

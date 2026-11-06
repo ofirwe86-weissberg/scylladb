@@ -8,15 +8,20 @@
 
 #include "db/pitr/pitr_shipper.hh"
 
+#include <filesystem>
+
 #include <fmt/format.h>
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/do_with.hh>
 #include <seastar/core/on_internal_error.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
 
 #include "db/config.hh"
+#include "mutation/timestamp.hh"
 #include "service/topology_state_machine.hh"
 #include "sstables/object_storage_client.hh"
 
@@ -48,6 +53,8 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_node_count_unreadable";
     case shipping_state::off_commitlog_disabled:
         return "off_commitlog_disabled";
+    case shipping_state::off_unknown_endpoint:
+        return "off_unknown_endpoint";
     case shipping_state::off_upload_failed:
         return "off_upload_failed";
     case shipping_state::waiting_for_cluster_size:
@@ -208,7 +215,7 @@ void pitr_shipper::set_release_hook(release_hook hook) {
     _release_hold = std::move(hook);
 }
 
-void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks) {
+void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks, chain_origin origin) {
     if (!active() || _client || _upload_gate.is_closed()) {
         return;
     }
@@ -218,6 +225,70 @@ void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_c
     }
     _client = std::move(client);
     _hooks = std::move(hooks);
+    _chain = chain_key_parts{
+            .prefix = _shipper_cfg->prefix,
+            .host_id = origin.host_id,
+            .shard = uint32_t(this_shard_id()),
+            .boot_epoch_us = origin.boot_epoch_us,
+            // The same clock a write's timestamp comes from, so that the
+            // coverage this chain claims is comparable with one (#9).
+            .chain_start_us = api::new_timestamp(),
+            .chain = chain_id::create_random_id(),
+    };
+    _chain_floor = origin.floor;
+    pitr_logger.info("Shipping segments from {} into chain {} ({})", _chain_floor ? fmt::format("segment {}", *_chain_floor) : "the next segment to close",
+            _chain->chain, chain_key_prefix(*_chain));
+}
+
+void pitr_shipper::flush_after_start(flush_function flush) {
+    if (!active() || _seal_gate.is_closed()) {
+        return;
+    }
+    // Background: the caller is the node's startup path, and a flush of every
+    // table can take a while. The seal gate is what makes stop() wait for it.
+    // The function is moved into do_with, because try_with_gate() does not keep
+    // it alive past the call, and a coroutine lambda keeps its captures in it.
+    (void)seastar::try_with_gate(_seal_gate, [flush = std::move(flush)]() mutable {
+        return seastar::do_with(std::move(flush), [](flush_function& f) {
+            return f();
+        });
+    }).handle_exception([](std::exception_ptr ex) {
+        // A table that was not flushed only keeps a later backup's bound lower
+        // than it could be; the next flush of that table fixes it.
+        pitr_logger.warn("Flushing the tables after shipping started failed, shipping continues: {}", ex);
+    });
+}
+
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path) {
+    if (!segment_path) {
+        seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path function");
+    }
+    // A segment the commitlog no longer holds has no path, and its file may be
+    // gone: there is nothing to ship, and saying so ends this one upload.
+    auto path_of = [segment_path = std::move(segment_path)](db::segment_id_type id) {
+        auto path = segment_path(id);
+        if (!path) {
+            throw std::runtime_error(fmt::format("segment {} is no longer held, so it cannot be shipped", id));
+        }
+        return *path;
+    };
+    return segment_hooks{
+            .open_segment =
+                    [path_of](db::segment_id_type id) {
+                        return seastar::open_file_dma(path_of(id), seastar::open_flags::ro);
+                    },
+            .object_name_of =
+                    [path_of, &shipper](db::segment_id_type id) {
+                        const auto& chain = shipper.chain();
+                        if (!chain) {
+                            throw std::runtime_error(fmt::format("segment {} cannot be stored: this shard has no chain yet", id));
+                        }
+                        // The segment keeps its own file name, which is what a
+                        // restore matches and what carries its id.
+                        const auto file_name = std::filesystem::path(std::string(path_of(id))).filename().string();
+                        return sstables::object_name(shipper.shipping_config().bucket, segment_object_key(*chain, file_name));
+                    },
+    };
 }
 
 void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bool failed) {
@@ -253,6 +324,14 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         pitr_logger.warn("Segment {} will not be shipped: the commitlog reported its close as failed", id);
         return;
     }
+    if (_chain_floor && id < *_chain_floor) {
+        // Written before this chain began. Shipping it would put a segment in
+        // the chain that the chain's own start does not cover, and the restore
+        // would read coverage it does not have.
+        pitr_logger.debug("Segment {} closed below the chain floor {}, releasing its hold", id, *_chain_floor);
+        _release_hold(id);
+        return;
+    }
     // Before the used size is looked at: a repeated close can report a size of
     // 0 for a segment whose upload is in flight, and releasing its hold then
     // would let the file be recycled under the upload.
@@ -268,7 +347,11 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         return;
     }
     if (_upload_gate.is_closed()) {
-        pitr_logger.debug("Not shipping segment {}: shutdown has begun", id);
+        // No upload may start now, and the chain ends at the last segment that
+        // was shipped. The hold goes rather than being left for the shutdown to
+        // clear, so a stop that is not a shutdown leaves nothing pinned.
+        pitr_logger.debug("Not shipping segment {}: shutdown has begun, releasing its hold", id);
+        _release_hold(id);
         return;
     }
     // Background: the close this runs inside cannot wait. The gate is what
@@ -310,8 +393,8 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
     } catch (...) {
         // Everything that is not an abort: a missing segment file, a segment
         // shorter than its used size, and anything else no retry could fix.
-        // The chain now has a hole in it, so shipping breaks and the hold goes.
-        // Provisional, pending the decision on the outage policy (#11).
+        // The chain now has a hole in it, so shipping breaks and the hold goes
+        // (D25).
         ++_segments_unshipped;
         auto ex = std::current_exception();
         break_shipping(shipping_state::off_upload_failed,
@@ -502,6 +585,22 @@ void pitr_shipper::note_cluster_size(size_t node_count) {
     _state = shipping_state::active;
     if (this_shard_id() == 0) {
         pitr_logger.info("Point-in-time recovery shipping is on");
+    }
+}
+
+void pitr_shipper::note_endpoint_unknown() {
+    if (!active()) {
+        // Shipping is already off, and every refusal is latched.
+        return;
+    }
+    _state = shipping_state::off_unknown_endpoint;
+    _break_reason = fmt::format("unknown_endpoint: pitr_endpoint is set to '{}', which is not one of this node's object_storage_endpoints. Add the endpoint "
+                                "and restart the node to ship again",
+            _cfg.pitr_endpoint());
+    // Nothing to seal for: a sealed segment could not be shipped anywhere.
+    _seal_timer.cancel();
+    if (this_shard_id() == 0) {
+        pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
     }
 }
 

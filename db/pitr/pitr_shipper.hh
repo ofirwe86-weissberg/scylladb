@@ -28,6 +28,7 @@
 #include <seastar/util/noncopyable_function.hh>
 
 #include "db/commitlog/replay_position.hh"
+#include "db/pitr/ledger_entry.hh"
 #include "db/pitr/segment_upload.hh"
 #include "seastarx.hh"
 
@@ -98,8 +99,12 @@ enum class shipping_state {
     // ship. Refused at startup rather than reported as shipping (P32's pattern
     // for an encrypted commitlog).
     off_commitlog_disabled,
+    // pitr_endpoint names an endpoint this node has no object_storage_endpoints
+    // entry for, so there is no store to ship to. Refused when shipping would
+    // have started, like a disabled commitlog, rather than reported as active.
+    off_unknown_endpoint,
     // A segment's upload failed in a way no retry can fix, so the chain has a
-    // hole in it. Provisional, pending the decision on the outage policy (#11).
+    // hole in it: shipping stops for good and every hold is released (D25).
     off_upload_failed,
     // Configured, waiting for the node's cluster membership to be counted.
     waiting_for_cluster_size,
@@ -144,6 +149,26 @@ struct segment_hooks {
     // Where a segment's bytes are stored. Must keep the segment's own file
     // name, which a restore matches against the prefix.
     std::function<sstables::object_name(db::segment_id_type)> object_name_of;
+};
+
+// Maps a held segment's id to the path of its file, or to nothing for an id the
+// commitlog does not hold. commitlog::held_segment_path() is what the wiring
+// passes in.
+using segment_path_function = std::function<std::optional<sstring>(db::segment_id_type)>;
+
+// What only the wiring knows about the chain this shard is about to start.
+struct chain_origin {
+    // The node's host id, which is part of every object key of the chain.
+    utils::UUID host_id;
+    // One value for the whole node, taken once per boot, so that every shard's
+    // chain key names the same boot.
+    int64_t boot_epoch_us = 0;
+    // The newest segment the commitlog holds when shipping starts, from
+    // commitlog::held_segments(), which is ordered. It becomes the chain's
+    // floor: a segment below it was written before the chain began, so it is
+    // released rather than shipped (D27). Empty when nothing is held yet, which
+    // lets every later close ship.
+    std::optional<db::segment_id_type> floor;
 };
 
 // Where the commitlog's close notification goes, one per shard. Not the
@@ -199,6 +224,8 @@ public:
     // count, and any count but one turns shipping off for good. A failed future
     // turns it off too, except during stop().
     using node_count_function = seastar::noncopyable_function<future<size_t>()>;
+    // Flushes this shard's user tables once. See flush_after_start().
+    using flush_function = seastar::noncopyable_function<future<>()>;
 
     // How the latest seal cycle ended, for the status report to read.
     enum class cycle_outcome {
@@ -243,6 +270,10 @@ private:
     seastar::shared_ptr<sstables::object_storage_client> _client;
     release_hook _release_hold;
     segment_hooks _hooks;
+    // Both set when start_shipping() takes effect, and never again: a chain
+    // belongs to one shard of one boot.
+    std::optional<chain_key_parts> _chain;
+    std::optional<db::segment_id_type> _chain_floor;
     segment_upload_limiter _uploads;
     seastar::gate _upload_gate;
     // One abort source per upload in flight, owned by the upload's own frame.
@@ -287,7 +318,31 @@ public:
     // Installs the store client and the hooks uploads run with, and needs the
     // release hook already installed. Takes effect only while shipping is
     // active and before stop(); a second call is ignored, as start_sealing()'s.
-    void start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks);
+    //
+    // A call that takes effect is where this shard's chain begins: it takes its
+    // chain identity from `origin` and its floor from origin.floor, and both
+    // stay as they are until the node restarts.
+    void start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks, chain_origin origin);
+
+    // The chain this shard ships into, empty until start_shipping() has taken
+    // effect. The ledger (#9) and the bound file read it.
+    const std::optional<chain_key_parts>& chain() const noexcept {
+        return _chain;
+    }
+
+    // The lowest segment id this chain ships; see chain_origin::floor. Empty
+    // when the chain has no floor, so every closed segment ships.
+    std::optional<db::segment_id_type> chain_floor() const noexcept {
+        return _chain_floor;
+    }
+
+    // Starts the one flush the wiring owes once shipping has started on every
+    // shard: a table that is never written again would otherwise keep a later
+    // backup's bound below this chain's start, and that backup would be refused
+    // (D27). Runs in the background inside the gate stop() waits for, so it
+    // cannot outlive this shipper, and a failure is logged and breaks nothing.
+    // Dropped unless shipping is active and stop() has not begun.
+    void flush_after_start(flush_function flush);
 
     // The commitlog's close notification for a held segment, which runs inside
     // the close, so this must not block: it starts the upload in the
@@ -308,7 +363,17 @@ public:
     //
     // Once shipping has broken there is no chain left to pin segments for, so
     // nothing is uploaded and every hold reported from then on is released at
-    // once. Provisional, pending the decision on the outage policy (#11).
+    // once (D25).
+    //
+    // A segment below chain_floor() was written before this chain began, so it
+    // is released rather than shipped: closes are not ordered by id
+    // (commitlog.hh), so the floor is what keeps a pre-chain segment out.
+    //
+    // A close that arrives once stop() has begun is released and not shipped,
+    // and the chain simply ends at the last segment shipped before that. The
+    // closes the shutdown drain causes arrive before stop(), because the drain
+    // runs first in the node's shutdown order, so each of them is either
+    // shipped or aborted by stop(), and an aborted one keeps its hold.
     //
     // A close reported for a segment already being shipped is ignored, so a
     // duplicate report cannot start a second upload to the same name, nor
@@ -375,6 +440,14 @@ public:
     // report active. Latched like every other refusal.
     void note_commitlog_disabled();
 
+    // Called on every shard instead of start_shipping() when pitr_endpoint
+    // names an endpoint the node has no object_storage_endpoints entry for.
+    // Shipping has nowhere to go, so it is refused with a reason naming the
+    // option, latched like every other refusal, and the seal timer is dropped.
+    // Does nothing once shipping is off for another reason, and never throws: a
+    // mistyped option must not stop the node from booting.
+    void note_endpoint_unknown();
+
     shipping_state state() const noexcept {
         return _state;
     }
@@ -412,5 +485,15 @@ public:
         return _uploads.max_concurrent_uploads();
     }
 };
+
+// The hooks the wiring installs, built here rather than in main.cc so that the
+// key a segment is stored under is under test. Both hooks throw for an id the
+// commitlog no longer holds, which ends that one segment's upload the way any
+// other permanent failure does.
+//
+// `shipper` must be the shipper the hooks are installed on, and it must outlive
+// them; object_name_of() reads its chain and its bucket, so start_shipping()
+// must have taken effect before a segment is shipped.
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path);
 
 } // namespace db::pitr

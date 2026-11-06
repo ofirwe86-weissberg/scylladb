@@ -345,6 +345,15 @@ public:
     std::vector<segment_id_type> held_segments() const;
 
     /**
+     * Path of the file of one held segment, or nullopt for an id this log does
+     * not hold. Read-only, and the only thing db/pitr needs to open a handle
+     * of its own on a segment it is about to ship, rather than reusing this
+     * log's handle (issue #8). Holding the segment is what keeps the path from
+     * being recycled under the reader.
+     */
+    std::optional<sstring> held_segment_path(segment_id_type) const;
+
+    /**
      * Size on disk of the held segments that have closed. The one still being
      * written is not counted: it cannot be shipped yet.
      */
