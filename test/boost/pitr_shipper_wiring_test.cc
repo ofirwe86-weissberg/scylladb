@@ -19,6 +19,7 @@
 #include <boost/test/unit_test.hpp>
 #include <algorithm>
 #include <cstdlib>
+#include <ranges>
 #include <filesystem>
 #include <string>
 #include <tuple>
@@ -254,6 +255,14 @@ SEASTAR_TEST_CASE(test_the_hooks_open_the_held_segments_own_file) {
                         BOOST_REQUIRE_THROW(hooks.open_segment(std::get<0>(closed.back()) + 1000).get(), std::runtime_error);
                         BOOST_REQUIRE(!log.held_segment_path(std::get<0>(closed.front()) - 1));
                         BOOST_REQUIRE_THROW(hooks.open_segment(std::get<0>(closed.front()) - 1).get(), std::runtime_error);
+
+                        // A segment the log has released, but still has, has no
+                        // path either: nothing keeps its file from being
+                        // recycled under a reader any more.
+                        const auto released = std::get<0>(closed.back());
+                        log.release_segment(released);
+                        BOOST_REQUIRE(!log.held_segment_path(released));
+                        BOOST_REQUIRE_THROW(hooks.open_segment(released).get(), std::runtime_error);
                     });
                 });
             },
@@ -343,7 +352,13 @@ SEASTAR_TEST_CASE(test_the_chain_floor_is_the_newest_held_segment) {
 
                         BOOST_REQUIRE_EQUAL(flushes, 1);
                         BOOST_REQUIRE(shipper.chain_floor());
-                        BOOST_REQUIRE_EQUAL(*shipper.chain_floor(), held.back());
+                        // The highest id held, whatever order the holds were
+                        // taken in: anything lower would let a segment that is
+                        // not in the chain be shipped into it.
+                        BOOST_REQUIRE_EQUAL(*shipper.chain_floor(), std::ranges::max(held));
+                        for (auto id : held) {
+                            BOOST_REQUIRE_LE(id, *shipper.chain_floor());
+                        }
                         // Every segment that closed before the chain is below
                         // it, so each is released rather than shipped.
                         for (const auto& [id, used_size, failed] : closed) {

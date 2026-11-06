@@ -2355,6 +2355,9 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_close_below_the_chain_floor_releases
 
         BOOST_REQUIRE(probe.released.empty());
         BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+        // Not a hole in the chain: the segment was written before the chain
+        // began, so it was never going to be in it.
+        BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 0u);
     });
 }
 

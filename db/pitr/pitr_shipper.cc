@@ -8,6 +8,7 @@
 
 #include "db/pitr/pitr_shipper.hh"
 
+#include <algorithm>
 #include <filesystem>
 
 #include <fmt/format.h>
@@ -275,7 +276,8 @@ segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_funct
         seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path function");
     }
     // A segment the commitlog no longer holds has no path, and its file may be
-    // gone: there is nothing to ship, and saying so ends this one upload.
+    // gone. Throwing is a permanent upload failure, so it breaks shipping on
+    // this shard and releases the holds (D25).
     auto path_of = [segment_path = std::move(segment_path)](db::segment_id_type id) {
         auto path = segment_path(id);
         if (!path) {
@@ -321,8 +323,6 @@ void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& s
         shipper.note_store_client_failed(fmt::format("{}", std::current_exception()));
         return;
     }
-    // held_segments() is in creation order, so the last is the newest: the
-    // segment still being written, which is where this chain starts.
     const auto held = log.held_segments();
     shipper.start_shipping(std::move(client),
             make_segment_hooks(shipper,
@@ -332,7 +332,10 @@ void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& s
             chain_origin{
                     .host_id = host_id,
                     .boot_epoch_us = boot_epoch_us,
-                    .floor = held.empty() ? std::optional<db::segment_id_type>() : std::optional<db::segment_id_type>(held.back()),
+                    // The highest id, not the last held: ids are assigned when a reserve
+                    // segment is allocated and the hold is taken later, so the order the
+                    // holds were taken in is not id order.
+                    .floor = held.empty() ? std::optional<db::segment_id_type>() : std::optional<db::segment_id_type>(std::ranges::max(held)),
             });
     shipper.flush_after_start(std::move(flush));
 }
@@ -357,6 +360,17 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         }
         return;
     }
+    if (_chain_floor && id < *_chain_floor) {
+        // Written before this chain began, so it is not in the chain: shipping
+        // it would claim coverage the chain's own start does not have, and a
+        // failed one is no hole in the chain either. Closes are not ordered by
+        // id (commitlog.hh), so the floor is what keeps such a segment out.
+        if (!failed) {
+            _release_hold(id);
+        }
+        pitr_logger.debug("Segment {} closed below the chain floor {}, not shipping it", id, *_chain_floor);
+        return;
+    }
     if (failed) {
         // A failed close or a rollback: the bytes are not shippable and the
         // commitlog has dropped the hold itself. The chain this breaks is the
@@ -368,14 +382,6 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
             it->second->request_abort();
         }
         pitr_logger.warn("Segment {} will not be shipped: the commitlog reported its close as failed", id);
-        return;
-    }
-    if (_chain_floor && id < *_chain_floor) {
-        // Written before this chain began. Shipping it would put a segment in
-        // the chain that the chain's own start does not cover, and the restore
-        // would read coverage it does not have.
-        pitr_logger.debug("Segment {} closed below the chain floor {}, releasing its hold", id, *_chain_floor);
-        _release_hold(id);
         return;
     }
     // Before the used size is looked at: a repeated close can report a size of
@@ -394,8 +400,8 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
     }
     if (_upload_gate.is_closed()) {
         // No upload may start now, and the chain ends at the last segment that
-        // was shipped. The hold goes rather than being left for the shutdown to
-        // clear, so a stop that is not a shutdown leaves nothing pinned.
+        // was shipped. This hold goes rather than waiting for the shutdown to
+        // clear it; the holds of the uploads stop() aborted are kept.
         pitr_logger.debug("Not shipping segment {}: shutdown has begun, releasing its hold", id);
         _release_hold(id);
         return;

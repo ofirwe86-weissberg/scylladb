@@ -144,10 +144,8 @@ using segment_path_function = std::function<std::optional<sstring>(db::segment_i
 
 // What only the wiring knows about the chain this shard is about to start.
 struct chain_origin {
-    // Part of every object key of the chain.
-    utils::UUID host_id;
-    // One value per boot for the whole node, so every shard names the boot.
-    int64_t boot_epoch_us = 0;
+    utils::UUID host_id;       // part of every object key of the chain
+    int64_t boot_epoch_us = 0; // one per boot, so every shard names the boot
     // The newest segment held when shipping starts, from the ordered
     // commitlog::held_segments(). The chain's floor: below it a segment was
     // written before the chain began, so it is released, not shipped (D27).
@@ -312,8 +310,9 @@ public:
     //   (D25), the hold rule applies; with no release hook it is ignored;
     // - `failed` for a segment being shipped is a rollback: that upload is
     //   aborted, so a file it may have erased is never recorded as shipped;
-    // - below chain_floor() it is released, not shipped: it was written before
-    //   this chain, and closes are not ordered by id (commitlog.hh);
+    // - below chain_floor() it is released and not shipped, and a failed one
+    //   there is no hole in the chain: it was written before this chain, and
+    //   closes are not ordered by id (commitlog.hh);
     // - a repeat for a segment being shipped is ignored, so it cannot start a
     //   second upload or release the hold early by reporting a used size of 0;
     // - `used_size` 0 is released at once: an empty object would describe a
@@ -424,8 +423,9 @@ public:
 
 // The hooks the wiring installs, built here rather than in main.cc so that the
 // key a segment is stored under is under test. Both throw for an id the log no
-// longer holds, which ends that one upload as any permanent failure does.
-// `shipper` must be the one they are installed on, and must outlive them.
+// longer holds, which is a permanent upload failure: it breaks shipping on this
+// shard and releases every hold (D25). `shipper` must be the one they are
+// installed on, and must outlive them.
 segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path);
 
 // Starts shipping on this shard, which is all the wiring at boot does: checks
