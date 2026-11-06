@@ -49,6 +49,10 @@ custom_args:
         - '-c1 -m2G'
     bloom_filter_test:
         - '-c1'
+    # One shard: the chain check runs on the shard it is called on, and the fake
+    # store it reads is this shard's.
+    pitr_chain_check_test:
+        - '-c1 -m1G'
     # One shard, so that every write lands in the table the test captures from.
     pitr_bound_capture_test:
         - '-c1 -m2G'
