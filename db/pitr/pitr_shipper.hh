@@ -9,18 +9,26 @@
 #pragma once
 
 #include <chrono>
+#include <cstdint>
 #include <expected>
+#include <functional>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/condition-variable.hh>
+#include <seastar/core/file.hh>
 #include <seastar/core/future.hh>
 #include <seastar/core/gate.hh>
+#include <seastar/core/shared_ptr.hh>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/timer.hh>
 #include <seastar/util/log.hh>
 #include <seastar/util/noncopyable_function.hh>
 
+#include "db/commitlog/replay_position.hh"
+#include "db/pitr/segment_upload.hh"
 #include "seastarx.hh"
 
 namespace db {
@@ -28,6 +36,13 @@ namespace db {
 class config;
 
 }
+
+namespace sstables {
+
+class object_name;
+class object_storage_client;
+
+} // namespace sstables
 
 namespace db::pitr {
 
@@ -71,13 +86,29 @@ struct shipper_config {
 // they do not describe a usable store. Does no I/O and cannot block.
 std::expected<shipper_config, shipping_state> make_shipper_config(const db::config&);
 
+// Everything shipping a segment needs that only the wiring knows, so that this
+// unit needs no commitlog of its own. All three are required together.
+struct segment_hooks {
+    // Opens a handle dedicated to one upload attempt, by the rules stated for
+    // `f` in segment_upload.hh. Called once per attempt, so a retry never
+    // reuses a handle, and never the commitlog's own.
+    std::function<future<seastar::file>(db::segment_id_type)> open_segment;
+    // Where a segment's bytes are stored. Must keep the segment's own file
+    // name, which a restore matches against the prefix.
+    std::function<sstables::object_name(db::segment_id_type)> object_name_of;
+    // Releases the commitlog's hold on a segment whose close was reported.
+    // Called from a continuation, so it must neither block nor throw.
+    std::function<void(db::segment_id_type)> release_segment;
+};
+
 // Ships sealed commitlog segments to object storage, one instance per shard.
 //
 // It validates its configuration, reports why shipping is off, and while
-// shipping is on runs the seal timer. The hold on segments, the uploads and the
-// ledger come with the later tickets. While shipping is off it owns no timer
-// and no store client, so a node that does not configure PITR behaves exactly
-// as it did before.
+// shipping is on runs the seal timer and uploads the segments whose close the
+// commitlog reports, releasing each hold once its bytes are stored. The ledger
+// comes with a later ticket. While shipping is off it owns no timer and no
+// store client, so a node that does not configure PITR behaves exactly as it
+// did before.
 class pitr_shipper final {
 public:
     // Seals the active commitlog segment (force_new_active_segment on the main
@@ -135,9 +166,24 @@ private:
     std::optional<sstring> _break_reason;
     cycle_outcome _last_outcome = cycle_outcome::none;
     std::optional<sstring> _last_failure;
+    // Held, not referenced: an upload outlives the caller that handed the
+    // client over, and the store client must outlive its sinks.
+    seastar::shared_ptr<sstables::object_storage_client> _client;
+    segment_hooks _hooks;
+    segment_upload_limiter _uploads;
+    seastar::gate _upload_gate;
+    // One abort source per upload in flight, owned by the upload's own frame.
+    // Per segment, because the outage latch (#11) cancels one segment's upload
+    // while the rest keep going, and stop() aborts them all.
+    std::unordered_map<db::segment_id_type, abort_source*> _uploading;
+    uint64_t _segments_shipped = 0;
+    uint64_t _segments_unshipped = 0;
 
     future<> seal_loop();
     future<> seal_cycle();
+    // Uploads one closed segment's used bytes and then releases its hold.
+    // Reports its own failures rather than throwing.
+    future<> ship_segment(db::segment_id_type id, uint64_t used_size);
 
 public:
     explicit pitr_shipper(const db::config& cfg) noexcept;
@@ -150,9 +196,34 @@ public:
     // up at waiting_for_cluster_size at best. Returns a ready future.
     future<> start();
 
-    // Stops the seal timer and waits for a seal that is running. Safe without a
-    // preceding start().
+    // Stops the seal timer, aborts every upload in flight and waits for the
+    // seal and the uploads to unwind. The abort wins over an upload that has
+    // just finished, so a segment aborted here keeps its hold; shutdown
+    // deletes the held segments anyway. Safe without a preceding start().
     future<> stop();
+
+    // Installs the store client and the hooks uploads run with. Without it a
+    // reported close only releases its hold, so the wiring order cannot ship
+    // bytes nowhere. Takes effect only while shipping is active and before
+    // stop(), and a second call is ignored, as start_sealing()'s is.
+    void start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks);
+
+    // The commitlog's close notification for a held segment, which runs inside
+    // the close, so this must not block: it starts the upload in the
+    // background and returns. `used_size` is the bytes a replay would read,
+    // and `failed` means the segment must not be shipped, in which case the
+    // commitlog has already dropped the hold.
+    //
+    // A `used_size` of 0 is not uploaded - an empty object would describe a
+    // segment that holds nothing - and its hold is released at once. The hold
+    // on any other segment is released only after its bytes are stored, so an
+    // upload that fails for good leaves the segment held: ending the shipped
+    // chain and letting the writes go is the outage latch's decision (#11), not
+    // this unit's.
+    //
+    // A close reported for a segment already being shipped is ignored, so a
+    // duplicate report cannot start a second upload to the same name.
+    void segment_closed(db::segment_id_type id, uint64_t used_size, bool failed);
 
     // Arms the seal timer and does nothing else. It does nothing at all unless
     // shipping is already active on this shard and stop() has not begun, so a
@@ -225,6 +296,26 @@ public:
 
     // Valid only while configured() holds.
     const shipper_config& shipping_config() const;
+
+    // Segments whose bytes are stored and whose hold was released.
+    uint64_t segments_shipped() const noexcept {
+        return _segments_shipped;
+    }
+
+    // Segments that will not be shipped: a failed close, and one whose upload
+    // failed for good. Both break the shipped chain.
+    uint64_t segments_unshipped() const noexcept {
+        return _segments_unshipped;
+    }
+
+    // Uploads started and not finished, the ones waiting for a slot included.
+    size_t uploads_in_flight() const noexcept {
+        return _uploading.size();
+    }
+
+    size_t max_concurrent_uploads() const noexcept {
+        return _uploads.max_concurrent_uploads();
+    }
 };
 
 } // namespace db::pitr
