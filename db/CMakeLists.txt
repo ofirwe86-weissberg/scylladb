@@ -52,6 +52,7 @@ target_sources(db
     pitr/ledger_writer.cc
     pitr/pitr_shipper.cc
     pitr/refusal.cc
+    pitr/replay_reader.cc
     pitr/segment_upload.cc
     pitr/t_filter.cc
     pitr/t_parser.cc
