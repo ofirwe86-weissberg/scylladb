@@ -1216,7 +1216,19 @@ public:
     db::replay_position set_low_replay_position_mark();
     db::replay_position highest_flushed_replay_position() const;
 
-    future<std::pair<std::vector<sstables::shared_sstable>, sstable_list_permit>> snapshot_sstables();
+    // The sstables a snapshot hard-links, with the commitlog bound taken in the same
+    // critical section as the list.
+    struct snapshot_sstable_list {
+        std::vector<sstables::shared_sstable> sstables;
+        // The lowest commitlog position that can still be replayed after a reboot, as
+        // of the moment `sstables` was copied. Every write that `sstables` does not
+        // hold is at or above it, so point-in-time recovery replaying from here misses
+        // no write (#12). Default-constructed when the table has no commitlog.
+        db::replay_position commitlog_bound;
+        sstable_list_permit permit;
+    };
+
+    future<snapshot_sstable_list> snapshot_sstables();
 
     future<std::unordered_map<sstring, snapshot_details>> get_snapshot_details();
     static future<snapshot_details> get_snapshot_details(std::filesystem::path snapshot_dir, std::filesystem::path datadir);
