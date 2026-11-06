@@ -20,10 +20,12 @@
 #include <seastar/core/when_all.hh>
 #include <seastar/util/defer.hh>
 
+#include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
 #include "mutation/timestamp.hh"
 #include "service/topology_state_machine.hh"
 #include "sstables/object_storage_client.hh"
+#include "sstables/sstables_manager.hh"
 
 namespace db::pitr {
 
@@ -236,8 +238,15 @@ void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_c
             .chain = chain_id::create_random_id(),
     };
     _chain_floor = origin.floor;
-    pitr_logger.info("Shipping segments from {} into chain {} ({})", _chain_floor ? fmt::format("segment {}", *_chain_floor) : "the next segment to close",
-            _chain->chain, chain_key_prefix(*_chain));
+    // The one "shipping is on" line, here and not at note_cluster_size(): until
+    // the store client is installed nothing can be shipped, and the endpoint may
+    // still turn shipping off.
+    const auto from = _chain_floor ? fmt::format("segment {}", *_chain_floor) : std::string("the next segment to close");
+    if (this_shard_id() == 0) {
+        pitr_logger.info("Point-in-time recovery shipping is on: shipping from {} into chain {} ({})", from, _chain->chain, chain_key_prefix(*_chain));
+    } else {
+        pitr_logger.debug("Shipping from {} into chain {} ({})", from, _chain->chain, chain_key_prefix(*_chain));
+    }
 }
 
 void pitr_shipper::flush_after_start(flush_function flush) {
@@ -289,6 +298,41 @@ segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_funct
                         return sstables::object_name(shipper.shipping_config().bucket, segment_object_key(*chain, file_name));
                     },
     };
+}
+
+void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& sstm, db::commitlog& log, utils::UUID host_id, int64_t boot_epoch_us,
+        pitr_shipper::flush_function flush) {
+    if (!shipper.active()) {
+        return;
+    }
+    const auto& endpoint = shipper.shipping_config().endpoint;
+    if (endpoint.empty() || !sstm.is_known_endpoint(endpoint)) {
+        shipper.note_endpoint_unknown();
+        return;
+    }
+    seastar::shared_ptr<sstables::object_storage_client> client;
+    try {
+        client = sstm.get_endpoint_client(endpoint);
+    } catch (...) {
+        // A configured endpoint the client cannot use: shipping is off for this
+        // boot, and the node carries on without it.
+        shipper.note_store_client_failed(fmt::format("{}", std::current_exception()));
+        return;
+    }
+    // held_segments() is in creation order, so the last is the newest: the
+    // segment still being written, which is where this chain starts.
+    const auto held = log.held_segments();
+    shipper.start_shipping(std::move(client),
+            make_segment_hooks(shipper,
+                    [&log](db::segment_id_type id) {
+                        return log.held_segment_path(id);
+                    }),
+            chain_origin{
+                    .host_id = host_id,
+                    .boot_epoch_us = boot_epoch_us,
+                    .floor = held.empty() ? std::optional<db::segment_id_type>() : std::optional<db::segment_id_type>(held.back()),
+            });
+    shipper.flush_after_start(std::move(flush));
 }
 
 void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bool failed) {
@@ -584,7 +628,7 @@ void pitr_shipper::note_cluster_size(size_t node_count) {
     }
     _state = shipping_state::active;
     if (this_shard_id() == 0) {
-        pitr_logger.info("Point-in-time recovery shipping is on");
+        pitr_logger.debug("The node counted one node; waiting for the store client");
     }
 }
 
@@ -598,6 +642,20 @@ void pitr_shipper::note_endpoint_unknown() {
                                 "and restart the node to ship again",
             _cfg.pitr_endpoint());
     // Nothing to seal for: a sealed segment could not be shipped anywhere.
+    _seal_timer.cancel();
+    if (this_shard_id() == 0) {
+        pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);
+    }
+}
+
+void pitr_shipper::note_store_client_failed(std::string_view cause) {
+    if (!active()) {
+        return;
+    }
+    _state = shipping_state::off_unknown_endpoint;
+    _break_reason = fmt::format("store_client_failed: no store client could be built for pitr_endpoint '{}' ({}). Fix the endpoint's configuration and restart "
+                                "the node to ship again",
+            _cfg.pitr_endpoint(), cause);
     _seal_timer.cancel();
     if (this_shard_id() == 0) {
         pitr_logger.error("Point-in-time recovery shipping is off: {}", *_break_reason);

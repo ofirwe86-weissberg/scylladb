@@ -18,6 +18,8 @@
 
 #include <boost/test/unit_test.hpp>
 #include <algorithm>
+#include <filesystem>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -28,21 +30,61 @@
 
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "db/object_storage_endpoint_param.hh"
+#include "db/pitr/ledger_entry.hh"
 #include "db/pitr/pitr_shipper.hh"
 #include "replica/database.hh"
 #include "replica/memtable.hh"
+#include "sstables/object_storage_client.hh"
+#include "sstables/sstables_manager.hh"
 #include "test/lib/cql_test_env.hh"
+#include "utils/UUID_gen.hh"
 
 BOOST_AUTO_TEST_SUITE(pitr_shipper_wiring_test)
 
 namespace {
 
-cql_test_config pitr_config() {
+constexpr const char* pitr_test_endpoint = "https://pitr-store.test";
+
+// `known_endpoint` decides whether the node was configured with the endpoint
+// pitr_endpoint names. Nothing talks to it: building a client does no I/O.
+cql_test_config pitr_config(bool known_endpoint = false) {
     auto cfg = cql_test_config();
-    cfg.db_config->pitr_endpoint.set("http://localhost:9000");
+    cfg.db_config->pitr_endpoint.set(pitr_test_endpoint);
     cfg.db_config->pitr_bucket.set("pitr-bucket");
+    if (known_endpoint) {
+        cfg.db_config->object_storage_endpoints({db::object_storage_endpoint_param(db::object_storage_endpoint_param::s3_storage{
+                .endpoint = pitr_test_endpoint,
+                .region = "local",
+                .iam_role_arn = "",
+                .legacy_format = false,
+        })});
+    }
     return cfg;
 }
+
+// An active shipper on this shard, as the wiring leaves it just before
+// start_shipping_on_shard(): the release hook is installed, nothing else is.
+template <typename Func>
+void with_an_active_shipper(cql_test_env& e, db::commitlog& log, Func&& f) {
+    db::pitr::pitr_shipper shipper(e.local_db().get_config());
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    BOOST_REQUIRE(shipper.active());
+    auto stop = seastar::defer([&shipper]() noexcept {
+        shipper.stop().get();
+    });
+    shipper.set_release_hook([&log](db::segment_id_type id) {
+        log.release_segment(id);
+    });
+    f(shipper);
+}
+
+std::string file_name_of(const seastar::sstring& path) {
+    return std::filesystem::path(std::string(path)).filename().string();
+}
+
+using closed_segments = std::vector<std::tuple<db::segment_id_type, uint64_t, bool>>;
 
 size_t partitions_in_memtables(replica::table& t) {
     size_t partitions = 0;
@@ -64,7 +106,7 @@ void with_a_held_closed_segment(cql_test_env& e, Func&& f) {
     auto* log = db.commitlog();
     BOOST_REQUIRE(log);
 
-    std::vector<std::tuple<db::segment_id_type, uint64_t, bool>> closed;
+    closed_segments closed;
     slot->fill([&closed](db::segment_id_type id, uint64_t used_size, bool failed) {
         closed.emplace_back(id, used_size, failed);
     });
@@ -76,14 +118,22 @@ void with_a_held_closed_segment(cql_test_env& e, Func&& f) {
     });
 
     e.execute_cql("create table ks.cf (pk int primary key, v int)").get();
-    e.execute_cql("insert into ks.cf (pk, v) values (1, 1)").get();
-    log->force_new_active_segment().get();
+    // Twice, so that a held id is not always the first segment the commitlog
+    // holds: a path lookup that ignores the id would answer with the wrong one.
+    for (int i = 0; i < 2; ++i) {
+        e.execute_cql(seastar::format("insert into ks.cf (pk, v) values ({}, {})", i, i)).get();
+        log->force_new_active_segment().get();
+    }
+    // One more write, so that the segment being written is held too, as it is
+    // on a node that takes writes: the hold starts with the first write to it.
+    e.execute_cql("insert into ks.cf (pk, v) values (2, 2)").get();
 
-    BOOST_REQUIRE_EQUAL(closed.size(), 1u);
-    const auto [id, used_size, failed] = closed.at(0);
-    BOOST_REQUIRE(!failed);
-    BOOST_REQUIRE_GT(used_size, 0u);
-    f(*log, id, used_size);
+    BOOST_REQUIRE_EQUAL(closed.size(), 2u);
+    for (const auto& [id, used_size, failed] : closed) {
+        BOOST_REQUIRE(!failed);
+        BOOST_REQUIRE_GT(used_size, 0u);
+    }
+    f(*log, closed);
 }
 
 } // namespace
@@ -140,49 +190,136 @@ SEASTAR_TEST_CASE(test_a_node_without_pitr_holds_nothing) {
 }
 
 // What open_segment() hands an upload has to be that segment's own file, read
-// through a handle of the shipper's own.
+// through a handle of the shipper's own, for every held id and not just the
+// first one the commitlog holds.
 SEASTAR_TEST_CASE(test_the_hooks_open_the_held_segments_own_file) {
     return do_with_cql_env_thread(
             [](cql_test_env& e) {
-                db::pitr::pitr_shipper shipper(e.local_db().get_config());
-                shipper.start().get();
-                auto stop = seastar::defer([&shipper]() noexcept {
-                    shipper.stop().get();
-                });
+                with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
+                    with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
+                        auto hooks = db::pitr::make_segment_hooks(shipper, [&log](db::segment_id_type id) {
+                            return log.held_segment_path(id);
+                        });
+                        for (const auto& [id, used_size, failed] : closed) {
+                            const auto path = log.held_segment_path(id);
+                            BOOST_REQUIRE(path);
+                            // The name is what carries the id to a restore, so
+                            // it has to be this id's own name.
+                            BOOST_REQUIRE_MESSAGE(path->find(seastar::format("-{}.log", id)) != seastar::sstring::npos,
+                                    seastar::format("segment {} answered with {}", id, *path));
 
-                with_a_held_closed_segment(e, [&](db::commitlog& log, db::segment_id_type id, uint64_t used_size) {
-                    const auto path = log.held_segment_path(id);
-                    BOOST_REQUIRE(path);
-                    // The name is what carries the id to a restore.
-                    BOOST_REQUIRE(path->find(seastar::format("-{}.log", id)) != seastar::sstring::npos);
+                            auto f = hooks.open_segment(id).get();
+                            auto close_f = seastar::defer([&f]() noexcept {
+                                f.close().get();
+                            });
+                            BOOST_REQUIRE_GE(f.size().get(), used_size);
 
-                    auto hooks = db::pitr::make_segment_hooks(shipper, [&log](db::segment_id_type id) {
-                        return log.held_segment_path(id);
+                            // The same bytes the file holds, through a handle
+                            // this test opened itself: a hook pointing at
+                            // another segment's file would differ here.
+                            constexpr size_t read_size = 4096;
+                            auto through_the_hook = f.dma_read_exactly<char>(0, read_size).get();
+                            auto direct = seastar::open_file_dma(*path, seastar::open_flags::ro).get();
+                            auto close_direct = seastar::defer([&direct]() noexcept {
+                                direct.close().get();
+                            });
+                            auto expected = direct.dma_read_exactly<char>(0, read_size).get();
+                            BOOST_REQUIRE_EQUAL(through_the_hook.size(), expected.size());
+                            BOOST_REQUIRE(std::equal(through_the_hook.begin(), through_the_hook.end(), expected.begin()));
+                        }
+                        // An id this log does not hold has no file to ship,
+                        // whether it is above every held id or below them: a
+                        // lookup that answered with a neighbouring segment
+                        // would ship another segment's bytes under this name.
+                        BOOST_REQUIRE_THROW(hooks.open_segment(std::get<0>(closed.back()) + 1000).get(), std::runtime_error);
+                        BOOST_REQUIRE(!log.held_segment_path(std::get<0>(closed.front()) - 1));
+                        BOOST_REQUIRE_THROW(hooks.open_segment(std::get<0>(closed.front()) - 1).get(), std::runtime_error);
                     });
-                    auto f = hooks.open_segment(id).get();
-                    auto close_f = seastar::defer([&f]() noexcept {
-                        f.close().get();
-                    });
-                    BOOST_REQUIRE_GE(f.size().get(), used_size);
-
-                    // The same bytes the file holds, through a handle this test
-                    // opened itself: a hook pointing at another segment's file,
-                    // or at the start of the wrong one, would differ here.
-                    constexpr size_t read_size = 4096;
-                    auto through_the_hook = f.dma_read_exactly<char>(0, read_size).get();
-                    auto direct = seastar::open_file_dma(*path, seastar::open_flags::ro).get();
-                    auto close_direct = seastar::defer([&direct]() noexcept {
-                        direct.close().get();
-                    });
-                    auto expected = direct.dma_read_exactly<char>(0, read_size).get();
-                    BOOST_REQUIRE_EQUAL(through_the_hook.size(), expected.size());
-                    BOOST_REQUIRE(std::equal(through_the_hook.begin(), through_the_hook.end(), expected.begin()));
-
-                    // An id this log does not hold has no file to ship.
-                    BOOST_REQUIRE_THROW(hooks.open_segment(id + 1000).get(), std::runtime_error);
                 });
             },
             pitr_config());
+}
+
+// An endpoint the node was not configured with: shipping is off with a reason
+// naming the option, no chain is started, and the caller carries on.
+SEASTAR_TEST_CASE(test_an_unknown_endpoint_leaves_shipping_off) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                auto* log = e.local_db().commitlog();
+                BOOST_REQUIRE(log);
+                with_an_active_shipper(e, *log, [&](db::pitr::pitr_shipper& shipper) {
+                    db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), *log, utils::UUID_gen::get_time_UUID(), 1, [] {
+                        return make_ready_future<>();
+                    });
+
+                    BOOST_REQUIRE(shipper.state() == db::pitr::shipping_state::off_unknown_endpoint);
+                    BOOST_REQUIRE(!shipper.chain());
+                    BOOST_REQUIRE(shipper.break_reason().has_value());
+                    BOOST_REQUIRE(shipper.break_reason()->find("pitr_endpoint") != seastar::sstring::npos);
+                    // The reason has to be the endpoint being unknown, not some
+                    // other refusal that also names the option.
+                    BOOST_REQUIRE(shipper.break_reason()->find("object_storage_endpoints") != seastar::sstring::npos);
+                });
+            },
+            pitr_config(false));
+}
+
+// A configured endpoint: shipping starts with a chain of this shard's own, and
+// a segment's key is that chain's, under the segment's real file name.
+SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
+                    with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
+                        db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), 1, [] {
+                            return make_ready_future<>();
+                        });
+
+                        BOOST_REQUIRE(shipper.active());
+                        BOOST_REQUIRE(shipper.chain());
+                        BOOST_REQUIRE_EQUAL(shipper.chain()->shard, seastar::this_shard_id());
+                        BOOST_REQUIRE_EQUAL(shipper.chain()->prefix, e.local_db().get_config().pitr_prefix());
+
+                        // The key is this chain's, keeping the commitlog's own
+                        // file name rather than one a test made up.
+                        const auto id = std::get<0>(closed.front());
+                        const auto name = db::pitr::make_segment_hooks(shipper, [&log](db::segment_id_type id) {
+                            return log.held_segment_path(id);
+                        }).object_name_of(id);
+                        const auto expected = db::pitr::segment_object_key(*shipper.chain(), file_name_of(*log.held_segment_path(id)));
+                        BOOST_REQUIRE_EQUAL(std::string(name.object()), std::string(expected));
+                        BOOST_REQUIRE(name.object().find(seastar::format("-{}.log", id)) != std::string_view::npos);
+                    });
+                });
+            },
+            pitr_config(true));
+}
+
+// The floor is the newest segment the commitlog holds when shipping starts, not
+// the oldest: everything below it was written before the chain began.
+SEASTAR_TEST_CASE(test_the_chain_floor_is_the_newest_held_segment) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
+                    with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
+                        const auto held = log.held_segments();
+                        // The two that closed plus the one being written.
+                        BOOST_REQUIRE_EQUAL(held.size(), 3u);
+                        db::pitr::start_shipping_on_shard(shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), 1, [] {
+                            return make_ready_future<>();
+                        });
+
+                        BOOST_REQUIRE(shipper.chain_floor());
+                        BOOST_REQUIRE_EQUAL(*shipper.chain_floor(), held.back());
+                        // Every segment that closed before the chain is below
+                        // it, so each is released rather than shipped.
+                        for (const auto& [id, used_size, failed] : closed) {
+                            BOOST_REQUIRE_LT(id, *shipper.chain_floor());
+                        }
+                    });
+                });
+            },
+            pitr_config(true));
 }
 
 // The flush the wiring owes once shipping has started: without it a table

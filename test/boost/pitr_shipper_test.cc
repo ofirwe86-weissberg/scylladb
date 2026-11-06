@@ -2326,10 +2326,16 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_at_the_chain_floor_is_shipped) {
     probe.floor = 30;
     with_shipping(probe, [&](pitr_shipper& shipper) {
         constexpr size_t used = 4096;
-        for (auto id : {db::segment_id_type(30), db::segment_id_type(31)}) {
-            probe.paths[id] = make_segment_file(probe.dir, id, used);
-            shipper.segment_closed(id, used, false);
-        }
+        probe.paths[30] = make_segment_file(probe.dir, 30, used);
+        probe.paths[31] = make_segment_file(probe.dir, 31, used);
+        shipper.segment_closed(30, used, false);
+        shipper.segment_closed(31, used, false);
+        // Nothing has yielded since the closes, so a floor that released the
+        // segment at the floor shows here, rather than only as a wait that
+        // never finishes below.
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 2u);
+
         wait_until([&] {
             return shipper.segments_shipped() == 2;
         });
@@ -2579,6 +2585,27 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_an_unknown_endpoint_refuses_shipping) {
                    })
                     .get();
         });
+    });
+}
+
+// A configured endpoint whose client cannot be built: shipping is off with the
+// cause in the reason, and the node is left to carry on.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_store_client_that_cannot_be_built_refuses_shipping) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.note_cluster_size(1);
+        shipper.note_store_client_failed("endpoint http://localhost:9000 not found");
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_unknown_endpoint);
+        BOOST_REQUIRE(shipper.break_reason().has_value());
+        BOOST_REQUIRE(shipper.break_reason()->find("not found") != seastar::sstring::npos);
+        BOOST_REQUIRE(shipper.break_reason()->find("restart") != seastar::sstring::npos);
+        // Latched, and a close after it releases its hold at once.
+        shipper.note_cluster_size(1);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_unknown_endpoint);
+        shipper.segment_closed(45, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{45});
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
     });
 }
 

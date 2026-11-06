@@ -2775,47 +2775,18 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                             shipper.start_sealing(seal_pitr_segment, count_pitr_nodes);
                         })
                         .get();
-                // The store client, after the sealing: from here on a segment
-                // that closes is shipped rather than released again. The
-                // endpoint has to be one the node was configured with, and a
-                // mistyped option turns shipping off rather than failing the
-                // boot. One boot epoch for the whole node, so that every
-                // shard's chain key names this boot.
-                const auto& pitr_endpoint = cfg->pitr_endpoint();
+                // The store client, after the sealing: from here on a closed
+                // segment is shipped. One boot epoch per node, so that every
+                // shard's chain names this boot.
                 const auto pitr_boot_epoch_us = api::new_timestamp();
-                const bool pitr_endpoint_known = !pitr_endpoint.empty() && sstm.local().is_known_endpoint(pitr_endpoint);
                 pitr_shipper
                         .invoke_on_all([&](db::pitr::pitr_shipper& shipper) {
-                            if (!shipper.active()) {
-                                return;
-                            }
-                            if (!pitr_endpoint_known) {
-                                shipper.note_endpoint_unknown();
-                                return;
-                            }
                             auto* log = db.local().commitlog();
                             if (!log) {
-                                // A guard, not a case: shipping is active only
-                                // where the commitlog holds segments.
+                                // A guard: shipping is active only where it holds.
                                 return;
                             }
-                            auto held = log->held_segments();
-                            shipper.start_shipping(sstm.local().get_endpoint_client(pitr_endpoint),
-                                    db::pitr::make_segment_hooks(shipper,
-                                            [log](db::segment_id_type id) {
-                                                return log->held_segment_path(id);
-                                            }),
-                                    db::pitr::chain_origin{
-                                            .host_id = host_id.id,
-                                            .boot_epoch_us = pitr_boot_epoch_us,
-                                            // held_segments() is in creation
-                                            // order, so the last one is the
-                                            // newest: the chain's floor.
-                                            .floor = held.empty() ? std::optional<db::segment_id_type>() : std::optional<db::segment_id_type>(held.back()),
-                                    });
-                            // A table nothing writes to again would keep a
-                            // later backup's bound below this chain's start.
-                            shipper.flush_after_start([&db] {
+                            db::pitr::start_shipping_on_shard(shipper, sstm.local(), *log, host_id.id, pitr_boot_epoch_us, [&db] {
                                 return db.local().flush_all_memtables();
                             });
                         })
