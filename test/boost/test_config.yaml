@@ -66,6 +66,9 @@ custom_args:
         - '-c2 -m2G'
     table_streaming_reader_test:
         - '-c1 -m2G'
+    # One shard: the hold is per shard, and the wiring is the same on each.
+    pitr_shipper_wiring_test:
+        - '-c1 -m2G'
 run_in_debug:
     - logalloc_standard_allocator_segment_pool_backend_test
 # Tests skipped in debug/sanitize modes because they use many iterations

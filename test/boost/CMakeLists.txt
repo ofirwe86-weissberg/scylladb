@@ -227,6 +227,8 @@ add_scylla_test(pitr_segment_upload_test
   KIND SEASTAR)
 add_scylla_test(pitr_shipper_test
   KIND SEASTAR)
+add_scylla_test(pitr_shipper_wiring_test
+  KIND SEASTAR)
 add_scylla_test(pitr_t_filter_test
   KIND SEASTAR)
 add_scylla_test(pitr_t_parser_test
