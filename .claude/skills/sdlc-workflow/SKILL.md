@@ -9,7 +9,7 @@ This skill defines how the subagents in `.claude/agents/` work together on one t
 
 ## Process
 
-1. **Scope the ticket.** Read the GitHub issue (`gh issue view <n> --comments`). If acceptance criteria are missing or contradictory, either ask a clarifying question (if a human is available) or proceed with a best-effort interpretation and state it clearly in the PR description — never invent scope silently. If the issue touches a surface listed under "Out of scope for agents" in `CLAUDE.md`, stop and say so unless the issue explicitly scopes it.
+1. **Scope the ticket.** Read the GitHub issue (`gh issue view <n> --comments`). If acceptance criteria are missing or contradictory, either ask a clarifying question (if a human is available) or proceed with a best-effort interpretation and state it clearly in the PR description — never invent scope silently. If the issue touches a surface listed under "Out of scope for agents" in `CLAUDE.md`, stop and say so unless the issue explicitly scopes it. Read its level label, `team:full` or `team:light` ("Team level per task" in `CLAUDE.md`). If it has none, ask the human before starting. If the work turns out riskier than its label, raise it to full and say so in the issue. Never lower a level yourself.
 
 2. **Delegate to `implementer`.** Hand it the issue number and point it at `CLAUDE.md`. Wait for its summary and pushed branch.
 
@@ -27,7 +27,7 @@ This skill defines how the subagents in `.claude/agents/` work together on one t
 
 5. **Verify the pushed head, then open the PR.** Before opening, confirm the worktree's `HEAD` equals `origin/<branch>` — resumed agents sometimes leave fixes committed but unpushed, or on a detached HEAD. Never merge. The PR description includes: what the issue asked for, what was built, which build modes/targets and tests were actually run, scope deliberately excluded, the QA verdict and any non-blocking nits, the architect-check result if it ran, and `Fixes #<n>` (or the project's equivalent).
 
-6. **Delegate to `pr-reviewer`** — a cold read of the PR now that it is open. It must be a *different agent instance* from the implementer and from the `reviewer-qa` that negotiated fixes, because by then `reviewer-qa` is reviewing a solution it co-authored.
+6. **At `team:light`, skip this step:** check yourself that the PR description's claims are true (tests run, results, what's not done), and say so in a signed PR comment. **At `team:full`, delegate to `pr-reviewer`** — a cold read of the PR now that it is open. It must be a *different agent instance* from the implementer and from the `reviewer-qa` that negotiated fixes, because by then `reviewer-qa` is reviewing a solution it co-authored.
 
    Give it the PR number and the issue number and nothing else — no summaries, no prior verdicts. One `pr-reviewer` instance per PR. It posts its verdict as a GitHub review.
    - **Request changes**: send the items back to `implementer`, push the fix, re-run `pr-reviewer`.

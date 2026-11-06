@@ -1,6 +1,6 @@
 # SDLC workflow
 
-Moved from `CLAUDE.md`, which keeps a summary. During the PITR assignment, the process cuts P1-P4 in `docs-work/implementation-plan.md` ("Estimate and corner cuts") override this file until 2026-11-09.
+Moved from `CLAUDE.md`, which keeps a summary. This file describes the `team:full` level. A `team:light` task follows the lighter column of "Team level per task" in `CLAUDE.md`.
 
 A team of subagents in `.claude/agents/` takes work from request to reviewed PR. Skills in `.claude/skills/` orchestrate them. Use `/tl-intake` to turn a request into an issue and `/sdlc-workflow` to take an issue to a PR.
 

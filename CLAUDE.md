@@ -7,8 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 See `docs-work/assignment.md`, and `docs-work/handoff.md` for the current state. `docs-work/` is in the main checkout only, not in worktrees, so use its absolute path there.
 
 - **Scope:** a home assignment meant for 2-3 days, deadline 2026-11-09. Build the minimum that gives a correct restore of one table to time T, or a clear refusal. Everything else becomes a stated limit or future work in the README. The one exception is anything whose absence would give a silently wrong restore: that stays.
-- **Process until 2026-11-09:** the process cuts P1-P4 in `docs-work/implementation-plan.md` ("Estimate and corner cuts") override "SDLC workflow" and `docs/agents/sdlc-workflow.md`. pr-reviewer runs only on the risky PRs, PRs go up to ~400 product lines (ceiling 500), there's one stack merged in batches, and the documents stay frozen unless an issue means silent wrong data.
-- **Test repeats for PITR:** 5 of 5 (`--repeat 5 --max-failures 1`) is the bar. The 100-of-100 runs in "Development rules" and `.github/copilot-instructions.md` are future work for this assignment.
+- **Team level:** every task runs at the level its label gives (see "Team level per task"). The process cuts P1-P4 in `docs-work/implementation-plan.md` ("Estimate and corner cuts") are the light level. The PRs P1 names as risky (#12, #15 and the `replay_to(T)` endpoint) are full. The documents stay frozen unless an issue means silent wrong data.
 
 ## Repo
 
@@ -84,7 +83,7 @@ Test suites: `boost`/`unit`/`raft` (C++), `cqlpy` and `alternator` (single-node 
 - Logging: `seastar::logger` per subsystem, structured, never log credentials/PII.
 - Commit messages: `module: imperative summary` (e.g. `sstables: close file-descriptor on error`; `tree:` for whole-tree changes); body explains why; reference issues (`Fixes #N`). Signed-off-by is not consistently used in recent history. Each commit must compile and pass tests (bisectable). See `docs/dev/review-checklist.md`.
 - New files: SPDX header with `LicenseRef-ScyllaDB-Source-Available-1.1`, current year for new files only.
-- Tests: every bug fix comes with a test that fails before and passes after, and cites the GitHub/JIRA issue. New tests must be stable (5 of 5 while developing, 100 of 100 after review, as in Development rules), fast, deterministic, and free of sleeps; reduce iterations in debug mode.
+- Tests: every bug fix comes with a test that fails before and passes after, and cites the GitHub/JIRA issue. New tests must be stable (5 of 5 while developing, and 100 of 100 after review at the full level, as in Development rules), fast, deterministic, and free of sleeps; reduce iterations in debug mode.
 - Question requests rather than implementing blindly; flag trade-offs.
 
 ## Development rules
@@ -101,7 +100,7 @@ These apply to all implementation and review on this project.
 **Tests are written with the code, not after it.**
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
 - Don't commit while a test fails, and ask the human if any test fails, even one that looks unrelated. Each commit holds a step's test and code together, so it compiles and passes.
-- New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and 100 of 100 only after review passes, before merge (not for PITR until 2026-11-09, see "Current task").
+- New tests run 5 of 5 (`--repeat 5 --max-failures 1`) while developing, and, at the full level, 100 of 100 after review passes, before merge (see "Team level per task").
 - While developing, build the task's own small test binary and run only relevant cases. Build composite binaries like `combined_tests` once per task, at the end.
 - Show that a test can fail: break the code on purpose, or record its failure before the fix. A test that has never failed proves nothing.
 - QA's tests are checked before and after: each is run without the change and must fail, then with the change and must pass, and both results go in the PR. Failing only because an endpoint doesn't exist isn't enough: the test must also catch wrong behaviour.
@@ -170,9 +169,34 @@ These apply to all implementation and review on this project.
 
 ## SDLC workflow
 
-Subagents in `.claude/agents/` (`product-manager`, `tester`, `implementer`, `architect-check`, `reviewer-qa`, `pr-reviewer`) take work from request to reviewed PR, orchestrated by `/tl-intake` (request → issue) and `/sdlc-workflow` (issue → PR). The session acts as team lead. Roles, models, the feature-work order and PR rules: `docs/agents/sdlc-workflow.md`. **During the PITR assignment, P1-P4 override it** (see "Current task").
+Subagents in `.claude/agents/` (`product-manager`, `tester`, `implementer`, `architect-check`, `reviewer-qa`, `pr-reviewer`) take work from request to reviewed PR, orchestrated by `/tl-intake` (request → issue) and `/sdlc-workflow` (issue → PR). The session acts as team lead. Roles, models, the feature-work order and PR rules at the full level: `docs/agents/sdlc-workflow.md`.
 
-Flow: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. Rules that always hold:
+### Team level per task
+
+Every task issue carries one level label, `team:full` or `team:light`. `tl-intake` proposes it in the issue with a one-line reason, and the human confirms it along with the issue. `sdlc-workflow` reads the label before starting and asks if it's missing.
+
+**`team:full`** applies if any of these is true:
+- the change is structural (see "Architecture constraints"): a format, RPC, public API or config change, a feature flag, threading or sharding, or a dependency;
+- it changes concurrency, lifetimes, shutdown or drain, cross-shard work, or code whose worst-case input could stall;
+- a bug in it could give silently wrong data, for example restore correctness, tombstones, the replay bound or the chain checks;
+- it touches an "Out of scope for agents" area that the ticket explicitly scopes;
+- it is new user-visible behaviour that needs requirements, or its design isn't settled;
+- it is expected to exceed ~300 product lines.
+
+**`team:light`** is everything else: a confined change to a settled design, such as a refusal check, a parser, wiring of a reviewed design, tests, docs or tooling.
+
+When in doubt, use full. Anyone (the team lead, `reviewer-qa`, `architect-check`) can raise a task to full when the work shows risk: a lifetime question, a possible stall, or an overrun of its time box. Lowering a level needs the human.
+
+| | `team:full` | `team:light` |
+|---|---|---|
+| Requirements | `product-manager` first, for feature work and product decisions | `product-manager` only if user-visible text changes |
+| Test plan | `tester` plan before code, for feature work | Tests written with the code |
+| Review | `implementer` → `architect-check` if structural → `reviewer-qa` → PR → `pr-reviewer` | `implementer` → `reviewer-qa` → PR; the team lead checks the description's claims instead of `pr-reviewer` |
+| PR size | 100-300 product lines, ceiling 500 | Up to ~400 product lines, ceiling 500 |
+| Sequencing | Each PR reviewed before the next starts | May overlap; stacked, merged in batches |
+| Test repeats | 5 of 5 while developing, 100 of 100 before merge | 5 of 5 |
+
+Flow at the full level: intake → implement → architect-check *if structural* → reviewer-qa → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
 - **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
 - **One commit and one PR per task,** on its own branch, with the PR title starting with the task ID. Dependent PRs stack on the previous task's branch.
 - **Every code-writing agent is launched with the Agent tool's `isolation: "worktree"`**, and checks out a real feature branch (`fix/<issue>-<slug>`) inside it before editing.
