@@ -1046,9 +1046,211 @@ SEASTAR_TEST_CASE(test_split_write_survives_a_floor_just_below_its_first_fragmen
     BOOST_REQUIRE_EQUAL(stats.dropped_at_or_below_truncate_floor, 0u);
 }
 
+// A list that ends inside a split write delivers nothing of it and still
+// succeeds: the write is counted as not verified, with the position to pick an
+// earlier T from (#17, decision P22).
+SEASTAR_TEST_CASE(test_a_split_write_missing_its_tail_is_counted_not_refused) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        rp = co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id(), rp);
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+    // The history ends at a break: every segment but the one the tail landed in.
+    params.segments.pop_back();
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.entries_replayed, 0u);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 1u);
+    BOOST_REQUIRE_EQUAL(to_str({stats.earliest_incomplete_split_write}), to_str({rp}));
+}
+
+// The same write with its last segment in the list is restored, and nothing is
+// left pending: the count must not fire on a write the history holds whole.
+SEASTAR_TEST_CASE(test_a_complete_split_write_counts_nothing_incomplete) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        rp = co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id(), rp);
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE_EQUAL(to_str(c.positions), to_str(std::vector<replay_position>{rp}));
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
+    BOOST_REQUIRE_EQUAL(to_str({stats.earliest_incomplete_split_write}), to_str({replay_position()}));
+}
+
+// A bound inside a split write changes nothing about reassembly: the write is
+// put back together from the whole list and only then dropped by the bound, as
+// the reader's bound rule has it, so it is not an incomplete write.
+SEASTAR_TEST_CASE(test_a_bound_inside_a_split_write_counts_nothing_incomplete) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id());
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+    const commitlog::descriptor second(std::string(params.segments[1].path), prefix());
+    params.bound = replay_position(second.id, 0);
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.dropped_below_bound, 1u);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
+}
+
+// Two writes left incomplete, the first missing its head and the second its
+// tail. Only the second is counted: a write whose head the list does not hold
+// started before the list, so the backup holds it and the source cannot have
+// been waiting on it.
+SEASTAR_TEST_CASE(test_only_the_incomplete_split_write_whose_head_was_read_is_counted) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position second_rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        co_await write_mutation(log, s, make_mutation(s, "first", 4 * log.max_record_size()));
+        second_rp = co_await write_mutation(log, s, make_mutation(s, "second", 4 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id());
+    BOOST_REQUIRE_GE(params.segments.size(), 4u);
+    // Both ends cut off: the first write loses its head, the second its tail.
+    auto all = params.segments;
+    params.segments.clear();
+    for (size_t i = 1; i + 1 < all.size(); ++i) {
+        params.segments.push_back(all[i]);
+    }
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 1u);
+    BOOST_REQUIRE_EQUAL(to_str({stats.earliest_incomplete_split_write}), to_str({second_rp}));
+}
+
+// A list that starts inside a split write holds no head of it, so the write
+// began before the list and the backup already holds it: nothing is counted.
+SEASTAR_TEST_CASE(test_a_list_starting_with_a_split_writes_tail_counts_nothing) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id());
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+    // Everything but the segment the write's head landed in.
+    auto all = params.segments;
+    params.segments.clear();
+    for (size_t i = 1; i < all.size(); ++i) {
+        params.segments.push_back(all[i]);
+    }
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.entries_replayed, 0u);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
+}
+
+// A pending split write that a later entry follows was rolled back and never
+// acknowledged: an oversized write holds every request-controller permit, so its
+// fragments are contiguous and exclusive, and anything written above it means it
+// was abandoned. Nothing is counted.
+SEASTAR_TEST_CASE(test_a_pending_split_write_a_later_entry_follows_counts_nothing) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position small_rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+        // The small entry in a segment of its own, above every fragment.
+        co_await log.force_new_active_segment();
+        small_rp = co_await write_mutation(log, s, make_mutation(s, "small", 16));
+    });
+    auto params = co_await params_for(dir, s->id());
+    // Drop the segment the tail landed in, which is the last one below the
+    // segment the small entry opened, and keep the small entry above the break.
+    std::optional<size_t> tail;
+    for (size_t i = 0; i < params.segments.size(); ++i) {
+        const commitlog::descriptor d(std::string(params.segments[i].path), prefix());
+        if (d.id < small_rp.id) {
+            tail = i;
+        }
+    }
+    BOOST_REQUIRE(tail);
+    BOOST_REQUIRE_GT(*tail, 0u);
+    auto all = params.segments;
+    params.segments.clear();
+    for (size_t i = 0; i < all.size(); ++i) {
+        if (i != *tail) {
+            params.segments.push_back(all[i]);
+        }
+    }
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE_EQUAL(to_str(c.positions), to_str(std::vector<replay_position>{small_rp}));
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
+}
+
+// The count is of writes, not of fragments: a write with two fragments held
+// apart is one incomplete write.
+SEASTAR_TEST_CASE(test_an_incomplete_split_write_of_many_fragments_counts_one) {
+    tmpdir tmp;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        rp = co_await write_mutation(log, s, make_mutation(s, "big", 8 * log.max_record_size()));
+    });
+    auto params = co_await params_for(dir, s->id());
+    // Fragments that touch are joined as they arrive, so the second segment is
+    // left out: the first and third fragments stay two.
+    BOOST_REQUIRE_GE(params.segments.size(), 4u);
+    auto first = params.segments[0];
+    auto third = params.segments[2];
+    params.segments.clear();
+    params.segments.push_back(std::move(first));
+    params.segments.push_back(std::move(third));
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 1u);
+    BOOST_REQUIRE_EQUAL(to_str({stats.earliest_incomplete_split_write}), to_str({rp}));
+}
+
 // A segment holding only the middle of a split write has no entry to complete:
-// the fragments are read and contribute nothing, and that is not a failure.
-// Detecting the write that never completes is a later PR of #17.
+// the fragments are read and contribute nothing, and that is not a failure. The
+// write is not counted either, since its head is not in the list (#17, P22).
 SEASTAR_TEST_CASE(test_middle_segment_of_a_split_write_delivers_nothing) {
     tmpdir tmp;
     auto dir = sstring(tmp.path().string());
@@ -1069,6 +1271,7 @@ SEASTAR_TEST_CASE(test_middle_segment_of_a_split_write_delivers_nothing) {
     BOOST_REQUIRE(c.positions.empty());
     BOOST_REQUIRE_EQUAL(stats.segments_read, 1u);
     BOOST_REQUIRE_EQUAL(stats.entries_replayed, 0u);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
 }
 
 // Normal replay counts a corrupt stretch and carries on. Restore cannot: the
