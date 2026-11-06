@@ -168,6 +168,10 @@ namespace view {
 class view_update_generator;
 }
 
+namespace pitr {
+class segment_closed_slot;
+}
+
 }
 
 namespace qos {
@@ -1840,6 +1844,11 @@ private:
     // By pointer, so that rehashing does not move keyspaces: tables link to theirs by address.
     flat_hash_map<sstring, std::unique_ptr<keyspace>> _keyspaces;
     tables_metadata _tables_metadata;
+    // Where the main commitlog's close notification for a held segment goes.
+    // Only set when the commitlog holds its segments for point-in-time
+    // recovery; declared ahead of the commitlog, so that a close reported while
+    // the commitlog is destroyed still finds it (issue #8).
+    std::unique_ptr<db::pitr::segment_closed_slot> _pitr_segment_closed;
     std::unique_ptr<db::commitlog> _commitlog;
     std::unique_ptr<db::commitlog> _schema_commitlog;
     utils::updateable_value_source<table_schema_version> _version;
@@ -2008,6 +2017,13 @@ public:
     }
     db::commitlog* schema_commitlog() const {
         return _schema_commitlog.get();
+    }
+    // The slot the main commitlog's close notifications for held segments go
+    // through, or nullptr when no hold is taken and nothing is reported to
+    // release. The wiring fills it once the shipper can take closes, and
+    // clears it before the shipper stops.
+    db::pitr::segment_closed_slot* pitr_segment_closed_slot() const {
+        return _pitr_segment_closed.get();
     }
     replica::cf_stats* cf_stats() {
         return &_cf_stats;

@@ -88,6 +88,43 @@ std::expected<shipper_config, shipping_state> make_shipper_config(const db::conf
     };
 }
 
+bool should_hold_segments(const db::config& cfg) {
+    return make_shipper_config(cfg).has_value() && !commitlog_disabled_for_user_tables(cfg.enable_commitlog(), cfg.enable_in_memory_data_store());
+}
+
+segment_closed_slot::segment_closed_slot(release_hook release)
+    : _release(std::move(release)) {
+    if (!_release) {
+        seastar::on_internal_error(pitr_logger, "a segment_closed slot needs a release hook");
+    }
+}
+
+void segment_closed_slot::fill(handler h) {
+    if (!h) {
+        seastar::on_internal_error(pitr_logger, "an empty handler cannot fill the segment_closed slot");
+        return;
+    }
+    _handler = std::move(h);
+}
+
+void segment_closed_slot::clear() noexcept {
+    _handler = nullptr;
+}
+
+void segment_closed_slot::segment_closed(db::segment_id_type id, uint64_t used_size, bool failed) {
+    if (_handler) {
+        _handler(id, used_size, failed);
+        return;
+    }
+    if (failed) {
+        // The commitlog has dropped the hold itself, so there is nothing to
+        // release and nothing that could be shipped.
+        return;
+    }
+    pitr_logger.debug("No consumer for the close of segment {}, releasing its hold", id);
+    _release(id);
+}
+
 pitr_shipper::pitr_shipper(const db::config& cfg) noexcept
     : _cfg(cfg)
     , _seal_timer([this] {
@@ -163,12 +200,20 @@ future<> pitr_shipper::stop() {
     return when_all_succeed(_seal_gate.close(), std::move(uploads_closed)).discard_result();
 }
 
+void pitr_shipper::set_release_hook(release_hook hook) {
+    if (!hook) {
+        seastar::on_internal_error(pitr_logger, "set_release_hook() needs a hook");
+        return;
+    }
+    _release_hold = std::move(hook);
+}
+
 void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks) {
     if (!active() || _client || _upload_gate.is_closed()) {
         return;
     }
-    if (!client || !hooks.open_segment || !hooks.object_name_of || !hooks.release_segment) {
-        seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client and all three hooks");
+    if (!client || !hooks.open_segment || !hooks.object_name_of || !_release_hold) {
+        seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client, both hooks and the release hook");
         return;
     }
     _client = std::move(client);
@@ -177,8 +222,13 @@ void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_c
 
 void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bool failed) {
     if (!_client) {
-        // start_shipping() has not run, so hold_segments is not set either and
-        // there is no hold to release.
+        // start_shipping() has not run, so nothing can be shipped yet. The
+        // hold, though, was taken when the commitlog was built: keeping it
+        // would pin the segment until the commitlog's disk filled up.
+        if (!failed && _release_hold) {
+            pitr_logger.debug("Not shipping segment {}: shipping has not started ({}), releasing its hold", id, _state);
+            _release_hold(id);
+        }
         return;
     }
     if (!active()) {
@@ -187,7 +237,7 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         // failed close has no hold left to release.
         if (!failed) {
             pitr_logger.debug("Not shipping segment {}: shipping is off ({}), releasing its hold", id, _state);
-            _hooks.release_segment(id);
+            _release_hold(id);
         }
         return;
     }
@@ -215,7 +265,7 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         // A forced seal leaves segments with nothing in them, and an empty
         // object would describe a segment that holds no writes.
         pitr_logger.debug("Segment {} closed with no used bytes, releasing its hold", id);
-        _hooks.release_segment(id);
+        _release_hold(id);
         return;
     }
     if (_upload_gate.is_closed()) {
@@ -268,7 +318,7 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
         break_shipping(shipping_state::off_upload_failed,
                 fmt::format(
                         "upload_failed: uploading segment {} failed in a way no retry can fix ({}). Fix the cause and restart the node to ship again", id, ex));
-        _hooks.release_segment(id);
+        _release_hold(id);
         co_return;
     }
     // The abort can land in the gap between the upload returning and this
@@ -281,7 +331,7 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
         co_return;
     }
     ++_segments_shipped;
-    _hooks.release_segment(id);
+    _release_hold(id);
     pitr_logger.debug("Shipped segment {} ({} bytes) and released its hold", id, used_size);
 }
 
@@ -291,7 +341,7 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
 void pitr_shipper::note_upload_aborted(db::segment_id_type id) {
     if (!active() && !_upload_gate.is_closed()) {
         pitr_logger.info("Upload of segment {} was aborted by the break, releasing its hold", id);
-        _hooks.release_segment(id);
+        _release_hold(id);
         return;
     }
     pitr_logger.info("Upload of segment {} was aborted, its hold is kept", id);

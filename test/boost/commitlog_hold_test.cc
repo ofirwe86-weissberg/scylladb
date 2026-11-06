@@ -34,6 +34,7 @@
 #include "db/commitlog/rp_set.hh"
 #include "db/config.hh"
 #include "db/extensions.hh"
+#include "db/pitr/pitr_shipper.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
 #include "utils/error_injection.hh"
@@ -616,6 +617,38 @@ SEASTAR_TEST_CASE(test_held_bytes_counts_whole_held_files) {
         log.release_segment(second.id);
         co_await log.wait_for_pending_deletes();
         BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
+    });
+}
+
+// The slot db/pitr puts between the commitlog and its shipper. With nothing
+// filled in - which is the node from the moment the commitlog exists until the
+// shipper can take closes, and again during the shutdown - a closed segment's
+// hold has to go at once, or it would pin the commitlog until its disk filled
+// up (issue #8).
+SEASTAR_TEST_CASE(test_an_empty_slot_releases_a_closed_segments_hold) {
+    // The release hook reaches the commitlog the slot was built for, which
+    // with_log() creates below; it is called from a close, so never before.
+    commitlog* held_log = nullptr;
+    db::pitr::segment_closed_slot slot([&held_log](segment_id_type id) {
+        held_log->release_segment(id);
+    });
+    auto cfg = hold_config();
+    cfg.segment_closed = [&slot](segment_id_type id, uint64_t used_size, bool failed) {
+        slot.segment_closed(id, used_size, failed);
+    };
+
+    co_await with_log(std::move(cfg), [&held_log](commitlog& log) -> future<> {
+        held_log = &log;
+        auto uuid = make_table_id();
+        auto sealed = co_await write_and_seal(log, uuid);
+        co_await log.wait_for_pending_deletes();
+
+        BOOST_REQUIRE_EQUAL(log.held_bytes(), 0u);
+        auto held = log.held_segments();
+        BOOST_REQUIRE(std::ranges::find(held, sealed.id) == held.end());
+        // Nothing holds the replay floor back any more, which is the commitlog
+        // behaving as it does without the hold.
+        BOOST_REQUIRE_GT(log.min_position().id, sealed.id);
     });
 }
 

@@ -2413,6 +2413,37 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 pitr_shipper.stop().get();
             });
             pitr_shipper.invoke_on_all(&db::pitr::pitr_shipper::start).get();
+            // The commitlog's hold was decided when it was built, so segments
+            // may already be held with nothing to ship them: from here on every
+            // close reaches the shipper, which releases such a hold at once
+            // until start_shipping() runs (#8).
+            pitr_shipper
+                    .invoke_on_all([&db](db::pitr::pitr_shipper& shipper) {
+                        auto* slot = db.local().pitr_segment_closed_slot();
+                        if (!slot) {
+                            // No hold is taken on this node, so no close
+                            // reports one and there is nothing to release.
+                            return;
+                        }
+                        auto* log = db.local().commitlog();
+                        shipper.set_release_hook([log](db::segment_id_type id) {
+                            log->release_segment(id);
+                        });
+                        slot->fill([&shipper](db::segment_id_type id, uint64_t used_size, bool failed) {
+                            shipper.segment_closed(id, used_size, failed);
+                        });
+                    })
+                    .get();
+            // Declared after stop_pitr_shipper, so it runs before it: a close
+            // reported during the shutdown must not reach a shipper that is
+            // stopping, and the slot releases such a hold itself.
+            auto clear_pitr_segment_closed = defer_verbose_shutdown("point-in-time recovery close handler", [&db] {
+                db.invoke_on_all([](replica::database& db) {
+                      if (auto* slot = db.pitr_segment_closed_slot()) {
+                          slot->clear();
+                      }
+                  }).get();
+            });
 
             checkpoint(stop_signal, "starting column family API");
             api::set_server_column_family(ctx, db).get();

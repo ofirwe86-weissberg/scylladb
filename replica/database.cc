@@ -36,6 +36,7 @@
 #include "db/system_distributed_keyspace.hh"
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "db/pitr/pitr_shipper.hh"
 #include "audit/audit.hh"
 #include "db/extensions.hh"
 #include "cql3/functions/functions.hh"
@@ -967,6 +968,21 @@ database::init_commitlog() {
     // an older version would leave unreadable commitlog segments on disk.
     if (_cfg.check_experimental(db::experimental_features_t::feature::STRONGLY_CONSISTENT_TABLES)) {
         config.descriptor_tag = detail::variant_format_tag;
+    }
+    if (db::pitr::should_hold_segments(_cfg)) {
+        // The hold cannot be turned on later, so it is taken before the shipper
+        // exists: every close is reported through the slot, which releases the
+        // hold itself until the shipper fills it (issue #8). Only the main
+        // commitlog is held; the schema commitlog is not shipped.
+        _pitr_segment_closed = std::make_unique<db::pitr::segment_closed_slot>([this](db::segment_id_type id) {
+            // Reached only from a close, which cannot happen before
+            // create_commitlog() below has returned.
+            _commitlog->release_segment(id);
+        });
+        config.hold_segments = true;
+        config.segment_closed = [this](db::segment_id_type id, uint64_t used_size, bool failed) {
+            _pitr_segment_closed->segment_closed(id, used_size, failed);
+        };
     }
     return db::commitlog::create_commitlog(config).then([this](db::commitlog&& log) {
         _commitlog = std::make_unique<db::commitlog>(std::move(log));

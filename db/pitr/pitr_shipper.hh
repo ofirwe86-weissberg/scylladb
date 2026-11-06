@@ -122,8 +122,28 @@ struct shipper_config {
 // they do not describe a usable store. Does no I/O and cannot block.
 std::expected<shipper_config, shipping_state> make_shipper_config(const db::config&);
 
+// Whether the commitlog must hold its closed segments from deletion, which is
+// what the wiring sets commitlog::config::hold_segments from. The hold is taken
+// only when the options describe a usable store and the node's user tables
+// write to the commitlog at all; anything else leaves the commitlog exactly as
+// it was before PITR existed.
+//
+// The hold is decided when the commitlog is built, long before shipping can
+// start, so a hold may be taken for a chain that never begins: the hold's
+// consumer releases such a segment as soon as its close is reported (issue #8).
+bool should_hold_segments(const db::config&);
+
+// Releases the commitlog's hold on one segment whose close was reported. Called
+// from inside the close, so it must neither block nor throw. It must also
+// tolerate a segment the commitlog has already dropped, which a rollback that
+// reported it leaves behind: commitlog::release_segment() of an id that is not
+// held is a no-op.
+using release_hook = std::function<void(db::segment_id_type)>;
+
 // Everything shipping a segment needs that only the wiring knows, so that this
-// unit needs no commitlog of its own. All three are required together.
+// unit needs no commitlog of its own. Both are required together. The hook that
+// releases a hold is not here: it is installed on its own, because holds exist
+// before there is anything to ship with (see set_release_hook()).
 struct segment_hooks {
     // Opens a handle dedicated to one upload attempt, by the rules stated for
     // `f` in segment_upload.hh. Called once per attempt, so a retry never
@@ -132,12 +152,44 @@ struct segment_hooks {
     // Where a segment's bytes are stored. Must keep the segment's own file
     // name, which a restore matches against the prefix.
     std::function<sstables::object_name(db::segment_id_type)> object_name_of;
-    // Releases the commitlog's hold on a segment whose close was reported.
-    // Called from a continuation, so it must neither block nor throw. It must
-    // also tolerate a segment the commitlog has already dropped, which a break
-    // can reach after a rollback reported it: commitlog::release_segment() of
-    // an id that is not held is a no-op.
-    std::function<void(db::segment_id_type)> release_segment;
+};
+
+// Where the commitlog's close notification goes, one per shard. The wiring
+// fills it once the shipper is ready to take closes and clears it before the
+// shipper stops; while it is empty - at startup, or during shutdown - a
+// non-failed close releases its hold straight away, because the commitlog's
+// hold is decided before the shipper exists and nothing else would ever drop
+// it (issue #8).
+//
+// It is not the shipper's member: the slot has to answer closes on both sides
+// of the shipper's own lifetime.
+class segment_closed_slot {
+public:
+    using handler = std::function<void(db::segment_id_type id, uint64_t used_size, bool failed)>;
+
+private:
+    release_hook _release;
+    handler _handler;
+
+public:
+    // `release` is what a close that finds the slot empty falls back to, so it
+    // must stay usable for as long as the slot is: in the wiring it is the
+    // commitlog's own release_segment(), and the commitlog outlives the slot.
+    explicit segment_closed_slot(release_hook release);
+
+    // Replaces whatever the slot held.
+    void fill(handler h);
+    void clear() noexcept;
+
+    bool filled() const noexcept {
+        return bool(_handler);
+    }
+
+    // The commitlog's close notification, by the contract stated for
+    // commitlog::config::segment_closed: it runs inside the close, so it must
+    // not block. A `failed` close releases nothing, on either path: the
+    // commitlog has dropped that hold itself.
+    void segment_closed(db::segment_id_type id, uint64_t used_size, bool failed);
 };
 
 // Ships sealed commitlog segments to object storage, one instance per shard.
@@ -208,6 +260,7 @@ private:
     // Held, not referenced: an upload outlives the caller that handed the
     // client over, and the store client must outlive its sinks.
     seastar::shared_ptr<sstables::object_storage_client> _client;
+    release_hook _release_hold;
     segment_hooks _hooks;
     segment_upload_limiter _uploads;
     seastar::gate _upload_gate;
@@ -246,11 +299,17 @@ public:
     // deletes the held segments anyway. Safe without a preceding start().
     future<> stop();
 
-    // Installs the store client and the hooks uploads run with. Until it is
-    // called a reported close does nothing at all, so the wiring must not set
-    // the commitlog's hold_segments before this: a hold taken earlier would
-    // have nobody to release it. Takes effect only while shipping is active
-    // and before stop(), and a second call is ignored, as start_sealing()'s is.
+    // Installs the hook that drops the commitlog's hold on a segment. Apart
+    // from the store client, and before it: hold_segments is fixed when the
+    // commitlog is built, so holds exist well before shipping can start, and
+    // each one has to be released as soon as its close is reported until then.
+    // The hook must outlive the shipper's uploads, which stop() waits for.
+    void set_release_hook(release_hook hook);
+
+    // Installs the store client and the hooks uploads run with. Needs the
+    // release hook already installed, since every shipped segment's hold goes
+    // through it. Takes effect only while shipping is active and before stop(),
+    // and a second call is ignored, as start_sealing()'s is.
     void start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks);
 
     // The commitlog's close notification for a held segment, which runs inside
@@ -258,6 +317,12 @@ public:
     // background and returns. `used_size` is the bytes a replay would read,
     // and `failed` means the segment must not be shipped, in which case the
     // commitlog has already dropped the hold.
+    //
+    // Until start_shipping() there is nothing to ship with, so a non-failed
+    // close releases its hold at once, whatever the shipper is waiting for:
+    // the hold was taken when the commitlog was built and nothing else would
+    // drop it. It needs set_release_hook() to have run; without it the close
+    // is ignored, which is what a node with no hold reports.
     //
     // A `used_size` of 0 is not uploaded - an empty object would describe a
     // segment that holds nothing - and its hold is released at once. The hold
