@@ -48,10 +48,12 @@ target_sources(db
     snapshot/cluster_backup.cc
     rate_limiter.cc
     per_partition_rate_limit_options.cc
+    pitr/apply_to_target.cc
     pitr/ledger_entry.cc
     pitr/ledger_writer.cc
     pitr/pitr_shipper.cc
     pitr/refusal.cc
+    pitr/replay_reader.cc
     pitr/segment_upload.cc
     pitr/t_filter.cc
     pitr/t_parser.cc
