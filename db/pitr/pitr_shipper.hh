@@ -29,6 +29,12 @@ class config;
 
 }
 
+namespace service {
+
+struct topology;
+
+}
+
 namespace db::pitr {
 
 extern seastar::logger pitr_logger;
@@ -37,6 +43,31 @@ extern seastar::logger pitr_logger;
 // recovery point objective, so an interval of hours would promise protection
 // that the shipped chain does not give.
 constexpr std::chrono::seconds max_seal_interval = std::chrono::hours(1);
+
+// How many seal cycles in a row may fail to read the node count before
+// shipping breaks. A single unreadable count is not worth the user's
+// protection, but a chain nobody can vouch for as single-node must not keep
+// growing either. Ten is judgement rather than a measurement (issue #7).
+constexpr unsigned max_unreadable_count_cycles = 10;
+
+// Counts the nodes the cluster holds, as the topology state machine sees them:
+// the normal members, the ones a topology transition is moving, and the ones
+// waiting to be joined, which together cover a joining or zero-token node.
+// Nodes that have left are not counted, so a node whose only peer was removed
+// counts as one again (issue #7).
+//
+// This is the one count source: the startup check and every seal cycle use it,
+// or a node that once had a peer would pass startup and break shipping later.
+// Pure and constant-time, so it cannot stall, and the caller must read the
+// topology on shard 0, which is the only shard that loads it.
+size_t count_cluster_nodes(const service::topology&) noexcept;
+
+// Whether the node's user tables write to the commitlog, which is what the
+// shipped chain is made of. It mirrors the per-keyspace decision in
+// database::make_keyspace_config(): an in-memory data store writes no commitlog
+// either, whatever enable_commitlog says. The commitlog object itself exists
+// even then, so it cannot answer this (issue #7).
+bool commitlog_disabled_for_user_tables(bool enable_commitlog, bool enable_in_memory_data_store) noexcept;
 
 // Why the shipper is, or is not, shipping. Every reason is reported as is, so
 // that the status report (phase 1.2) can tell the user what to change.
@@ -50,6 +81,14 @@ enum class shipping_state {
     // The node counted anything but exactly one node, at startup or in a seal
     // cycle, which single-node PITR does not support.
     off_multi_node,
+    // The node count was unreadable for max_unreadable_count_cycles seal
+    // cycles in a row, so the chain can no longer be shown to be single-node.
+    // Reported to the user as node_count_unreadable.
+    off_node_count_unreadable,
+    // The commitlog is disabled, so there is nothing to seal and nothing to
+    // ship. Refused at startup rather than reported as shipping (P32's pattern
+    // for an encrypted commitlog).
+    off_commitlog_disabled,
     // Configured, waiting for the node's cluster membership to be counted.
     waiting_for_cluster_size,
     active,
@@ -89,11 +128,12 @@ public:
     // through the commitlog's close notification (segment_closed with
     // failed=true), which is where an unshippable segment is dealt with.
     using seal_function = seastar::noncopyable_function<future<>()>;
-    // The number of nodes the cluster holds in any state, none and left
-    // included. A future, because the real count is read on shard 0. It runs on
+    // The number of nodes the cluster holds, as count_cluster_nodes() counts
+    // them. A future, because the real count is read on shard 0. It runs on
     // every seal cycle, so it must be cheap. A count that could not be
     // established must fail the future: returning 0 is not "unknown", it is a
-    // count, and any count but one turns shipping off for good.
+    // count, and any count but one turns shipping off for good. A failed future
+    // keeps shipping on for max_unreadable_count_cycles cycles.
     using node_count_function = seastar::noncopyable_function<future<size_t>()>;
 
     // How the latest seal cycle ended, for the status report to read.
@@ -107,7 +147,8 @@ public:
         // from the commitlog's close notifications.
         sealed,
         // The node count could not be read: nothing was sealed, and shipping
-        // stays on.
+        // stays on until the run of failures reaches
+        // max_unreadable_count_cycles, which breaks it instead.
         count_failed,
         // The seal function failed. Recorded for the status report; the next
         // cycle does not repeat it, and a failed close is reported through
@@ -135,9 +176,13 @@ private:
     std::optional<sstring> _break_reason;
     cycle_outcome _last_outcome = cycle_outcome::none;
     std::optional<sstring> _last_failure;
+    // Seal cycles since the last one that read the node count. A successful
+    // read puts it back to zero, so only an unbroken run breaks shipping.
+    unsigned _unreadable_counts = 0;
 
     future<> seal_loop();
     future<> seal_cycle();
+    void break_shipping(shipping_state, sstring reason);
 
 public:
     explicit pitr_shipper(const db::config& cfg) noexcept;
@@ -202,12 +247,24 @@ public:
         return _last_failure;
     }
 
-    // Called on every shard once the node has joined, with the number of nodes
-    // the local topology holds. This is the startup check; the seal cycle
+    // How many seal cycles in a row have failed to read the node count. Zero
+    // whenever the latest cycle read it. The status report tells the user from
+    // the first failed cycle how much of the allowance is left.
+    unsigned unreadable_count_cycles() const noexcept {
+        return _unreadable_counts;
+    }
+
+    // Called on every shard once the node has joined, with the node count from
+    // count_cluster_nodes(). This is the startup check; the seal cycle
     // repeats it, so a node added later is noticed there. Anything but
     // exactly one node, a count of zero included, refuses shipping until the
     // next restart; the refusal does not undo itself if the count later drops.
     void note_cluster_size(size_t node_count);
+
+    // Called on every shard at startup, instead of note_cluster_size(), when
+    // the node runs without a commitlog: a cycle would seal nothing and still
+    // report active. Latched like every other refusal.
+    void note_commitlog_disabled();
 
     shipping_state state() const noexcept {
         return _state;
