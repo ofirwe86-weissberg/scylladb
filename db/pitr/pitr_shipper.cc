@@ -578,6 +578,22 @@ future<> pitr_shipper::record_entries() {
     while (active() && !_ledger_as.abort_requested() && !_pending.empty() && _pending.begin()->second.stored) {
         const auto id = _pending.begin()->first;
         const auto& pending = _pending.begin()->second;
+        // Closes are not ordered by id (commitlog.hh), so a segment below this
+        // one can be reported later and under a newer capture. Its entry still
+        // comes first, and claiming that capture here would leave the segments
+        // above it - which can hold writes from before it - outside a restore
+        // that stops at this entry. Every other pending segment is above this
+        // one, so the lowest capture among them is the most this entry may
+        // claim. The coverage cannot fall below the entry before it either:
+        // that entry was held down by this set too.
+        //
+        // One pass per entry over the pending segments, which the commitlog's
+        // hold limit bounds, and each pass is separated from the next by a
+        // store request.
+        auto coverage = pending.covered_through_us;
+        for (const auto& [above_id, above] : _pending) {
+            coverage = std::min(coverage, above.covered_through_us);
+        }
         // Copied out before the first suspension: the map can change while the
         // put is in flight.
         const segment_entry entry{
@@ -589,7 +605,7 @@ future<> pitr_shipper::record_entries() {
                 .used_size = pending.used_size,
                 .segment_crc32 = pending.crc32,
                 .upload_time_us = api::new_timestamp(),
-                .covered_through_us = pending.covered_through_us,
+                .covered_through_us = coverage,
                 .chain_start_us = _chain->chain_start_us,
                 .host_id = _chain->host_id,
                 .shard = _chain->shard,

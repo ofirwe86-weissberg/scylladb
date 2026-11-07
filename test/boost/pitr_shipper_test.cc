@@ -2707,6 +2707,84 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_rotation_while_a_seal_is_pending_carries_th
     });
 }
 
+// The coverage an entry carries is the capture its close was reported under,
+// not the one in force when the entry is written: a capture taken after the
+// close can cover a write that went into the segment above this one, and an
+// entry claiming it would leave that write outside a restore that stops here.
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_entry_keeps_the_capture_its_close_was_reported_under) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        const auto first = seals.run_a_cycle(shipper);
+        probe.paths[95] = make_segment_file(probe.dir, 95, used);
+        // Parked in its upload, so the next cycle's capture lands between the
+        // close and the entry being built.
+        probe.store.hold_object(segment_object(95));
+        shipper.segment_closed(95, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 1;
+        });
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+
+        probe.store.let_object_go(segment_object(95));
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+    });
+}
+
+// Closes are not ordered by id, so a lower segment can be reported after a
+// higher one and under a newer capture. Its entry comes first, and its coverage
+// is held down to what the segments above it carry: a restore that stopped at
+// it would otherwise miss writes the higher segment holds.
+SEASTAR_THREAD_TEST_CASE(test_pitr_coverage_never_passes_a_segment_still_to_be_recorded) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        const auto first = seals.run_a_cycle(shipper);
+        for (db::segment_id_type id : {96, 97}) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+            probe.store.hold_object(segment_object(id));
+        }
+        // 97 closed under the first capture; nothing is recorded yet, because
+        // its upload is parked.
+        shipper.segment_closed(97, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 1;
+        });
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+        // 96 is reported late, so it carries the newer capture.
+        shipper.segment_closed(96, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 2;
+        });
+
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 2u);
+        BOOST_REQUIRE_EQUAL(entries[0].segment_id, 96u);
+        BOOST_REQUIRE_EQUAL(entries[1].segment_id, 97u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+        BOOST_REQUIRE_EQUAL(entries[1].covered_through_us, first);
+        // Never backwards, whatever order the closes arrived in.
+        BOOST_REQUIRE_LE(entries[0].covered_through_us, entries[1].covered_through_us);
+    });
+}
+
 // The bytes are in the store and the entry is not: the hold has to stay, or a
 // restore would find a segment no entry names.
 SEASTAR_THREAD_TEST_CASE(test_pitr_a_hold_is_kept_while_the_entry_put_retries) {
