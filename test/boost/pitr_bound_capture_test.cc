@@ -132,15 +132,55 @@ SEASTAR_TEST_CASE(test_bound_is_never_above_a_write_a_concurrent_flush_left_out)
     });
 }
 
-// Nothing was ever written: the bound is still a real position, never the
-// default one, which replay refuses.
-SEASTAR_TEST_CASE(test_bound_is_a_real_position_with_an_empty_memtable) {
+// Nothing was ever written, so no sstable records a position and the capture
+// reports the default one. The snapshot replaces it with the lowest bound the
+// format accepts (lowest_safe_bound(), table.cc), because a table with nothing
+// flushed on this shard has no write that could sit below any bound. Before the
+// capture read the sstables this was min_position(), which answered a different
+// question (#103).
+SEASTAR_TEST_CASE(test_bound_is_the_default_position_with_nothing_flushed) {
     return do_with_cql_env_thread([](cql_test_env& e) {
         auto& t = create_test_table(e);
 
         auto capture = t.snapshot_sstables().get();
 
         BOOST_REQUIRE(capture.sstables.empty());
-        BOOST_REQUIRE_NE(capture.commitlog_bound.id, 0u);
+        // No operator<< for a position, so the comparison, not _EQUAL.
+        BOOST_REQUIRE(capture.commitlog_bound == db::replay_position());
+    });
+}
+
+// The rule itself: the bound is the highest commitlog position the snapshot's
+// own sstables record, and never a position read off the commitlog's segment
+// bookkeeping. Two flushes give two sstables, so the max over the list is what
+// must come back, and a write made after the capture must still be above it.
+SEASTAR_TEST_CASE(test_bound_is_the_highest_position_the_snapshots_sstables_record) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        auto& t = create_test_table(e);
+        insert_rows(e, 0, 2);
+        t.flush().get();
+        insert_rows(e, 10, 2);
+        t.flush().get();
+
+        db::replay_position bound, highest;
+        {
+            // In a scope of its own: the capture holds the sstable-list permit,
+            // which the flush below takes too, so keeping it would deadlock.
+            auto capture = t.snapshot_sstables().get();
+            BOOST_REQUIRE_GE(capture.sstables.size(), 2u);
+            bound = capture.commitlog_bound;
+            for (const auto& sst : capture.sstables) {
+                const auto& recorded = sst->get_stats_metadata().position;
+                if (sst->originated_on_this_node().value_or(false) && recorded.shard_id() == this_shard_id()) {
+                    highest = std::max(highest, recorded);
+                }
+            }
+        }
+        BOOST_REQUIRE(bound == highest);
+        // And the invariant the bound exists for: a write the snapshot does not
+        // hold is above it, so the replay still reaches it.
+        insert_rows(e, 100, 2);
+        t.flush().get();
+        BOOST_REQUIRE(bound < t.highest_flushed_replay_position());
     });
 }
