@@ -1444,6 +1444,8 @@ struct fake_store {
     unsigned entry_puts = 0;
     unsigned fail_first_entry_sinks = 0;
     std::optional<seastar::shared_promise<>> hold_entry_put;
+    size_t entry_sinks_open = 0;
+    size_t max_entry_sinks_open = 0;
     // Puts of one named object wait for their own promise, which is how one
     // segment's upload is parked while another finishes.
     std::unordered_map<std::string, seastar::shared_promise<>> holds;
@@ -1490,7 +1492,9 @@ public:
         , _as(as)
         , _is_entry(_store.is_entry(_name))
         , _index(_is_entry ? _store.entry_sinks_created++ : _store.sinks_created++) {
-        if (!_is_entry) {
+        if (_is_entry) {
+            _store.max_entry_sinks_open = std::max(_store.max_entry_sinks_open, ++_store.entry_sinks_open);
+        } else {
             _store.max_sinks_open = std::max(_store.max_sinks_open, ++_store.sinks_open);
         }
     }
@@ -1518,9 +1522,7 @@ public:
         return make_ready_future<>();
     }
     future<> close() override {
-        if (!_is_entry) {
-            --_store.sinks_open;
-        }
+        --(_is_entry ? _store.entry_sinks_open : _store.sinks_open);
         // GCS-style: the close is what finalizes, unless the upload was
         // aborted, in which case the sink abandons it.
         if (!_as || !_as->abort_requested()) {
@@ -2971,6 +2973,9 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_entries_are_written_in_segment_id_order) {
         BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == (std::vector<db::segment_id_type>{50, 51, 52}));
         // A hold goes with its own entry, so the releases follow the same order.
         BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{50, 51, 52}));
+        // One entry at a time: two puts in flight could leave the later entry
+        // in the store while the earlier one failed.
+        BOOST_REQUIRE_EQUAL(probe.store.max_entry_sinks_open, 1u);
     });
 }
 
