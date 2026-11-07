@@ -4438,21 +4438,20 @@ static future<> write_schema_as_cql(snapshot_writer& writer, cql3::description s
     }
 }
 
-/*!
- * \brief write the snapshot's point-in-time-recovery bound file.
- *
- * Restore takes the set of shards, their replay bounds and their chain ids from
- * this file and never from a bucket listing, so a shard whose chain is gone
- * reads as a missing recorded chain rather than as a shard that never shipped
- * (#12). A backup uploads it with the snapshot's other non-sstable files.
- */
-// The bound one shard records: the lowest of what the snapshot's sstables
-// recorded and the commitlog's own floor, because either alone can sit above a
-// write the sstables do not hold. A write is given its position before it
-// reaches the memtable and can yield in between, so a large write can land
-// after the flush while a smaller, later one is in the sstables; the floor
-// covers that, since the large write's segment is still live. The sstable value
-// covers the case the floor gets wrong (#103).
+// The bound one shard records: what the snapshot's sstables recorded, raised to
+// the chain's floor, then capped by the commitlog's own floor. Either source
+// alone can sit above a write the sstables do not hold. A write is given its
+// position before it reaches the memtable and can yield in between, so a large
+// write can land after the flush while a smaller, later one is in the sstables;
+// the cap covers that, since the large write's segment is still live. The
+// sstable value covers the case the floor gets wrong (#103).
+//
+// The raise is for a shard flushed before this chain began: its sstables record
+// positions below the chain's floor, which reads as a backup taken before
+// shipping started and is refused, though the sstables hold everything. It is
+// sound because every write made after the capture lands at or above the floor,
+// and an unflushed write below the floor keeps its segment live, so the cap
+// still pulls the bound under the floor and that backup is still refused.
 //
 // With nothing flushed here there is no recorded position, and the chain's
 // floor stands in: below it nothing is shipped. With no chain, segment 1 - such
@@ -4468,16 +4467,25 @@ static db::replay_position lowest_safe_bound(
     const auto with_floor = [&](db::replay_position rp) {
         return commitlog_floor == db::replay_position() ? rp : std::min(rp, commitlog_floor);
     };
-    if (captured != db::replay_position()) {
-        return with_floor(captured);
-    }
     // A chain's floor is a whole segment id, carrying the shard already.
-    if (chain && chain->floor_segment_id) {
-        return with_floor(db::replay_position(*chain->floor_segment_id, 0));
+    const auto chain_floor = chain && chain->floor_segment_id ? std::optional(db::replay_position(*chain->floor_segment_id, 0)) : std::nullopt;
+    if (captured != db::replay_position()) {
+        return with_floor(chain_floor ? std::max(captured, *chain_floor) : captured);
+    }
+    if (chain_floor) {
+        return with_floor(*chain_floor);
     }
     return db::replay_position(shard, db::segment_id_type(1), 0);
 }
 
+/*!
+ * \brief write the snapshot's point-in-time-recovery bound file.
+ *
+ * Restore takes the set of shards, their replay bounds and their chain ids from
+ * this file and never from a bucket listing, so a shard whose chain is gone
+ * reads as a missing recorded chain rather than as a shard that never shipped
+ * (#12). A backup uploads it with the snapshot's other non-sstable files.
+ */
 static future<> write_bound_file(snapshot_writer& writer, const schema& s, const std::vector<db::replay_position>& bounds,
         const std::vector<db::replay_position>& commitlog_floors, const std::vector<std::optional<db::pitr::shard_chain>>& chains) {
     db::pitr::bound_file bf;
@@ -4557,8 +4565,8 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         // Per-shard commitlog bound, each taken together with that shard's sstable
         // list. Point-in-time recovery records these with the snapshot (#12).
         std::vector<db::replay_position> commitlog_bounds(this_smp_shard_count());
-        // Beside each bound, the commitlog's own floor at the same capture: the bound
-        // file records the lower of the two (lowest_safe_bound(), #103).
+        // Beside each bound, the commitlog's own floor at the same capture: it caps
+        // what the bound file records (lowest_safe_bound(), #103).
         std::vector<db::replay_position> commitlog_floors(this_smp_shard_count());
         // The chain each shard was shipping, for the bound file below. Only
         // collected when PITR can run, so that a snapshot taken on a node
