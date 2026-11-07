@@ -23,6 +23,7 @@
 
 #include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "db/pitr/ledger_writer.hh"
 #include "mutation/timestamp.hh"
 #include "service/topology_state_machine.hh"
 #include "sstables/object_storage_client.hh"
@@ -62,6 +63,10 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_store_client_failed";
     case shipping_state::off_upload_failed:
         return "off_upload_failed";
+    case shipping_state::off_ledger_failed:
+        return "off_ledger_failed";
+    case shipping_state::off_chain_broken:
+        return "off_chain_broken";
     case shipping_state::waiting_for_cluster_size:
         return "waiting_for_cluster_size";
     case shipping_state::active:
@@ -199,6 +204,10 @@ future<> pitr_shipper::stop() {
         pitr_logger.debug("Aborting the upload of segment {} for shutdown", id);
         as->request_abort();
     }
+    // The entry put in flight, if any. The chain ends at the last entry
+    // written: the restart is itself the break, recorded by the next boot
+    // (SHP-7), and the holds go with the segments the shutdown deletes.
+    _ledger_as.request_abort();
     // The limiter outlives every call it started, waiters included, because
     // every one of them unwinds through the upload gate.
     if (uploads_closed.available() && !uploads_closed.failed()) {
@@ -304,8 +313,28 @@ segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_funct
     };
 }
 
+chain_provider make_chain_provider(const pitr_shipper& shipper) {
+    return [&shipper]() -> std::optional<shard_chain> {
+        const auto& chain = shipper.chain();
+        if (!chain) {
+            // This shard ships nothing, so a snapshot taken now is not
+            // protected and the bound file says so.
+            return std::nullopt;
+        }
+        return shard_chain{
+                .host_id = chain->host_id,
+                .boot_epoch_us = chain->boot_epoch_us,
+                .chain_start_us = chain->chain_start_us,
+                .chain = chain->chain,
+                // D29: nothing when no segment was held when shipping started,
+                // which makes the D27 check vacuous, and never 0.
+                .floor_segment_id = shipper.chain_floor(),
+        };
+    };
+}
+
 void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& sstm, db::commitlog& log, utils::UUID host_id, int64_t boot_epoch_us,
-        pitr_shipper::flush_function flush) {
+        pitr_shipper::flush_function flush, chain_provider_sink install_chain_provider) {
     if (!shipper.active()) {
         return;
     }
@@ -337,6 +366,12 @@ void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& s
                     // holds were taken in is not id order.
                     .floor = held.empty() ? std::optional<db::segment_id_type>() : std::optional<db::segment_id_type>(std::ranges::max(held)),
             });
+    // Only once the chain exists: a provider installed without one would
+    // answer a snapshot with nothing for the rest of the node's life, since it
+    // is installed once.
+    if (install_chain_provider && shipper.chain()) {
+        install_chain_provider(make_chain_provider(shipper));
+    }
     shipper.flush_after_start(std::move(flush));
 }
 
@@ -373,22 +408,37 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
     }
     if (failed) {
         // A failed close or a rollback: the bytes are not shippable and the
-        // commitlog has dropped the hold itself. The chain this breaks is the
-        // ledger's, which #9 and #11 own.
+        // commitlog has dropped the hold itself. This segment is at or above
+        // the floor, so it belongs to the chain, and nothing above it may
+        // cover writes it holds: the chain ends here.
         ++_segments_unshipped;
-        if (auto it = _uploading.find(id); it != _uploading.end()) {
-            // A rollback of a segment already reported as closed: the file may
-            // be gone, so the upload must not record a success for it.
-            it->second->request_abort();
-        }
-        pitr_logger.warn("Segment {} will not be shipped: the commitlog reported its close as failed", id);
+        // Taken out before the break, so the break does not release a hold the
+        // commitlog has dropped already. The upload and the entry put in
+        // flight, if any, are aborted by the break itself.
+        _pending.erase(id);
+        break_shipping(shipping_state::off_chain_broken,
+                fmt::format("chain_broken: the commitlog reported the close of segment {} as failed, so it will never be shipped and nothing after it can be "
+                            "covered. Restart the node to ship a new chain",
+                        id));
         return;
     }
     // Before the used size is looked at: a repeated close can report a size of
     // 0 for a segment whose upload is in flight, and releasing its hold then
     // would let the file be recycled under the upload.
-    if (_uploading.contains(id)) {
+    if (_pending.contains(id)) {
         pitr_logger.debug("Segment {} is already being shipped, ignoring the repeated close", id);
+        return;
+    }
+    if (_prev_recorded_id != 0 && id <= _prev_recorded_id) {
+        // The entries rise with the segment id, so this one cannot be appended,
+        // and leaving it out would let the entries above it cover writes it
+        // holds. The commitlog reports a held segment once, so this is a
+        // segment that closed after a higher one was recorded.
+        break_shipping(shipping_state::off_chain_broken,
+                fmt::format("chain_broken: segment {} closed after segment {} was already recorded, so it cannot be added to the chain in order. Restart the "
+                            "node to ship a new chain",
+                        id, _prev_recorded_id));
+        _release_hold(id);
         return;
     }
     if (used_size == 0) {
@@ -406,6 +456,13 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         _release_hold(id);
         return;
     }
+    // Recorded before the upload starts, so the order the entries go out in is
+    // fixed by the closes rather than by the order the uploads finish in, and
+    // the coverage is the capture in force now rather than a later one.
+    _pending.emplace(id, pending_segment{
+                                 .used_size = used_size,
+                                 .covered_through_us = _coverage_us,
+                         });
     // Background: the close this runs inside cannot wait. The gate is what
     // stop() waits for, and every continuation below runs inside it.
     (void)seastar::try_with_gate(_upload_gate, [this, id, used_size] {
@@ -429,9 +486,17 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
                         pitr_logger.debug("Upload of segment {} failed, retrying in {}: {}", id, wait, ex);
                     },
     };
+    upload_result result;
     try {
-        co_await _uploads.upload(
-                *_client, _hooks.object_name_of(id), used_size,
+        // The object's key, and with it the file name the entry carries, comes
+        // from the hook, which throws for a segment the log no longer holds.
+        const auto name = _hooks.object_name_of(id);
+        const auto file_name = std::filesystem::path(std::string(name.object())).filename().string();
+        if (auto it = _pending.find(id); it != _pending.end()) {
+            it->second.file_name = file_name;
+        }
+        result = co_await _uploads.upload(
+                *_client, name, used_size,
                 [this, id] {
                     return _hooks.open_segment(id);
                 },
@@ -449,6 +514,7 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
         // (D25).
         ++_segments_unshipped;
         auto ex = std::current_exception();
+        _pending.erase(id);
         break_shipping(shipping_state::off_upload_failed,
                 fmt::format(
                         "upload_failed: uploading segment {} failed in a way no retry can fix ({}). Fix the cause and restart the node to ship again", id, ex));
@@ -464,16 +530,144 @@ future<> pitr_shipper::ship_segment(db::segment_id_type id, uint64_t used_size) 
         note_upload_aborted(id);
         co_return;
     }
-    ++_segments_shipped;
-    _release_hold(id);
-    pitr_logger.debug("Shipped segment {} ({} bytes) and released its hold", id, used_size);
+    auto it = _pending.find(id);
+    if (it == _pending.end()) {
+        // A rollback or a break took the segment out of the chain while its
+        // bytes were going up. The object stays in the store, recorded by
+        // nothing, which is as harmless as one an earlier attempt left.
+        pitr_logger.debug("Segment {} is no longer part of the chain, so its upload is not recorded", id);
+        co_return;
+    }
+    it->second.crc32 = result.crc32;
+    it->second.stored = true;
+    pitr_logger.debug("Stored segment {} ({} bytes); its hold goes once its ledger entry is written", id, used_size);
+    // The entry, and with it the hold, waits for every lower segment still
+    // pending: the entries go out in segment-id order.
+    record_ready_entries();
+}
+
+void pitr_shipper::record_ready_entries() {
+    if (_recording || _upload_gate.is_closed() || !active()) {
+        return;
+    }
+    if (_pending.empty() || !_pending.begin()->second.stored) {
+        return;
+    }
+    _recording = true;
+    // Background: the caller is a close or an upload's continuation, neither of
+    // which can wait for a store request. The upload gate is what stop() waits
+    // for, so the recorder cannot outlive the shipper.
+    (void)seastar::try_with_gate(_upload_gate, [this] {
+        return record_entries();
+    }).handle_exception([](std::exception_ptr ex) {
+        // record_entries() reports its own failures, so only a release hook
+        // that broke its contract, or a closed gate, can land here.
+        pitr_logger.error("Recording ledger entries ended unexpectedly: {}", ex);
+    });
+}
+
+future<> pitr_shipper::record_entries() {
+    auto done = seastar::defer([this]() noexcept {
+        _recording = false;
+        _recording_id.reset();
+    });
+    // One entry per iteration, and one iteration per segment whose bytes are
+    // stored: the loop ends at the first segment still uploading, so it is
+    // bounded by the segments the commitlog holds. Every iteration awaits a
+    // store request, so the shard is given back in each of them.
+    while (active() && !_ledger_as.abort_requested() && !_pending.empty() && _pending.begin()->second.stored) {
+        const auto id = _pending.begin()->first;
+        const auto& pending = _pending.begin()->second;
+        // Copied out before the first suspension: the map can change while the
+        // put is in flight.
+        const segment_entry entry{
+                .chain = _chain->chain,
+                .sequence = _next_sequence,
+                .boot_epoch_us = _chain->boot_epoch_us,
+                .segment_id = id,
+                .prev_segment_id = _prev_recorded_id,
+                .used_size = pending.used_size,
+                .segment_crc32 = pending.crc32,
+                .upload_time_us = api::new_timestamp(),
+                .covered_through_us = pending.covered_through_us,
+                .chain_start_us = _chain->chain_start_us,
+                .host_id = _chain->host_id,
+                .shard = _chain->shard,
+                .file_name = pending.file_name,
+        };
+        _recording_id = id;
+        try {
+            co_await write_entry(*_client, _shipper_cfg->bucket, _shipper_cfg->prefix, entry,
+                    ledger_retry_policy{
+                            .on_attempt_failed =
+                                    [id](std::exception_ptr ex, std::chrono::milliseconds wait) {
+                                        pitr_logger.debug("The ledger entry of segment {} could not be written, retrying in {}: {}", id, wait, ex);
+                                    },
+                    },
+                    _ledger_as);
+        } catch (...) {
+            _recording_id.reset();
+            if (_ledger_as.abort_requested()) {
+                // stop(), a break, or a rollback of this very segment: no later
+                // entry is ever written, and the chain ends at the last one.
+                // The hold follows the same rule as an aborted upload's.
+                note_entry_aborted(id);
+                co_return;
+            }
+            // Nothing a retry could fix: write_entry() retries a store failure
+            // until it is aborted, so this is an entry no writer may produce.
+            ++_segments_unshipped;
+            auto ex = std::current_exception();
+            _pending.erase(id);
+            break_shipping(shipping_state::off_ledger_failed,
+                    fmt::format("ledger_failed: the ledger entry of segment {} could not be written ({}), so nothing after it can be covered. Fix the cause "
+                                "and restart the node to ship again",
+                            id, ex));
+            _release_hold(id);
+            co_return;
+        }
+        _recording_id.reset();
+        // The abort can land in the gap between the put returning and this
+        // resumption, as ledger_writer.hh requires the caller to check: a
+        // rollback in that gap means this entry must not count, even though the
+        // object may be in the store. Nothing is awaited before the hold goes.
+        if (_ledger_as.abort_requested()) {
+            note_entry_aborted(id);
+            co_return;
+        }
+        _prev_recorded_id = id;
+        ++_next_sequence;
+        ++_segments_shipped;
+        _pending.erase(id);
+        _release_hold(id);
+        pitr_logger.debug("Recorded segment {} as entry {} of chain {} and released its hold", id, entry.sequence, _chain->chain);
+    }
+}
+
+// The hold of a segment whose entry was aborted, by the same rule as an aborted
+// upload's: kept for a shutdown, which deletes the held segments anyway, and
+// kept for a rollback, where the commitlog has dropped it already; a break
+// releases it, since no chain is left to hold it for.
+void pitr_shipper::note_entry_aborted(db::segment_id_type id) {
+    const bool rolled_back = !_pending.contains(id);
+    _pending.erase(id);
+    if (!rolled_back && !active() && !_upload_gate.is_closed()) {
+        pitr_logger.info("The ledger entry of segment {} was aborted by the break, releasing its hold", id);
+        _release_hold(id);
+        return;
+    }
+    pitr_logger.info("The ledger entry of segment {} was aborted, its hold is kept", id);
 }
 
 // The hold is kept for a shutdown, which deletes the held segments anyway, and
 // for a rollback, where the commitlog has dropped it already; a break releases
 // it, since no chain is left to hold it for.
 void pitr_shipper::note_upload_aborted(db::segment_id_type id) {
-    if (!active() && !_upload_gate.is_closed()) {
+    // A segment the rollback took out of the chain is not this shipper's to
+    // release: the commitlog dropped its hold when it reported the failure.
+    const bool rolled_back = !_pending.contains(id);
+    _pending.erase(id);
+    if (!rolled_back && !active() && !_upload_gate.is_closed()) {
         pitr_logger.info("Upload of segment {} was aborted by the break, releasing its hold", id);
         _release_hold(id);
         return;
@@ -561,6 +755,21 @@ void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
     for (auto& [id, as] : _uploading) {
         pitr_logger.debug("Aborting the upload of segment {}: shipping broke", id);
         as->request_abort();
+    }
+    // The entry put in flight goes the same way; no later entry is written.
+    _ledger_as.request_abort();
+    // The holds of the segments nothing is working on any more: the ones
+    // uploading, and the one being recorded, are released by their own abort
+    // paths, which have to tell a break from a shutdown. O(1) per segment and
+    // no yield, so nothing changes the map under this loop.
+    for (auto it = _pending.begin(); it != _pending.end();) {
+        if (_uploading.contains(it->first) || _recording_id == it->first) {
+            ++it;
+            continue;
+        }
+        pitr_logger.debug("Segment {} will not be recorded: shipping broke, releasing its hold", it->first);
+        _release_hold(it->first);
+        it = _pending.erase(it);
     }
     // Every shard keeps its own latch, so the shard that breaks is the one that
     // has to say so: a break happens at most once per shard per boot.
