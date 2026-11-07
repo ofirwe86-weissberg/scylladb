@@ -26,6 +26,7 @@
 
 #include "cql3/description.hh"
 #include "db/config.hh"
+#include "marshal_exception.hh"
 #include "db/pitr/t_parser.hh"
 #include "replica/database.hh"
 #include "replica/memtable.hh"
@@ -357,6 +358,30 @@ future<sstring> normalize_schema_cql(std::string_view text) {
     co_return out;
 }
 
+std::optional<::table_id> parse_source_table_id(std::string_view schema_cql) {
+    // Describe writes the id as the first WITH option, on the line that closes
+    // the column list; anywhere else those words are part of a value.
+    static constexpr std::string_view opener = ") WITH ID = ";
+    while (!schema_cql.empty()) {
+        const auto end = schema_cql.find('\n');
+        const auto line = trim(end == std::string_view::npos ? schema_cql : schema_cql.substr(0, end));
+        schema_cql.remove_prefix(end == std::string_view::npos ? schema_cql.size() : end + 1);
+        if (!line.starts_with(opener)) {
+            continue;
+        }
+        const auto value = trim(line.substr(opener.size()));
+        try {
+            auto id = ::table_id(utils::UUID(value));
+            if (id.uuid()) {
+                return id;
+            }
+        } catch (const marshal_exception&) {
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
+}
+
 future<std::optional<refusal>> check_schema_match(std::string_view target_cql, std::string_view backup_cql) {
     auto target = co_await normalize_schema_cql(target_cql);
     auto backup = co_await normalize_schema_cql(backup_cql);
@@ -666,6 +691,17 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                 "The backup carries no schema, so the target cannot be checked against it. The prefix names another backup.",
                 seastar::format("{}/{}", p.prefix, schema_cql_file_name));
     }
+    // The replay applies the entries of this one table and no other, so without
+    // its id nothing can be replayed: a schema.cql with no `ID` option is not
+    // one a snapshot of a supported version wrote.
+    const auto source_table_id = parse_source_table_id(*backup_cql);
+    if (!source_table_id) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup's schema does not record the table's id, so the shipped commitlog cannot be matched to it. The backup was written by an "
+                "unsupported version.",
+                seastar::format("{}/{} carries no ID option", p.prefix, schema_cql_file_name));
+    }
+
     auto describe_helper = replica::make_schema_describe_helper(target_schema, local.as_data_dictionary());
     auto target_cql = target_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
     if (auto mismatch = co_await check_schema_match(target_cql, *backup_cql)) {
@@ -718,6 +754,7 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
             .toc_names = std::move(manifest->toc_names),
             .source_keyspace = std::move(manifest->keyspace),
             .source_table = std::move(manifest->table),
+            .source_table_id = *source_table_id,
             .in_flight = std::move(*held),
     };
 }

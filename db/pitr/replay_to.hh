@@ -145,6 +145,13 @@ future<sstring> normalize_schema_cql(std::string_view);
 // Compares the two statements, ignoring the three above.
 future<std::optional<refusal>> check_schema_match(std::string_view target_cql, std::string_view backup_cql);
 
+// The id of the table the backup was taken from, which is the id its commitlog
+// entries carry and the only one a replay may apply: the target's id is a
+// different one, and the manifest records the source's name but not its id.
+// `nullopt` when the statement carries no `ID` option, which a snapshot's
+// `schema.cql` always does.
+std::optional<::table_id> parse_source_table_id(std::string_view schema_cql);
+
 // What a checked and marked replay hands to the load and, after it, to ep.3.
 struct replay_start {
     ::table_id target;
@@ -159,6 +166,8 @@ struct replay_start {
     utils::chunked_vector<sstring> toc_names;
     sstring source_keyspace;
     sstring source_table;
+    // From the backup's schema: what the shipped entries are matched on.
+    ::table_id source_table_id;
     // Held until the run ends, so no second replay enters this target.
     replay_in_flight::guard in_flight;
 };

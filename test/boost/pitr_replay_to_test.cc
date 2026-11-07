@@ -676,4 +676,31 @@ BOOST_AUTO_TEST_CASE(a_hold_is_kept_and_released_per_target) {
     BOOST_REQUIRE_EQUAL(*holds.find(test_target), 1);
 }
 
+// The replay applies the entries of the table the backup was taken from and no
+// other, matched on the id its commitlog entries carry; only the backup's own
+// schema.cql records it.
+SEASTAR_TEST_CASE(the_source_tables_id_is_read_from_the_backups_schema) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int)").get();
+        const auto parsed = parse_source_table_id(schema_cql_of(e, "source"));
+        BOOST_REQUIRE(parsed);
+        BOOST_REQUIRE_EQUAL(*parsed, e.local_db().find_schema(ks_name, "source")->id());
+    });
+}
+
+// A statement describe wrote without its internals, or one an unsupported
+// version wrote: there is nothing to match the shipped entries against, and a
+// guess would apply another table's writes.
+SEASTAR_TEST_CASE(a_backup_schema_without_an_id_has_no_source_table_id) {
+    BOOST_REQUIRE(!parse_source_table_id("CREATE TABLE ks.source (\n    pk text PRIMARY KEY\n) WITH comment = ''\n"));
+    BOOST_REQUIRE(!parse_source_table_id(""));
+    // The words are the option only where describe writes it; a value holding
+    // them is not an id.
+    BOOST_REQUIRE(!parse_source_table_id("CREATE TABLE ks.source (\n    pk text PRIMARY KEY\n) WITH comment = ') WITH ID = 1'\n"));
+    // Damage where the id belongs is not an id either.
+    BOOST_REQUIRE(!parse_source_table_id(") WITH ID = not-a-uuid\n"));
+    BOOST_REQUIRE(!parse_source_table_id(") WITH ID = 00000000-0000-0000-0000-000000000000\n"));
+    return make_ready_future<>();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
