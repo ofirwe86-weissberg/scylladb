@@ -123,7 +123,7 @@ std::filesystem::path replay_state_path(const std::filesystem::path& state_dir, 
     return state_dir / fmt::format("{}.replay", target.uuid());
 }
 
-future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id target, const replay_state& state) {
+future<> write_replay_state(std::filesystem::path state_dir, ::table_id target, replay_state state) {
     auto body = encode(state);
     auto path = replay_state_path(state_dir, target);
     auto tmp = path;
@@ -150,7 +150,7 @@ future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id t
     replay_log.info("wrote the {} mark of {} to {}", phase_name(state.phase), target, path.native());
 }
 
-future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target) {
+future<std::optional<replay_state>> read_replay_state(std::filesystem::path state_dir, ::table_id target) {
     auto path = replay_state_path(state_dir, target);
     if (!co_await file_exists(path.native())) {
         co_return std::nullopt;
@@ -167,7 +167,7 @@ std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::
     return restore_root(work_dir) / fmt::format("{}", target.uuid());
 }
 
-future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target) {
+future<std::filesystem::path> make_restore_dir(std::filesystem::path work_dir, ::table_id target) {
     auto dir = restore_dir_path(work_dir, target);
     if (co_await file_exists(dir.native())) {
         replay_log.info("dropping what an earlier replay of {} left in {}", target, dir.native());
@@ -177,7 +177,7 @@ future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work
     co_return dir;
 }
 
-future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept {
+future<> remove_restore_dir(std::filesystem::path work_dir, ::table_id target) noexcept {
     auto dir = restore_dir_path(work_dir, target);
     try {
         if (co_await file_exists(dir.native())) {
@@ -188,7 +188,7 @@ future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id ta
     }
 }
 
-future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept {
+future<> sweep_restore_dirs(std::filesystem::path work_dir) noexcept {
     auto root = restore_root(work_dir);
     try {
         if (co_await file_exists(root.native())) {

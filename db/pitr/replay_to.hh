@@ -105,11 +105,14 @@ std::filesystem::path replay_state_path(const std::filesystem::path& state_dir, 
 
 // A crash leaves either no file or a complete one: fsynced under a temporary
 // name, renamed over the final one, then the directory fsynced.
-future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id target, const replay_state&);
+//
+// Everything below takes its path and its state by value: these suspend, and a
+// coroutine's reference parameter outlives nothing a caller built inline (#18).
+future<> write_replay_state(std::filesystem::path state_dir, ::table_id target, replay_state);
 
 // `nullopt` only when there is no mark. An unreadable one throws: damage is not
 // a target that was never replayed into.
-future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target);
+future<std::optional<replay_state>> read_replay_state(std::filesystem::path state_dir, ::table_id target);
 
 // Where a run's fetched segments live: under the work directory, one directory
 // per target, and never under the commitlog directory - startup replays
@@ -118,13 +121,13 @@ std::filesystem::path restore_root(const std::filesystem::path& work_dir);
 std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::table_id target);
 
 // Empty: what a crashed run of the same target left is of no use to this one.
-future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target);
+future<std::filesystem::path> make_restore_dir(std::filesystem::path work_dir, ::table_id target);
 
 // Called on every path out of a run, a failure and an abort too, so neither
 // throws: a leftover costs disk and nothing else. The sweep runs at node start,
 // where no run is in flight, so it drops the whole root.
-future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept;
-future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept;
+future<> remove_restore_dir(std::filesystem::path work_dir, ::table_id target) noexcept;
+future<> sweep_restore_dirs(std::filesystem::path work_dir) noexcept;
 
 // Streams one shipped segment into `dir`, under the file name the source wrote
 // it with, since replay reads the segment's id and base position out of it, and
