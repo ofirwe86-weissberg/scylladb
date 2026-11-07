@@ -51,9 +51,12 @@ async def replay(manager, server, object_storage, ks, table, snapshot, prefix, t
     return status
 
 
-async def backup_with_a_pitr_bound(manager, server, object_storage, ks, rows):
+async def backup_with_a_pitr_bound(manager, server, object_storage, ks, rows, schema_flag_only=False):
     """A backup of ks.source taken with shipping on, so that it carries a pitr bound, and the
-    target created from it: what every replay that gets past the checks needs."""
+    target created from it: what every replay that gets past the checks needs.
+
+    With schema_flag_only, the target turns compaction off the way the README tells a user to,
+    through its own schema, and nodetool is not called at all."""
     cql = manager.get_cql()
     await cql.run_async(f"CREATE TABLE {ks}.source (pk text primary key, value text);")
     await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.source (pk, value) VALUES ('{k}', '{v}');")
@@ -61,8 +64,12 @@ async def backup_with_a_pitr_bound(manager, server, object_storage, ks, rows):
     snap_name, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
     prefix = f'source/{snap_name}'
     await do_backup(server, snap_name, prefix, ks, 'source', object_storage, manager, logger)
-    await cql.run_async(f"CREATE TABLE {ks}.target (pk text primary key, value text);")
-    await manager.api.disable_autocompaction(server.ip_addr, ks, 'target')
+    if schema_flag_only:
+        await cql.run_async(f"CREATE TABLE {ks}.target (pk text primary key, value text) "
+                            "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'};")
+    else:
+        await cql.run_async(f"CREATE TABLE {ks}.target (pk text primary key, value text);")
+        await manager.api.disable_autocompaction(server.ip_addr, ks, 'target')
     return snap_name, prefix
 
 
@@ -261,3 +268,22 @@ async def test_aborting_a_replay_releases_the_hold_and_keeps_the_mark(manager: S
         await asyncio.wait_for(manager.api.keyspace_compaction(server.ip_addr, ks, 'target'), timeout=120)
         second = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
         assert 'target_already_replayed' in refusal_of(second), refusal_of(second)
+
+
+async def test_replay_into_a_target_whose_schema_turns_compaction_off(manager: ScyllaClusterManager, object_storage):
+    """The way the README tells a user to create the target: compaction off in its own schema, and
+    nodetool never called. The run must get past the check it makes at the end as well as the one
+    before the load, or every ordinary replay would end in "cannot be trusted"."""
+    server = await one_server(manager, object_storage, shipping=True)
+    cql = manager.get_cql()
+    rows = {'0': 'zero', '1': 'one'}
+    async with new_test_keyspace(manager, RF_1) as ks:
+        snap_name, prefix = await backup_with_a_pitr_bound(manager, server, object_storage, ks, rows,
+                                                           schema_flag_only=True)
+        status = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
+        error = refusal_of(status)
+        assert 'cannot be trusted' not in error, error
+        assert f"loaded backup '{snap_name}' of {ks}.source" in error, error
+
+        loaded = {x.pk: x.value for x in await cql.run_async(f"SELECT * FROM {ks}.target;")}
+        assert loaded == rows, f'the target does not hold the backup after the load: {loaded}'
