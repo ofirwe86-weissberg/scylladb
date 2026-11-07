@@ -1645,6 +1645,11 @@ struct ship_probe {
     // that does not exist. A hold starts with the first write to the segment
     // and ends when the shipper releases it.
     std::set<db::segment_id_type> held;
+    // What commitlog::held_bytes() and commitlog::segment_hold_limit() answer.
+    // A limit of 0 is the commitlog's own "hold off", so a test that is not
+    // about the outage latch cannot trip it.
+    uint64_t held_bytes = 0;
+    uint64_t hold_limit = 0;
 
     // The segment becomes the one being written: held, not reported.
     void rotate_to(db::segment_id_type id) {
@@ -1667,6 +1672,14 @@ struct ship_probe {
                 .held_segments =
                         [this] {
                             return std::vector<db::segment_id_type>(held.begin(), held.end());
+                        },
+                .held_bytes =
+                        [this] {
+                            return held_bytes;
+                        },
+                .segment_hold_limit =
+                        [this] {
+                            return hold_limit;
                         },
         };
     }
@@ -2948,19 +2961,26 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_an_entry_that_cannot_be_written_breaks_shippi
     });
 }
 
-// "Shipped, then rolled back": the commitlog reports a segment that is already
-// in the chain as failed, so its writes are gone and nothing above it may
-// cover them. The entry already written stays - it is correct about bytes that
-// are in the store - and no later entry is ever added.
-SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_of_a_recorded_segment_breaks_the_chain) {
+// "Shipped, then rolled back": the commitlog reports a segment whose bytes are
+// already in the store as failed, so its writes are gone and nothing above it
+// may cover them. The rollback arrives while the entry put is in flight, which
+// is the last moment the commitlog can send one: the hold is dropped in the
+// same task that records the entry, and a rollback is only reported for a
+// segment still held (commitlog.cc, drop_hold()). The chain ends here, and no
+// later entry is ever added.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_during_an_entry_put_breaks_the_chain) {
     ship_probe probe;
     with_shipping(probe, [&](pitr_shipper& shipper) {
         constexpr size_t used = 4096;
         probe.paths[75] = make_segment_file(probe.dir, 75, used);
+        probe.rotate_to(75);
+        probe.store.hold_entry_put.emplace();
         shipper.segment_closed(75, used, false);
         wait_until([&] {
-            return shipper.segments_shipped() == 1;
+            return probe.store.entry_puts >= 1;
         });
+        BOOST_REQUIRE(probe.has_object(75));
+        BOOST_REQUIRE(probe.released.empty());
 
         shipper.segment_closed(75, used, true);
         BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_chain_broken);
@@ -2968,13 +2988,23 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_of_a_recorded_segment_breaks_the_c
 
         probe.paths[76] = make_segment_file(probe.dir, 76, used);
         shipper.segment_closed(76, used, false);
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return probe.released == std::vector<db::segment_id_type>{76};
+        });
         settle();
 
-        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{75});
-        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 1u);
+        // The entry put was aborted, so no entry claims 75 and none is written
+        // above it; 75's object stays in the store, recorded by nothing, which
+        // is as harmless as one a retried upload left.
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 1u);
+        BOOST_REQUIRE(probe.has_object(75));
         BOOST_REQUIRE(!probe.has_object(76));
-        // 75's hold went with its entry; 76 is released at once after a break.
-        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{75, 76}));
+        // 75's hold is the commitlog's own to have dropped when it reported the
+        // failure; 76 is released at once after a break.
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{76});
     });
 }
 
@@ -3177,6 +3207,12 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_store_a_segment_under_its_chain) {
                 },
                 [&probe] {
                     return std::vector<db::segment_id_type>(probe.held.begin(), probe.held.end());
+                },
+                [&probe] {
+                    return probe.held_bytes;
+                },
+                [&probe] {
+                    return probe.hold_limit;
                 });
 
         const auto name = hooks.object_name_of(42);
@@ -3212,6 +3248,12 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_refuse_to_name_an_object_without_a_
                 },
                 [] {
                     return std::vector<db::segment_id_type>();
+                },
+                [] {
+                    return uint64_t(0);
+                },
+                [] {
+                    return uint64_t(0);
                 });
         BOOST_REQUIRE(!shipper.chain());
         BOOST_REQUIRE_THROW(hooks.object_name_of(1), std::runtime_error);
@@ -3371,6 +3413,314 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_an_unknown_endpoint_releases_th
         shipper.segment_closed(44, 4096, false);
         BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{44});
         BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+    });
+}
+
+// The outage latch (P56, P63): once the segments waiting to be shipped have
+// reached the commitlog's hold limit, a write that needs a new segment would
+// wait for one the store outage keeps from being shipped. The latch keeps the
+// node writing and ends the chain visibly instead, one way until a restart.
+
+// The common case has holds well below the limit, so nothing the latch does may
+// show there: a close is shipped and recorded as it would be with no limit.
+SEASTAR_THREAD_TEST_CASE(test_pitr_holds_below_the_limit_break_nothing) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        // One byte below the limit, which is the boundary the latch is read at.
+        probe.held_bytes = probe.hold_limit - 1;
+        probe.paths[200] = make_segment_file(probe.dir, 200, used);
+        probe.rotate_to(200);
+        shipper.segment_closed(200, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        BOOST_REQUIRE(shipper.active());
+        BOOST_REQUIRE(!shipper.break_reason());
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{200});
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{200});
+    });
+}
+
+// At the limit the latch trips: shipping breaks and every hold goes exactly
+// once - the arriving segment's, the one whose entry put is in flight, and the
+// one waiting its turn in the order - so the commitlog can delete the segments
+// and the node keeps writing.
+SEASTAR_THREAD_TEST_CASE(test_pitr_reaching_the_hold_limit_breaks_shipping_and_releases_every_hold) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        // Two segments stored and waiting for their entries, as a store that
+        // answers uploads but not entry puts leaves them: 210's put is in
+        // flight, and 211 waits for 210's turn in the order.
+        probe.store.hold_entry_put.emplace();
+        for (db::segment_id_type id : {210, 211}) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+            probe.rotate_to(id);
+            shipper.segment_closed(id, used, false);
+        }
+        wait_until([&] {
+            return probe.store.entry_puts >= 1 && probe.has_object(211);
+        });
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 2u);
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE(shipper.active());
+
+        // The close whose hold takes the commitlog to its limit. The commitlog
+        // has counted its bytes before it reports the close.
+        probe.held_bytes = probe.hold_limit;
+        probe.paths[212] = make_segment_file(probe.dir, 212, used);
+        probe.rotate_to(212);
+        shipper.segment_closed(212, used, false);
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+        BOOST_REQUIRE(shipper.break_reason());
+        BOOST_REQUIRE_EQUAL(shipper.break_reason()->find("outage:"), 0u);
+        BOOST_REQUIRE(shipper.break_reason()->find("restart") != seastar::sstring::npos);
+        BOOST_REQUIRE(!shipper.sealing_scheduled());
+        // 212 was never taken for shipping, so no third upload started, and
+        // its hold and 211's are gone before this thread runs again.
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 2u);
+        BOOST_REQUIRE_EQUAL(probe.released.size(), 2u);
+
+        // The aborted entry put releases the last hold.
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return probe.released.size() == 3;
+        });
+        settle();
+
+        for (db::segment_id_type id : {210, 211, 212}) {
+            BOOST_REQUIRE_EQUAL(unsigned(std::ranges::count(probe.released, id)), 1u);
+        }
+        BOOST_REQUIRE_EQUAL(probe.released.size(), 3u);
+        BOOST_REQUIRE(probe.held.empty());
+        // Nothing is recorded, so the chain ends before all three.
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+    });
+}
+
+// The uploads a store outage has parked are aborted by the latch, and their
+// holds go with them: nothing is left pinning a segment the chain gave up on.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_outage_latch_aborts_the_uploads_in_flight) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        // Two uploads parked, as a store outage leaves them.
+        probe.store.hold_put.emplace();
+        for (db::segment_id_type id : {210, 211}) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+            probe.rotate_to(id);
+            shipper.segment_closed(id, used, false);
+        }
+        BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 2u);
+        BOOST_REQUIRE(shipper.active());
+
+        // The close whose hold takes the commitlog to its limit. The commitlog
+        // has counted its bytes before it reports the close.
+        probe.held_bytes = probe.hold_limit;
+        probe.paths[212] = make_segment_file(probe.dir, 212, used);
+        probe.rotate_to(212);
+        shipper.segment_closed(212, used, false);
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+        // It was never taken for shipping: no third upload started, and the
+        // release is synchronous, so it shows here.
+        BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 2u);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{212});
+
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return probe.released.size() == 3;
+        });
+        settle();
+
+        for (db::segment_id_type id : {210, 211, 212}) {
+            BOOST_REQUIRE_EQUAL(unsigned(std::ranges::count(probe.released, id)), 1u);
+        }
+        BOOST_REQUIRE_EQUAL(probe.released.size(), 3u);
+        BOOST_REQUIRE(probe.held.empty());
+        // The aborted uploads left nothing finalized, and nothing is recorded.
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE(!probe.has_object(210));
+        BOOST_REQUIRE(!probe.has_object(211));
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+    });
+}
+
+// A close after the latch is released at once, as after any other break: no
+// chain is left to keep a segment for.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_the_outage_latch_is_released_without_an_upload) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    probe.held_bytes = probe.hold_limit;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[220] = make_segment_file(probe.dir, 220, used);
+        shipper.segment_closed(220, used, false);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+
+        probe.paths[221] = make_segment_file(probe.dir, 221, used);
+        shipper.segment_closed(221, used, false);
+        settle();
+
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{220, 221}));
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+    });
+}
+
+// One way until a restart: a store that comes back, and holds that drop with
+// it, must not turn shipping on again behind the operator's back. The chain is
+// already short of the segments that were released, so resuming it would claim
+// coverage it does not have.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_outage_latch_stays_tripped_after_the_held_bytes_drop) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    probe.held_bytes = probe.hold_limit;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver driver;
+        driver.install(shipper);
+        probe.paths[225] = make_segment_file(probe.dir, 225, used);
+        shipper.segment_closed(225, used, false);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+        const auto reason = *shipper.break_reason();
+
+        // The store is back and the commitlog holds nothing.
+        probe.held_bytes = 0;
+        shipper.note_cluster_size(1);
+        shipper.seal_tick();
+        shipper.wait_for_cycles(cycle_timeout).get();
+        settle();
+        BOOST_REQUIRE_EQUAL(driver.seals, 0);
+        probe.paths[226] = make_segment_file(probe.dir, 226, used);
+        shipper.segment_closed(226, used, false);
+        settle();
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+        BOOST_REQUIRE_EQUAL(*shipper.break_reason(), reason);
+        BOOST_REQUIRE(!shipper.active());
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{225, 226}));
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+    });
+}
+
+// A shard whose uploads are all parked reports no close, so the seal cycle is
+// what has to notice the outage: it checks before it seals, and breaks instead.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_seal_cycle_trips_the_outage_latch) {
+    ship_probe probe;
+    probe.hold_limit = 64 * 1024;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.store.hold_put.emplace();
+        probe.paths[230] = make_segment_file(probe.dir, 230, used);
+        probe.rotate_to(230);
+        shipper.segment_closed(230, used, false);
+        seal_driver driver;
+        driver.install(shipper);
+        BOOST_REQUIRE(shipper.sealing_scheduled());
+
+        probe.held_bytes = probe.hold_limit + 1;
+        shipper.seal_tick();
+        shipper.wait_for_cycles(cycle_timeout).get();
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_outage);
+        // Broken before it sealed: another segment would only add a hold.
+        BOOST_REQUIRE_EQUAL(driver.seals, 0);
+        BOOST_REQUIRE(!shipper.sealing_scheduled());
+
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return probe.released == std::vector<db::segment_id_type>{230};
+        });
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+    });
+}
+
+// The latch is off while the commitlog holds nothing, which is every node
+// without PITR and every one whose hold limit is 0: held bytes that have
+// reached a limit of 0 must not read as an outage.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_hold_limit_of_zero_turns_the_latch_off) {
+    ship_probe probe;
+    probe.hold_limit = 0;
+    probe.held_bytes = 0;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[235] = make_segment_file(probe.dir, 235, used);
+        probe.rotate_to(235);
+        shipper.segment_closed(235, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        BOOST_REQUIRE(shipper.active());
+        BOOST_REQUIRE(!shipper.break_reason());
+    });
+}
+
+// The recorder's liveness: an empty segment below a stored one is released
+// rather than shipped, and nothing else would start the recorder again, so on
+// an idle shard the stored segment would stay unrecorded and held for good
+// (#9, code-reviewer's follow-up 1).
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_empty_lower_segment_closing_late_restarts_the_recorder) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        // 240 rotated and is held; its close has not been reported yet, so the
+        // entry of 241 above it cannot be written in order.
+        probe.rotate_to(240);
+        probe.rotate_to(241);
+        probe.paths[241] = make_segment_file(probe.dir, 241, used);
+        shipper.segment_closed(241, used, false);
+        wait_until([&] {
+            return probe.has_object(241);
+        });
+        settle();
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 1u);
+
+        // A forced seal left 240 with nothing in it, so it is released rather
+        // than shipped - and that release is what lets 241 be recorded.
+        shipper.segment_closed(240, 0, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{241});
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{240, 241}));
+        BOOST_REQUIRE(shipper.active());
+    });
+}
+
+// A segment held from before the chain began is not in the chain, so no entry
+// waits for its close: without the floor exclusion in unreported_held_below()
+// the first entry would never be written (#9, pr-reviewer's follow-up 5).
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_held_segment_below_the_floor_does_not_stall_recording) {
+    ship_probe probe;
+    probe.floor = 250;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        // 249 was written before the chain and is still held, its close yet to
+        // be reported; 250 is the chain's first segment.
+        probe.rotate_to(249);
+        probe.rotate_to(250);
+        probe.paths[250] = make_segment_file(probe.dir, 250, used);
+        shipper.segment_closed(250, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{250});
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{250});
+        // 249 is still the commitlog's to report, and the chain did not wait.
+        BOOST_REQUIRE(probe.held == std::set<db::segment_id_type>{249});
     });
 }
 

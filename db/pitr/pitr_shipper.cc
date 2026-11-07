@@ -68,6 +68,8 @@ std::string_view format_as(shipping_state state) noexcept {
         return "off_ledger_failed";
     case shipping_state::off_chain_broken:
         return "off_chain_broken";
+    case shipping_state::off_outage:
+        return "off_outage";
     case shipping_state::waiting_for_cluster_size:
         return "waiting_for_cluster_size";
     case shipping_state::active:
@@ -234,7 +236,7 @@ void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_c
     if (!active() || _client || _upload_gate.is_closed()) {
         return;
     }
-    if (!client || !hooks.open_segment || !hooks.object_name_of || !hooks.held_segments || !_release_hold) {
+    if (!client || !hooks.open_segment || !hooks.object_name_of || !hooks.held_segments || !hooks.held_bytes || !hooks.segment_hold_limit || !_release_hold) {
         seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client, every hook and the release hook");
         return;
     }
@@ -281,9 +283,10 @@ void pitr_shipper::flush_after_start(flush_function flush) {
     });
 }
 
-segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments) {
-    if (!segment_path || !held_segments) {
-        seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path and a held-segments function");
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments,
+        held_bytes_function held_bytes, hold_limit_function hold_limit) {
+    if (!segment_path || !held_segments || !held_bytes || !hold_limit) {
+        seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path, a held-segments, a held-bytes and a hold-limit function");
     }
     // A segment the commitlog no longer holds has no path, and its file may be
     // gone. Throwing is a permanent upload failure, so it breaks shipping on
@@ -312,6 +315,8 @@ segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_funct
                         return sstables::object_name(shipper.shipping_config().bucket, segment_object_key(*chain, file_name));
                     },
             .held_segments = std::move(held_segments),
+            .held_bytes = std::move(held_bytes),
+            .segment_hold_limit = std::move(hold_limit),
     };
 }
 
@@ -363,6 +368,12 @@ void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& s
                     },
                     [&log] {
                         return log.held_segments();
+                    },
+                    [&log] {
+                        return log.held_bytes();
+                    },
+                    [&log] {
+                        return log.segment_hold_limit();
                     }),
             chain_origin{
                     .host_id = host_id,
@@ -452,6 +463,10 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         // object would describe a segment that holds no writes.
         pitr_logger.debug("Segment {} closed with no used bytes, releasing its hold", id);
         _release_hold(id);
+        // A segment above it may have been waiting for this close before its
+        // own entry could be written in order. Nothing else would start the
+        // recorder again: on an idle shard the next upload may never come.
+        record_ready_entries();
         return;
     }
     if (_upload_gate.is_closed()) {
@@ -459,6 +474,13 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         // was shipped. This hold goes rather than waiting for the shutdown to
         // clear it; the holds of the uploads stop() aborted are kept.
         pitr_logger.debug("Not shipping segment {}: shutdown has begun, releasing its hold", id);
+        _release_hold(id);
+        return;
+    }
+    // Checked where a hold would be kept: the commitlog has already counted
+    // this segment's bytes (commitlog.cc, on_segment_closed()), so the latch
+    // sees the holds this close would leave behind.
+    if (outage_latch_tripped()) {
         _release_hold(id);
         return;
     }
@@ -584,7 +606,9 @@ future<> pitr_shipper::record_entries() {
         // close being reported, the commitlog not awaiting the close
         // (commitlog.cc, finish_and_get_new()). Recording now would put the
         // chain past a segment that still has to join it; the close is coming,
-        // since the hold is this shipper's, and it starts the recorder again.
+        // since the hold is this shipper's, and every path that answers it -
+        // its upload, or the release of an empty segment - starts the recorder
+        // again.
         if (const auto unreported = unreported_held_below(id)) {
             pitr_logger.debug("Not recording segment {} yet: segment {} is held and its close has not been reported", id, *unreported);
             co_return;
@@ -646,12 +670,14 @@ future<> pitr_shipper::record_entries() {
             co_return;
         }
         _recording_id.reset();
-        // The abort can land in the gap between the put returning and this
-        // resumption, which ledger_writer.hh requires the caller to check. It
-        // does not unwrite the object - a restore reads whatever finalized -
-        // and the entry is correct about bytes that are in the store. What it
-        // does is stop the chain here: this segment is not counted, its hold
-        // follows note_entry_aborted()'s rule, and no later entry is written.
+        // An abort can land in the gap between the put returning and this
+        // resumption, which ledger_writer.hh requires the caller to check: a
+        // stop(), a break, or a rollback of this very segment, whose hold is
+        // still this shipper's until the release below. It does not unwrite the
+        // object - a restore reads whatever finalized - and the entry is
+        // correct about bytes that are in the store. What it does is stop the
+        // chain here: this segment is not counted, its hold follows
+        // note_entry_aborted()'s rule, and no later entry is written.
         if (_ledger_as.abort_requested()) {
             note_entry_aborted(id);
             co_return;
@@ -807,6 +833,34 @@ void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
     pitr_logger.error("Point-in-time recovery shipping is off on shard {}: {}", this_shard_id(), *_break_reason);
 }
 
+// The outage latch (P56, P63). A store outage leaves every closed segment held
+// while its upload retries; once the holds reach the commitlog's limit, a write
+// that needs a new segment waits for one of them, because the commitlog does
+// not go over its size limit (commitlog.cc, allow_going_over_size_limit). The
+// node would stall rather than lose coverage, and the decided policy is the
+// other way round: keep the node writing and end the chain visibly here.
+bool pitr_shipper::outage_latch_tripped() {
+    if (!active() || !_hooks.segment_hold_limit || !_hooks.held_bytes) {
+        return false;
+    }
+    // Both are plain reads of a counter the commitlog keeps, so neither waits.
+    const auto limit = _hooks.segment_hold_limit();
+    if (limit == 0) {
+        // The commitlog holds nothing for this shipper, so no hold can fill it.
+        return false;
+    }
+    const auto held = _hooks.held_bytes();
+    if (held < limit) {
+        return false;
+    }
+    break_shipping(shipping_state::off_outage,
+            fmt::format("outage: the segments waiting to be shipped take {} bytes, which has reached the {} bytes the commitlog may hold, so a write would "
+                        "wait for a segment shipping cannot free. Shipping is off and every hold is released, and the chain ends at the last entry recorded. "
+                        "Fix the store and restart the node to ship a new chain",
+                    held, limit));
+    return true;
+}
+
 // One capture: the time, and the highest segment the log holds then. A write
 // acknowledged before the time is in that segment or below it, so an entry at
 // or above it covers every such write the chain is responsible for. Taken
@@ -879,8 +933,24 @@ future<> pitr_shipper::release_holds(std::vector<db::segment_id_type> ids) {
 
 // Records every failure instead of throwing, so seal_loop() always finishes.
 future<> pitr_shipper::seal_cycle() {
-    // Before anything that can wait: see capture_coverage().
-    capture_coverage();
+    // Before the cycle does anything else: an outage that no close reports -
+    // an idle shard, or one whose uploads are all parked - is noticed here.
+    if (outage_latch_tripped()) {
+        co_return;
+    }
+    try {
+        // Before anything that can wait: see capture_coverage().
+        capture_coverage();
+    } catch (...) {
+        // Reading the held segments allocates, so this can fail under memory
+        // pressure. A cycle with no capture is not a reason to break: the
+        // entries keep the coverage they already have, which is conservative,
+        // and the next cycle takes a capture of its own.
+        _last_outcome = cycle_outcome::seal_failed;
+        _last_failure = fmt::format("capturing the cycle's coverage failed: {}", std::current_exception());
+        pitr_logger.warn("{}; shipping stays on, and the next cycle captures again", *_last_failure);
+        co_return;
+    }
     // Every cycle repeats the startup check, because a node can join later.
     size_t node_count = 0;
     try {
