@@ -726,7 +726,7 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     // The replay applies the entries of this one table and no other, so without
     // its id nothing can be replayed: a schema.cql with no `ID` option is not
     // one a snapshot of a supported version wrote.
-    const auto source_table_id = parse_source_table_id(*backup_cql);
+    const auto source_table_id = parse_source_table_id(**backup_cql);
     if (!source_table_id) {
         co_return refuse(refusal_reason::backup_file_missing,
                 "The backup's schema does not record the table's id, so the shipped commitlog cannot be matched to it. The backup was written by an "
