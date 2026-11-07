@@ -729,4 +729,59 @@ SEASTAR_TEST_CASE(a_large_manifest_parses_from_a_coroutine) {
     BOOST_REQUIRE_EQUAL(manifest->toc_names.back(), seastar::format("me-{}-big-TOC.txt", sstables - 1));
 }
 
+// The run's one line is what an operator is left with: the task carries no
+// success text, so the result is read from the node log, and a field missing
+// from it is a restore nobody can account for (PM-66, PM-67).
+SEASTAR_TEST_CASE(the_result_line_gives_t_the_backup_what_was_read_and_what_was_applied) {
+    const replay_to_params params{
+            .endpoint = test_endpoint,
+            .bucket = "bucket",
+            .prefix = "backups/one",
+            .keyspace = ks_name,
+            .table = "target",
+            .snapshot = "backup-1",
+            .t = "2026-11-04T14:05:00.000000Z",
+    };
+    replay_start start;
+    start.t = 1762265100000000;
+    start.source_keyspace = "ks";
+    start.source_table = "source";
+    const replay_run_stats stats{
+            .objects_read = 7,
+            .bytes_read = 123456,
+            .entries_replayed = 41,
+            .incomplete_split_writes = 2,
+            .applier =
+                    apply_stats{
+                            .entries_applied = 39,
+                            .cells_applied = 90,
+                            .cells_dropped_after_t = 11,
+                            .cells_not_verified = 3,
+                    },
+    };
+    const auto line = format_replay_result(params, start, stats);
+    BOOST_TEST_CONTEXT(line) {
+        // T as the user wrote it and as the replay read it: a wrong parse is
+        // visible only when both are there.
+        BOOST_REQUIRE(line.find("2026-11-04T14:05:00.000000Z") != sstring::npos);
+        BOOST_REQUIRE(line.find("1762265100000000") != sstring::npos);
+        // The backup and the table it was taken from: a snapshot tag can be
+        // shared, so the names are the only record of what was restored.
+        BOOST_REQUIRE(line.find("backup-1") != sstring::npos);
+        BOOST_REQUIRE(line.find("ks.source") != sstring::npos);
+        BOOST_REQUIRE(line.find("ks.target") != sstring::npos);
+        BOOST_REQUIRE(line.find("7 shipped segment(s)") != sstring::npos);
+        BOOST_REQUIRE(line.find("123456 byte(s)") != sstring::npos);
+        BOOST_REQUIRE(line.find("90 cell(s)") != sstring::npos);
+        BOOST_REQUIRE(line.find("39 write(s)") != sstring::npos);
+        BOOST_REQUIRE(line.find("11 cell(s) written after t") != sstring::npos);
+        BOOST_REQUIRE(line.find("3 cell(s) could not be verified") != sstring::npos);
+        // "up to", because an incomplete split write cannot be decoded, so not
+        // even its table is readable (P22).
+        BOOST_REQUIRE(line.find("up to 2 split write(s)") != sstring::npos);
+        BOOST_REQUIRE(line.find("limit 27") != sstring::npos);
+    }
+    return make_ready_future<>();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

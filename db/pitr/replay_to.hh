@@ -19,6 +19,7 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 
+#include "db/pitr/apply_to_target.hh"
 #include "db/pitr/bound_file.hh"
 #include "db/pitr/chain_check.hh"
 #include "db/pitr/refusal.hh"
@@ -192,5 +193,49 @@ struct replay_start {
 // yields per read and per entry, and needs every reference to outlive the call.
 future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
         std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
+
+// What the history replay did, for the run's result line.
+struct replay_run_stats {
+    // Shipped segments fetched and read, and the bytes of them, which are the
+    // sizes the ledger recorded and the fetch proved.
+    uint64_t objects_read = 0;
+    uint64_t bytes_read = 0;
+    uint64_t entries_replayed = 0;
+    // Split writes a chain ended inside. Counted and not applied, and reported
+    // as "up to N": an incomplete write cannot be decoded, so neither its table
+    // nor its timestamp is readable (P22, `replay_reader_stats`).
+    uint64_t incomplete_split_writes = 0;
+    apply_stats applier;
+
+    bool operator==(const replay_run_stats&) const = default;
+};
+
+// Fetches, replays, filters at T and applies every chain of `start.history`
+// into `start.target`, shard by shard and in ledger order within a shard. One
+// segment is on local disk at a time: each is fetched into `restore_dir`, read,
+// and removed before the next is fetched, so a history of any length costs the
+// disk one segment.
+//
+// Nothing is applied that the target cannot hold, and nothing above T: the
+// applier refuses the first and the filter drops the second. A refusal here
+// comes from the store - an object missing or not the one its record describes -
+// and the caller must never write `done` after one. A store or disk error is an
+// exception, and so is anything the applier refuses, since the target is already
+// marked and the run is over either way.
+//
+// Each segment is read once per call to the reader, so a write split across two
+// segments does not reassemble and is counted in `incomplete_split_writes`
+// instead of being applied (#18).
+//
+// Runs on the shard the run runs on; the apply of each entry happens on the
+// shard that owns its key. Yields per fetched chunk, per segment and per entry.
+// Every reference must outlive the call.
+future<std::expected<replay_run_stats, refusal>> replay_history_into_target(sharded<replica::database>& db, sstables::object_storage_client& client,
+        sstring bucket, const replay_start& start, std::filesystem::path restore_dir, seastar::abort_source& as);
+
+// The run's one line: T as the user wrote it and in microseconds, the backup and
+// the table it was taken from, what was read, what was applied, what was dropped
+// as written after T, and what could not be verified (PM-66).
+sstring format_replay_result(const replay_to_params&, const replay_start&, const replay_run_stats&);
 
 } // namespace db::pitr

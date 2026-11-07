@@ -27,6 +27,7 @@
 #include <seastar/util/file.hh>
 
 #include "cql3/description.hh"
+#include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
 #include "marshal_exception.hh"
 #include "db/pitr/t_parser.hh"
@@ -38,6 +39,7 @@
 #include "sstables/sstables_manager.hh"
 #include "utils/crc.hh"
 #include "utils/log.hh"
+#include "utils/on_internal_error.hh"
 
 namespace db::pitr {
 
@@ -789,6 +791,92 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
             .source_table_id = *source_table_id,
             .in_flight = std::move(*held),
     };
+}
+
+future<std::expected<replay_run_stats, refusal>> replay_history_into_target(sharded<replica::database>& db, sstables::object_storage_client& client,
+        sstring bucket, const replay_start& start, std::filesystem::path restore_dir, abort_source& as) {
+    if (start.history.chains.size() != start.bound.shards.size()) {
+        on_internal_error(replay_log,
+                seastar::format("the checked history holds {} chain(s) for a bound of {} shard(s)", start.history.chains.size(), start.bound.shards.size()));
+    }
+    // The source wrote its segments with this node's prefix: both run the same
+    // Scylla, and the reader reads the segment's id out of the file name.
+    const sstring filename_prefix = db::commitlog::descriptor::FILENAME_PREFIX;
+    const auto& extensions = db.local().get_config().extensions();
+    // One instance for the whole replay: a source schema version is rebuilt on
+    // a shard once and not once per entry.
+    sharded<shard_mapping_cache> mappings;
+    co_await mappings.start();
+    replay_run_stats stats;
+    std::optional<refusal> refused;
+    std::exception_ptr ex;
+    try {
+        target_applier applier(db, mappings, start.target, start.t);
+        for (size_t shard_index = 0; shard_index < start.history.chains.size() && !refused; ++shard_index) {
+            const auto& chain = start.history.chains[shard_index];
+            const auto& shard = start.bound.shards[shard_index];
+            for (size_t i = 0; i < chain.segments.size() && !refused; ++i) {
+                as.check();
+                const auto& segment = chain.segments[i];
+                auto fetched = co_await fetch_segment(client, bucket, segment, chain.segment_crc32s[i], restore_dir, as);
+                if (!fetched) {
+                    refused = std::move(fetched.error());
+                    break;
+                }
+                ++stats.objects_read;
+                stats.bytes_read += segment.used_size;
+                shard_replay_params params;
+                params.segments.push_back(shipped_segment{.path = sstring(fetched->native()), .used_size = segment.used_size});
+                params.filename_prefix = filename_prefix;
+                params.shard = shard.shard;
+                params.source_table = start.source_table_id;
+                params.bound = shard.bound;
+                params.extensions = &extensions;
+                replay_reader_stats reader;
+                std::exception_ptr replay_error;
+                try {
+                    reader = co_await replay_shard_segments(params, [&applier](const replay_entry& entry) {
+                        return applier(entry);
+                    });
+                } catch (...) {
+                    replay_error = std::current_exception();
+                }
+                // Before the next fetch, and on a failure too: the local copy
+                // is of no use to anything once the reader is done with it.
+                co_await remove_quietly(*fetched);
+                if (replay_error) {
+                    std::rethrow_exception(std::move(replay_error));
+                }
+                stats.entries_replayed += reader.entries_replayed;
+                stats.incomplete_split_writes += reader.incomplete_split_writes;
+                replay_log.debug("replayed {} of shard {}: {} entry/entries applied of {} read", segment.path, shard.shard, reader.entries_replayed,
+                        reader.entries_read);
+            }
+        }
+        stats.applier = applier.stats();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    // Every path out: the cache holds a copy of every source schema version the
+    // replay met, on every shard that applied one.
+    co_await mappings.stop();
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+    if (refused) {
+        co_return std::unexpected(std::move(*refused));
+    }
+    co_return stats;
+}
+
+sstring format_replay_result(const replay_to_params& p, const replay_start& start, const replay_run_stats& stats) {
+    return seastar::format(
+            "Point-in-time replay of {}.{} to t={} ({}us) is done: restored from backup '{}' of {}.{}; read {} shipped segment(s), {} byte(s); applied {} "
+            "cell(s) in {} write(s); dropped {} cell(s) written after t; {} cell(s) could not be verified; up to {} split write(s) were not replayed; one "
+            "table of one node was restored (limit 27)",
+            p.keyspace, p.table, p.t, start.t, p.snapshot, start.source_keyspace, start.source_table, stats.objects_read, stats.bytes_read,
+            stats.applier.cells_applied, stats.applier.entries_applied, stats.applier.cells_dropped_after_t, stats.applier.cells_not_verified,
+            stats.incomplete_split_writes);
 }
 
 } // namespace db::pitr
