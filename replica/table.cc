@@ -4464,8 +4464,12 @@ static db::replay_position lowest_safe_bound(unsigned shard, db::replay_position
     if (captured != db::replay_position()) {
         return captured;
     }
-    const auto floor = chain && chain->floor_segment_id ? *chain->floor_segment_id : db::segment_id_type(1);
-    return db::replay_position(shard, floor, 0);
+    // A chain's floor is a whole segment id, which already carries the shard,
+    // so it goes in as it is; the last resort builds base id 1 for this shard.
+    if (chain && chain->floor_segment_id) {
+        return db::replay_position(*chain->floor_segment_id, 0);
+    }
+    return db::replay_position(shard, db::segment_id_type(1), 0);
 }
 
 static future<> write_bound_file(snapshot_writer& writer, const schema& s, const std::vector<db::replay_position>& bounds,
