@@ -55,6 +55,7 @@ target_sources(db
     pitr/pitr_shipper.cc
     pitr/refusal.cc
     pitr/replay_reader.cc
+    pitr/replay_to.cc
     pitr/segment_upload.cc
     pitr/t_filter.cc
     pitr/t_parser.cc

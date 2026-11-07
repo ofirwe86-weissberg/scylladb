@@ -1,0 +1,393 @@
+/*
+ * Copyright (C) 2026-present ScyllaDB
+ */
+
+/*
+ * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
+ */
+
+#include "db/pitr/replay_to.hh"
+
+#include <algorithm>
+#include <charconv>
+#include <chrono>
+#include <exception>
+#include <utility>
+
+#include <seastar/core/abort_source.hh>
+#include <seastar/core/coroutine.hh>
+#include <seastar/core/file.hh>
+#include <seastar/core/fstream.hh>
+#include <seastar/core/format.hh>
+#include <seastar/core/iostream.hh>
+#include <seastar/core/seastar.hh>
+#include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/file.hh>
+#include <seastar/util/short_streams.hh>
+
+#include "cql3/description.hh"
+#include "db/pitr/t_parser.hh"
+#include "replica/database.hh"
+#include "replica/memtable.hh"
+#include "replica/schema_describe_helper.hh"
+#include "schema/schema.hh"
+#include "sstables/object_storage_client.hh"
+#include "sstables/sstables_manager.hh"
+#include "utils/log.hh"
+
+namespace db::pitr {
+
+static logging::logger replay_log("pitr_replay_to");
+
+static constexpr std::string_view replay_state_format = "pitr-replay";
+static constexpr uint32_t replay_state_version_1 = 1;
+
+static std::string_view phase_name(replay_phase phase) {
+    switch (phase) {
+    case replay_phase::started:
+        return "started";
+    case replay_phase::done:
+        return "done";
+    }
+    return "unknown";
+}
+
+sstring encode(const replay_state& state) {
+    for (const auto& value : {std::string_view(state.snapshot), std::string_view(state.t)}) {
+        if (value.find('\n') != std::string_view::npos) {
+            throw std::runtime_error("pitr replay mark: a value may not hold a newline");
+        }
+    }
+    if (state.started_at_us < 0) {
+        throw std::runtime_error("pitr replay mark: started_at_us may not be negative");
+    }
+    return seastar::format("format={}\nversion={}\nphase={}\nsnapshot={}\nt={}\nstarted_at_us={}\n", replay_state_format, replay_state_version_1,
+            phase_name(state.phase), state.snapshot, state.t, state.started_at_us);
+}
+
+// The value of `key`, or an error naming what was there instead: a reader built
+// today diagnoses damage the same way whatever wrote the file.
+static std::string_view take_line(std::string_view& text, std::string_view key) {
+    auto end = text.find('\n');
+    if (end == std::string_view::npos) {
+        throw std::runtime_error(seastar::format("pitr replay mark: no line for {}", key));
+    }
+    auto line = text.substr(0, end);
+    text.remove_prefix(end + 1);
+    if (!line.starts_with(key) || line.size() <= key.size() || line[key.size()] != '=') {
+        throw std::runtime_error(seastar::format("pitr replay mark: expected {}=, got '{}'", key, line));
+    }
+    return line.substr(key.size() + 1);
+}
+
+replay_state decode_replay_state(std::string_view text) {
+    if (take_line(text, "format") != replay_state_format) {
+        throw std::runtime_error("pitr replay mark: not a replay mark");
+    }
+    auto version = take_line(text, "version");
+    if (version != "1") {
+        throw std::runtime_error(seastar::format("pitr replay mark: unknown version '{}'", version));
+    }
+    replay_state state;
+    auto phase = take_line(text, "phase");
+    if (phase == phase_name(replay_phase::started)) {
+        state.phase = replay_phase::started;
+    } else if (phase == phase_name(replay_phase::done)) {
+        state.phase = replay_phase::done;
+    } else {
+        throw std::runtime_error(seastar::format("pitr replay mark: unknown phase '{}'", phase));
+    }
+    state.snapshot = sstring(take_line(text, "snapshot"));
+    state.t = sstring(take_line(text, "t"));
+    auto started = take_line(text, "started_at_us");
+    auto [end, ec] = std::from_chars(started.data(), started.data() + started.size(), state.started_at_us);
+    if (ec != std::errc() || end != started.data() + started.size() || state.started_at_us < 0) {
+        throw std::runtime_error(seastar::format("pitr replay mark: bad started_at_us '{}'", started));
+    }
+    if (!text.empty()) {
+        throw std::runtime_error("pitr replay mark: trailing bytes");
+    }
+    return state;
+}
+
+std::filesystem::path replay_state_path(const std::filesystem::path& state_dir, ::table_id target) {
+    return state_dir / fmt::format("{}.replay", target.uuid());
+}
+
+future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id target, const replay_state& state) {
+    auto body = encode(state);
+    auto path = replay_state_path(state_dir, target);
+    auto tmp = path;
+    tmp += ".tmp";
+    co_await recursive_touch_directory(state_dir.native());
+    // Flushed and fsynced under the temporary name, renamed over the final name
+    // and the directory fsynced after it, so a crash leaves either no mark or a
+    // whole one; a half-written temporary file is overwritten by the next run.
+    auto f = co_await open_file_dma(tmp.native(), open_flags::wo | open_flags::create | open_flags::truncate);
+    auto out = co_await make_file_output_stream(std::move(f));
+    std::exception_ptr ex;
+    try {
+        co_await out.write(body);
+        co_await out.flush();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await out.close();
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+    co_await rename_file(tmp.native(), path.native());
+    co_await sync_directory(state_dir.native());
+    replay_log.info("wrote the {} mark of {} to {}", phase_name(state.phase), target, path.native());
+}
+
+future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target) {
+    auto path = replay_state_path(state_dir, target);
+    if (!co_await file_exists(path.native())) {
+        co_return std::nullopt;
+    }
+    auto body = co_await seastar::util::read_entire_file_contiguous(path);
+    co_return decode_replay_state(body);
+}
+
+// The identifier of the table a `CREATE TABLE` or `ALTER TABLE` line names,
+// which a replay into another table is allowed to differ in.
+static constexpr std::string_view table_name_placeholder = "<table>";
+
+static std::string_view trim(std::string_view line) {
+    while (!line.empty() && (line.front() == ' ' || line.front() == '\t')) {
+        line.remove_prefix(1);
+    }
+    while (!line.empty() && (line.back() == ' ' || line.back() == '\t' || line.back() == '\r')) {
+        line.remove_suffix(1);
+    }
+    return line;
+}
+
+// Replaces the identifier after `keyword`, which runs to the next space, with
+// the placeholder. The statement's own words are kept, so a DROP of a column
+// still differs from an ADD of it.
+static std::optional<sstring> without_table_name(std::string_view line, std::string_view keyword) {
+    if (!line.starts_with(keyword)) {
+        return std::nullopt;
+    }
+    auto rest = line.substr(keyword.size());
+    auto end = rest.find(' ');
+    return seastar::format("{}{}{}", keyword, table_name_placeholder, end == std::string_view::npos ? std::string_view() : rest.substr(end));
+}
+
+sstring normalize_schema_cql(std::string_view text) {
+    sstring out;
+    while (!text.empty()) {
+        auto end = text.find('\n');
+        auto line = trim(end == std::string_view::npos ? text : text.substr(0, end));
+        text.remove_prefix(end == std::string_view::npos ? text.size() : end + 1);
+        if (line.empty()) {
+            continue;
+        }
+        // The `ID` option opens the WITH clause, so the next line's `AND` still
+        // reads as a continuation of a `WITH` that now carries no option.
+        if (auto id = line.find("WITH ID = "); id != std::string_view::npos) {
+            line = line.substr(0, id + 4);
+        }
+        sstring kept;
+        if (auto renamed = without_table_name(line, "CREATE TABLE ")) {
+            kept = std::move(*renamed);
+        } else if (auto renamed = without_table_name(line, "ALTER TABLE ")) {
+            kept = std::move(*renamed);
+        } else if (line.starts_with("AND compaction = {") || line.starts_with("compaction = {")) {
+            continue;
+        } else {
+            kept = sstring(line);
+        }
+        out += kept;
+        out += "\n";
+    }
+    return out;
+}
+
+std::optional<refusal> check_schema_match(std::string_view target_cql, std::string_view backup_cql) {
+    auto target = normalize_schema_cql(target_cql);
+    auto backup = normalize_schema_cql(backup_cql);
+    if (target == backup) {
+        return std::nullopt;
+    }
+    replay_log.debug("the target's schema is\n{}\nand the backup's is\n{}", target, backup);
+    // The line, so that an operator can find the difference in two statements
+    // that are hundreds of lines long, without the message carrying either.
+    auto mismatch = std::ranges::mismatch(target, backup);
+    auto line = 1 + std::count(target.begin(), mismatch.in1, '\n');
+    return refusal{
+            .reason = refusal_reason::target_schema_differs,
+            .message = "The target table's schema differs from the backup's in more than its name, its id and its compaction options. Create the target from "
+                       "the backup's schema.cql, with compaction disabled.",
+            .detail = seastar::format("the statements differ at line {} of the comparison", line),
+    };
+}
+
+// Reads one whole file of the backup, or nothing when the store does not hold
+// it. A read error is told from an absent object by asking the store, so a
+// failing read never reads as a backup taken without the file.
+//
+// The key parts come by value: this suspends, and a reference parameter would
+// outlive nothing a caller passing a literal built.
+static future<std::optional<sstring>> read_backup_file(
+        sstables::object_storage_client& client, sstring bucket, sstring prefix, sstring name, size_t cap, abort_source& as) {
+    auto object = sstables::object_name(bucket, prefix, name);
+    std::exception_ptr read_error;
+    sstring body;
+    try {
+        auto is = input_stream<char>(client.make_download_source(object, &as));
+        std::exception_ptr ex;
+        try {
+            // One byte over the cap tells an oversized object from a read this
+            // code truncated itself; either way the parse refuses it.
+            while (body.size() <= cap) {
+                auto buf = co_await is.read();
+                if (buf.empty()) {
+                    break;
+                }
+                body.append(buf.get(), buf.size());
+            }
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        co_await is.close();
+        if (ex) {
+            std::rethrow_exception(std::move(ex));
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    if (read_error) {
+        if (co_await client.object_exists(object, &as)) {
+            std::rethrow_exception(std::move(read_error));
+        }
+        replay_log.info("the backup holds no {}", object);
+        co_return std::nullopt;
+    }
+    if (body.size() > cap) {
+        throw std::runtime_error(seastar::format("{} is larger than the {} bytes a replay reads", object, cap));
+    }
+    co_return std::move(body);
+}
+
+static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, sstring detail) {
+    replay_log.warn("refusing the replay: {} ({})", message, detail);
+    return std::unexpected(refusal{.reason = reason, .message = std::move(message), .detail = std::move(detail)});
+}
+
+future<std::expected<replay_start, refusal>> start_replay_to(
+        sharded<replica::database>& db, sstables::storage_manager& sm, std::filesystem::path state_dir, const replay_to_params& p, abort_source& as) {
+    auto t = parse_t(p.t);
+    if (!t) {
+        co_return std::unexpected(t.error());
+    }
+    if (p.endpoint.empty() || p.bucket.empty() || !sm.is_known_endpoint(p.endpoint)) {
+        co_return refuse(refusal_reason::store_location_missing,
+                "The replay was given no object-storage location this node knows, so the backup cannot be read. Name a configured endpoint and its bucket.",
+                seastar::format("endpoint='{}' bucket='{}'", p.endpoint, p.bucket));
+    }
+
+    auto& local = db.local();
+    if (!local.has_schema(p.keyspace, p.table)) {
+        co_return refuse(refusal_reason::target_missing,
+                "The target table does not exist. Create it from the backup's schema.cql with compaction disabled, then call the replay again.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+    auto target_schema = local.find_schema(p.keyspace, p.table);
+    auto target = target_schema->id();
+
+    // Every shard, because the target is one table on all of them: compaction
+    // left on on one shard purges that shard's tombstones.
+    auto compacting_shards = co_await db.map_reduce0(
+            [target](replica::database& db) {
+                return size_t(!db.find_column_family(target).is_auto_compaction_disabled_by_user());
+            },
+            size_t(0), std::plus<size_t>());
+    if (compacting_shards) {
+        co_return refuse(refusal_reason::target_auto_compaction_enabled,
+                "Auto-compaction is enabled on the target table, so a compaction could purge a tombstone before the writes it covers are replayed. Disable it "
+                "on the table and call the replay again.",
+                seastar::format("{}.{}, on {} shard(s)", p.keyspace, p.table, compacting_shards));
+    }
+
+    // Sstables and the memtables that hold writes this node took: a replay
+    // writes the backup and then the history over the target, and could not
+    // tell its own writes from whatever was there before.
+    auto occupied_shards = co_await db.map_reduce0(
+            [target](replica::database& db) {
+                auto& t = db.find_column_family(target);
+                size_t occupied = t.sstables_count();
+                t.for_each_active_memtable([&occupied](replica::memtable& m) {
+                    occupied += m.empty() ? 0 : 1;
+                });
+                return occupied;
+            },
+            size_t(0), std::plus<size_t>());
+    if (occupied_shards) {
+        co_return refuse(refusal_reason::target_not_empty,
+                "The target table is not empty. A replay writes over it, so it must be a table nothing has been written to.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+
+    auto mark_path = replay_state_path(state_dir, target);
+    std::optional<replay_state> existing;
+    try {
+        existing = co_await read_replay_state(state_dir, target);
+    } catch (...) {
+        // A mark that cannot be read is not a table no replay ever touched.
+        co_return refuse(refusal_reason::target_already_replayed,
+                "A replay already ran into the target table and its mark cannot be read. Replay into a table created for it.",
+                seastar::format("{}: {}", mark_path.native(), std::current_exception()));
+    }
+    if (existing) {
+        co_return refuse(refusal_reason::target_already_replayed, "A replay already ran into the target table. Replay into a table created for it.",
+                seastar::format("{} says {}, from backup '{}' to {}", mark_path.native(), phase_name(existing->phase), existing->snapshot, existing->t));
+    }
+
+    auto client = sm.get_endpoint_client(p.endpoint);
+    auto bound_body = co_await read_backup_file(*client, p.bucket, p.prefix, bound_file_name, max_bound_file_size, as);
+    if (!bound_body) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup carries no point-in-time recovery bound, so where its sstables end and the replay starts is unknown. It was taken with shipping "
+                "off, or the prefix names another backup.",
+                seastar::format("{}/{}", p.prefix, bound_file_name));
+    }
+    bound_file bound;
+    try {
+        bound = decode_bound_file(*bound_body);
+    } catch (const bound_file_format_error&) {
+        co_return refuse(refusal_reason::bound_file_damaged,
+                "The backup's point-in-time recovery bound is damaged, so where the replay starts cannot be proved. Restore from another backup.",
+                seastar::format("{}/{}: {}", p.prefix, bound_file_name, std::current_exception()));
+    }
+
+    auto backup_cql = co_await read_backup_file(*client, p.bucket, p.prefix, schema_cql_file_name, max_schema_cql_size, as);
+    if (!backup_cql) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup carries no schema, so the target cannot be checked against it. The prefix names another backup.",
+                seastar::format("{}/{}", p.prefix, schema_cql_file_name));
+    }
+    auto describe_helper = replica::make_schema_describe_helper(target_schema, local.as_data_dictionary());
+    auto target_cql = target_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
+    if (auto mismatch = check_schema_match(target_cql, *backup_cql)) {
+        replay_log.warn("refusing the replay: {}", *mismatch);
+        co_return std::unexpected(std::move(*mismatch));
+    }
+
+    // Last, so that every refusal above leaves the node as it was. From here on
+    // the target reads as `incomplete` until a replay writes `done` over it.
+    co_await write_replay_state(state_dir, target,
+            replay_state{
+                    .phase = replay_phase::started,
+                    .snapshot = p.snapshot,
+                    .t = p.t,
+                    .started_at_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
+            });
+    replay_log.info("replay of backup '{}' into {}.{} to {} started: {} shard(s) in the bound, captured at {}us", p.snapshot, p.keyspace, p.table, p.t,
+            bound.shards.size(), bound.capture_time_us);
+    co_return replay_start{.target = target, .t = *t, .bound = std::move(bound)};
+}
+
+} // namespace db::pitr

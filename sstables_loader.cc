@@ -47,6 +47,7 @@
 
 #include <cfloat>
 #include <algorithm>
+#include <filesystem>
 #include <set>
 #include "utils/assert.hh"
 
@@ -939,6 +940,47 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
             prefix = std::move(prefix), sstables = std::move(sstables), scope, primary_replica] (tasks::task_manager::task::impl& self) {
         return download_and_stream(*progress, endpoint, bucket, ks_name, cf_name, prefix, sstables, scope, primary_replica_only(primary_replica), self.get_abort_source());
     });
+    co_return task->id();
+}
+
+static constexpr auto pitr_replay_to_task_type = "pitr_replay_to";
+
+// One directory per node, beside the data: the mark is this node's record of
+// what it did to a target table, and is read before any data is loaded.
+static std::filesystem::path pitr_replay_state_dir(const db::config& cfg) {
+    return std::filesystem::path(cfg.work_directory()) / "pitr" / "replay";
+}
+
+future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& params, const std::vector<sstring>& sstables, abort_source& as) {
+    auto start = co_await db::pitr::start_replay_to(_db, _storage_manager, pitr_replay_state_dir(_db.local().get_config()), params, as);
+    if (!start) {
+        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} refused: {}", params.keyspace, params.table, start.error()));
+    }
+
+    // The load of the backup is ep.2 and the replay of the shipped history
+    // ep.3. Until they land the task ends in failure and never in `done`: the
+    // target carries the `started` mark, so it reads as incomplete, and a
+    // recovery that did not replay anything may not read as a finished one.
+    throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} to {} is not built yet: the target was checked and marked, and stays incomplete",
+            params.keyspace, params.table, params.t));
+}
+
+future<tasks::task_id> sstables_loader::pitr_replay_to(db::pitr::replay_to_params params, std::vector<sstring> sstables) {
+    llog.info("Point-in-time replay of backup '{}' from {}({}) into {}.{} to t={}, sstables={}", params.snapshot, params.endpoint, params.prefix,
+            params.keyspace, params.table, params.t, sstables.size());
+
+    tasks::task_manager::task_builder task_builder{_task_manager_module, pitr_replay_to_task_type};
+    task_builder.set_scope("node")
+            .set_keyspace(params.keyspace)
+            .set_table(params.table)
+            .set_is_abortable(tasks::is_abortable::yes)
+            .set_is_internal(tasks::is_internal::no)
+            .set_is_user_task(tasks::is_user_task::yes);
+    // The task owns both, and outlives the body that refers to them.
+    auto task =
+            co_await std::move(task_builder).build([this, params = std::move(params), sstables = std::move(sstables)](tasks::task_manager::task::impl& self) {
+                return do_pitr_replay_to(params, sstables, self.get_abort_source());
+            });
     co_return task->id();
 }
 
