@@ -38,6 +38,7 @@
 #include "sstables/object_storage_client.hh"
 #include "sstables/sstables_manager.hh"
 #include "utils/crc.hh"
+#include "utils/error_injection.hh"
 #include "utils/log.hh"
 #include "utils/on_internal_error.hh"
 
@@ -860,7 +861,13 @@ future<std::expected<replay_run_stats, refusal>> replay_history_into_target(shar
             params.close_segment = [](const sstring& local_path) -> future<> {
                 // The local copy is of no use to anything once the reader is
                 // done with it, and the next fetch needs the disk.
-                return remove_quietly(std::filesystem::path(std::string_view(local_path)));
+                co_await remove_quietly(std::filesystem::path(std::string_view(local_path)));
+                // One segment of the history is read and the next is not, so a
+                // test can fail a run in the middle of the replay rather than
+                // before it or after it.
+                utils::get_local_injector().inject("pitr_replay_segment_replayed", [] {
+                    throw std::runtime_error("Injected replay failure");
+                });
             };
             replay_reader_stats reader;
             try {
