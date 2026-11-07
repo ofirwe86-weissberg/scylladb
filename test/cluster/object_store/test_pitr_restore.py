@@ -30,20 +30,6 @@ BIG_VALUE_BYTES = 15 * 1024 * 1024
 PURGEABLE_SCHEMA = f'{TABLE_SCHEMA} {PURGEABLE_OPTIONS}'
 
 
-# seed_statements writes a row at pk + 100 for each key, and the history deletes that partition. The team's end-to-end runs showed
-# these three seed rows present in the target, so T1 expects them (the brief of task C2). The delete of every other pk + 100 is
-# still checked.
-SEED_ROWS_KEPT = (100, 102, 103)
-
-
-def expected_statements(seed, history):
-    """The statements T1's expected set is built from: the seed and the history, minus the partition deletes of the seed rows
-    above, so those rows are expected."""
-    skipped = tuple(f'WHERE pk = {pk}' for pk in SEED_ROWS_KEPT)
-    kept = [w for w in history if not (getattr(w, 'cql', '').startswith('DELETE FROM {t}') and w.cql.endswith(skipped))]
-    return seed + kept
-
-
 @needs_phase('ep.3')
 async def test_restore_is_exact_at_t_on_every_shard(manager: ScyllaClusterManager, s3_storage):
     """T1: RST-1, RST-2, limit 26, RTN-1, P52. Every kind of change on every shard, writes 1 microsecond either side of T on one
@@ -73,7 +59,7 @@ async def test_restore_is_exact_at_t_on_every_shard(manager: ScyllaClusterManage
         await p.covered(t + 1_000_000)
 
         outcome, target = await p.replay_done(t)
-        await assert_exact(p.cql, p.ks, target, expected_statements(seed, history), t)
+        await assert_exact(p.cql, p.ks, target, seed + history, t)
         await assert_every_shard(p.cql, p.ks, target, pks)
         assert not [r for r in await read_exact(p.cql, p.ks, target) if 'from u' in r], 'a value from table u was applied'
         late = {r.pk: r.writetime_v for r in await p.cql.run_async(f'SELECT pk, WRITETIME(v) AS writetime_v FROM {p.ks}.t WHERE ck = 0 ALLOW FILTERING')
