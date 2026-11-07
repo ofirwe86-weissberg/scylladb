@@ -204,7 +204,9 @@ static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, s
 
 // A file no step may read again. Removing it must not hide the failure that led
 // here, nor fail a run that is otherwise fine.
-static future<> remove_quietly(const std::filesystem::path& path) noexcept {
+// By value: this suspends, and a caller with a temporary path would otherwise
+// leave a dangling reference across the suspension.
+static future<> remove_quietly(std::filesystem::path path) noexcept {
     try {
         if (co_await file_exists(path.native())) {
             co_await remove_file(path.native());
