@@ -25,6 +25,7 @@
 #include <seastar/util/file.hh>
 
 #include "cql3/description.hh"
+#include "db/config.hh"
 #include "db/pitr/t_parser.hh"
 #include "replica/database.hh"
 #include "replica/memtable.hh"
@@ -410,7 +411,6 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                 "The replay was given no object-storage location this node knows. Name a configured endpoint and its bucket.",
                 seastar::format("endpoint='{}' bucket='{}'", p.endpoint, p.bucket));
     }
-
     auto& local = db.local();
     if (!local.has_schema(p.keyspace, p.table)) {
         co_return refuse(refusal_reason::target_missing,
@@ -529,6 +529,29 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
         co_return std::unexpected(std::move(*mismatch));
     }
 
+    // The history is read from where this node ships, not from the call: the
+    // backup and the shipped segments can live in different stores, and the call
+    // names the backup's (P51). A node with shipping off has nowhere to read the
+    // history from, so the replay is refused with nothing loaded and no mark.
+    const auto& cfg = local.get_config();
+    const sstring history_endpoint = cfg.pitr_endpoint();
+    const sstring history_bucket = cfg.pitr_bucket();
+    if (history_endpoint.empty() || history_bucket.empty() || !sm.is_known_endpoint(history_endpoint)) {
+        co_return refuse(refusal_reason::store_location_missing,
+                "This node has no point-in-time shipping location it knows, so the history between the backup and T cannot be read. Set pitr_endpoint and "
+                "pitr_bucket to the store the backup's node shipped to, and restart.",
+                seastar::format("pitr_endpoint='{}' pitr_bucket='{}'", history_endpoint, history_bucket));
+    }
+
+    // Before the mark, so a T above coverage leaves the target untouched and the
+    // user retries on it with a T the refusal names (REF-5).
+    auto history_client = sm.get_endpoint_client(history_endpoint);
+    auto history = co_await check_bound_chains(*history_client, history_bucket, cfg.pitr_prefix(), bound, *t, as);
+    if (!history) {
+        replay_log.warn("refusing the replay: {}", history.error());
+        co_return std::unexpected(std::move(history.error()));
+    }
+
     // Last, so every refusal above leaves the node as it was.
     co_await write_replay_state(state_dir, target,
             replay_state{
@@ -539,12 +562,15 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                     .source_table = manifest->table,
                     .started_at_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
             });
-    replay_log.info("replay of backup '{}' of {}.{} into {}.{} to {} started: {} sstable(s), {} shard(s) in the bound, captured at {}us", p.snapshot,
-            manifest->keyspace, manifest->table, p.keyspace, p.table, p.t, manifest->toc_names.size(), bound.shards.size(), bound.capture_time_us);
+    replay_log.info(
+            "replay of backup '{}' of {}.{} into {}.{} to {} started: {} sstable(s), {} shard(s) in the bound, captured at {}us, chains covering through {}us",
+            p.snapshot, manifest->keyspace, manifest->table, p.keyspace, p.table, p.t, manifest->toc_names.size(), bound.shards.size(), bound.capture_time_us,
+            history->covered_through_us);
     co_return replay_start{
             .target = target,
             .t = *t,
             .bound = std::move(bound),
+            .history = std::move(*history),
             .toc_names = std::move(manifest->toc_names),
             .source_keyspace = std::move(manifest->keyspace),
             .source_table = std::move(manifest->table),

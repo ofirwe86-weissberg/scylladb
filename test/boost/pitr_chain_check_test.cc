@@ -35,6 +35,7 @@
 #include <seastar/core/iostream.hh>
 #include <seastar/util/later.hh>
 
+#include "db/pitr/bound_file.hh"
 #include "db/pitr/chain_check.hh"
 #include "db/pitr/ledger_entry.hh"
 #include "sstables/object_storage_client.hh"
@@ -284,6 +285,78 @@ const refusal& refused(const std::expected<checked_chain, refusal>& result, refu
 const checked_chain& accepted(const std::expected<checked_chain, refusal>& result) {
     if (!result.has_value()) {
         BOOST_FAIL(fmt::format("the check refused the chain: {}", result.error()));
+    }
+    return *result;
+}
+
+// The whole bound file, one shard at a time. Each shard ships a chain of its
+// own, as a real node does: the shard is part of every key, so a check that
+// read shard 0's chain twice would show up as the wrong keys.
+
+constexpr int64_t test_capture_time_us = test_chain_start_us + 10000;
+
+chain_id chain_of_shard(uint32_t shard) {
+    return chain_id{utils::UUID(std::string_view(fmt::format("11112222-0000-4000-8000-00000000{:04x}", 0x100 + shard)))};
+}
+
+chain_key_parts shard_chain_key(uint32_t shard) {
+    auto key = test_chain_key(chain_of_shard(shard));
+    key.shard = shard;
+    return key;
+}
+
+// `coverage` is what its last entry carries, and the entries below it step down
+// from it, so one shard's coverage is set by the test alone.
+void store_shard_chain(fake_store& store, uint32_t shard, uint64_t count, int64_t coverage) {
+    for (uint64_t sequence = 0; sequence < count; ++sequence) {
+        auto entry = make_entry(sequence);
+        entry.shard = shard;
+        entry.chain = chain_of_shard(shard);
+        entry.covered_through_us = coverage - int64_t(count - 1 - sequence) * covered_step_us;
+        entry.upload_time_us = entry.covered_through_us + 1000;
+        const auto body = encode(entry);
+        store.put(entry_object_key(shard_chain_key(shard), sequence), std::string(reinterpret_cast<const char*>(body.data()), body.size()));
+    }
+}
+
+shard_bound bound_row(uint32_t shard, bool with_chain = true) {
+    shard_bound row;
+    row.shard = shard;
+    row.bound = db::replay_position(first_segment_id, 1);
+    if (with_chain) {
+        row.chain = db::pitr::shard_chain{
+                .host_id = test_host_id,
+                .boot_epoch_us = test_boot_epoch_us,
+                .chain_start_us = test_chain_start_us,
+                .chain = chain_of_shard(shard),
+                .floor_segment_id = first_segment_id,
+        };
+    }
+    return row;
+}
+
+bound_file bound_of(std::vector<shard_bound> shards) {
+    bound_file bound;
+    bound.capture_time_us = test_capture_time_us;
+    bound.shards = std::move(shards);
+    return bound;
+}
+
+future<std::expected<checked_history, refusal>> check_all(fake_store& store, const bound_file& bound, int64_t target_time_us) {
+    fake_client client(store);
+    abort_source as;
+    co_return co_await check_bound_chains(client, bucket, key_prefix, bound, target_time_us, as);
+}
+
+const refusal& refused_history(const std::expected<checked_history, refusal>& result, refusal_reason reason) {
+    BOOST_REQUIRE_MESSAGE(!result.has_value(), "the check accepted the bound where a refusal was expected");
+    BOOST_REQUIRE_EQUAL(result.error().code(), reason_code(reason));
+    return result.error();
+}
+
+const checked_history& accepted_history(const std::expected<checked_history, refusal>& result) {
+    if (!result.has_value()) {
+        BOOST_FAIL(fmt::format("the check refused the bound: {}", result.error()));
     }
     return *result;
 }
@@ -593,4 +666,97 @@ SEASTAR_TEST_CASE(test_every_refusal_reason_has_a_code_of_its_own) {
     }
     BOOST_REQUIRE_EQUAL(codes.size(), all_refusal_reasons.size());
     co_return;
+}
+
+// Every shard of the bound is checked, and the node covers what its least
+// covered shard does: a write of any shard can be the one missing above it.
+SEASTAR_TEST_CASE(test_every_shard_of_the_bound_is_checked) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 3, low + covered_step_us);
+    store_shard_chain(store, 1, 2, low);
+    const auto bound = bound_of({bound_row(0), bound_row(1)});
+    const auto result = co_await check_all(store, bound, low);
+    const auto& history = accepted_history(result);
+    BOOST_REQUIRE_EQUAL(history.chains.size(), 2);
+    BOOST_REQUIRE_EQUAL(history.covered_through_us, low);
+    BOOST_REQUIRE_EQUAL(history.chains[0].entries_read, 3);
+    BOOST_REQUIRE_EQUAL(history.chains[1].entries_read, 2);
+    // Each shard's own chain, and not shard 0's read twice.
+    for (uint32_t shard = 0; shard < 2; ++shard) {
+        for (const auto& segment : history.chains[shard].segments) {
+            BOOST_REQUIRE_MESSAGE(segment.path.starts_with(chain_key_prefix(shard_chain_key(shard))),
+                    fmt::format("shard {} holds a segment of another chain: {}", shard, segment.path));
+        }
+    }
+}
+
+// The lagging shard is the one the user is told about: it is what bounds T, and
+// a T at or below its coverage is the one to retry with.
+SEASTAR_TEST_CASE(test_the_shard_covering_least_is_the_one_refused) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 2, low + 10 * covered_step_us);
+    store_shard_chain(store, 1, 2, low);
+    const auto bound = bound_of({bound_row(0), bound_row(1)});
+    const auto result = co_await check_all(store, bound, low + 1);
+    const auto& r = refused_history(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE_EQUAL(r.detail, "shard 1");
+    BOOST_REQUIRE(r.interval);
+    BOOST_REQUIRE_EQUAL(r.interval->through_us, low);
+}
+
+// With more than one shard lagging, the one covering least is still the one
+// reported: a T the better covered shard allows would be refused again.
+SEASTAR_TEST_CASE(test_the_least_covered_of_several_lagging_shards_is_the_one_refused) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 2, low + 2 * covered_step_us);
+    store_shard_chain(store, 1, 2, low);
+    store_shard_chain(store, 2, 2, low + covered_step_us);
+    const auto bound = bound_of({bound_row(0), bound_row(1), bound_row(2)});
+    const auto result = co_await check_all(store, bound, low + 3 * covered_step_us);
+    const auto& r = refused_history(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE_EQUAL(r.detail, "shard 1");
+    BOOST_REQUIRE_EQUAL(r.interval->through_us, low);
+}
+
+// The interval offered starts at the backup and not at the chain: below the
+// capture time this backup has nothing to restore to.
+SEASTAR_TEST_CASE(test_the_offered_interval_starts_at_the_backup) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 2, low);
+    const auto bound = bound_of({bound_row(0)});
+    const auto result = co_await check_all(store, bound, low + 1);
+    const auto& r = refused_history(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE(r.interval);
+    BOOST_REQUIRE_EQUAL(r.interval->from_us, test_capture_time_us);
+    BOOST_REQUIRE_GT(test_capture_time_us, test_chain_start_us);
+}
+
+// A shard no lower T would make readable outranks one that only lags: lowering
+// T on the advice of a lagging shard would refuse again for the damaged one.
+SEASTAR_TEST_CASE(test_a_damaged_chain_outranks_a_lagging_shard) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 2, low);
+    store_shard_chain(store, 1, 2, low + 10 * covered_step_us);
+    store.put(entry_object_key(shard_chain_key(1), 1), "not a ledger entry at all");
+    const auto bound = bound_of({bound_row(0), bound_row(1)});
+    const auto result = co_await check_all(store, bound, low + 1);
+    const auto& r = refused_history(result, refusal_reason::protection_records_damaged);
+    BOOST_REQUIRE(r.detail.find(entry_object_key(shard_chain_key(1), 1)) != sstring::npos);
+}
+
+// The bound names the shard, so it was writing when the backup was taken; with
+// no chain recorded, nothing says it ever shipped (PM-50).
+SEASTAR_TEST_CASE(test_a_shard_the_bound_records_without_a_chain_is_refused) {
+    fake_store store;
+    const auto low = covered_us_of(5);
+    store_shard_chain(store, 0, 2, low);
+    const auto bound = bound_of({bound_row(0), bound_row(1, false)});
+    const auto result = co_await check_all(store, bound, low);
+    const auto& r = refused_history(result, refusal_reason::protection_records_missing);
+    BOOST_REQUIRE(r.detail.find("shard 1") != sstring::npos);
 }
