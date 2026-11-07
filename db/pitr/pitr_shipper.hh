@@ -10,9 +10,9 @@
 
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <expected>
 #include <functional>
-#include <map>
 #include <optional>
 #include <string_view>
 #include <unordered_map>
@@ -66,16 +66,14 @@ extern seastar::logger pitr_logger;
 // The interval is the floor of the recovery point objective, so refuse hours.
 constexpr std::chrono::seconds max_seal_interval = std::chrono::hours(1);
 
-// Subtracted from every coverage capture (design, "Ledger"). The capture
-// already precedes the seal, which is what makes a write before it shipped, so
-// this is only a buffer against a stepping clock and a client's own timestamps.
+// Subtracted from every coverage capture (design, "Ledger"): a buffer against
+// a stepping clock and a client's own timestamps.
 constexpr std::chrono::microseconds coverage_margin = std::chrono::seconds(1);
 
 // The nodes the cluster holds, as the topology state machine sees them: normal
-// members, the ones a transition is moving, and the ones waiting to be joined.
-// Nodes that have left are not counted (issue #7). The one count source, for
-// the startup check and every seal cycle. Pure and constant-time; the caller
-// must read the topology on shard 0, the only shard that loads it.
+// members, moving ones and ones waiting to be joined, but not the ones that
+// have left (issue #7). The one count source, for the startup check and every
+// cycle. Pure, constant-time, and read on shard 0, the only shard with it.
 size_t count_cluster_nodes(const service::topology&) noexcept;
 
 // Whether the node's user tables write to the commitlog, which is what the
@@ -105,12 +103,9 @@ enum class shipping_state {
     // An upload failed in a way no retry can fix, so the chain has a hole:
     // shipping stops for good and every hold is released (D25).
     off_upload_failed,
-    // A ledger entry could not be written, so what was shipped after it can
-    // never be proved: the chain ends at the last entry written.
+    // A ledger entry could not be written, so the chain ends before it.
     off_ledger_failed,
-    // A segment the chain holds, or was about to hold, will not be in the
-    // store: covering past it would claim writes that were never shipped. See
-    // segment_closed() for the three ways it happens.
+    // A segment the chain holds, or was about to, will not be in the store.
     off_chain_broken,
     // Waiting for the node's cluster membership to be counted.
     waiting_for_cluster_size,
@@ -134,38 +129,40 @@ std::expected<shipper_config, shipping_state> make_shipper_config(const db::conf
 
 // What the wiring sets commitlog::config::hold_segments from: only a usable
 // store with user tables writing to the commitlog holds segments. The hold rule
-// the rest of this header refers to: the hold is fixed when the commitlog is
-// built, long before shipping starts, so until it does every non-failed close
-// is released at once, and a failed close releases nothing - the commitlog has
-// dropped it itself (issue #8).
+// this header refers to: the hold is fixed when the commitlog is built, so
+// until shipping starts every non-failed close is released at once and a failed
+// one releases nothing, the commitlog having dropped it (issue #8).
 bool should_hold_segments(const db::config&);
 
 // Drops one hold. Runs inside the close: must not block or throw.
 using release_hook = std::function<void(db::segment_id_type)>;
 
-// What only the wiring knows. Both required; the release hook is separate.
+// What only the wiring knows. All required; the release hook is separate.
 struct segment_hooks {
     // One handle per upload attempt, by segment_upload.hh's rules for `f`:
     // never reused by a retry, and never the commitlog's own.
     std::function<future<seastar::file>(db::segment_id_type)> open_segment;
     // Where a segment's bytes are stored, under its own file name.
     std::function<sstables::object_name(db::segment_id_type)> object_name_of;
+    // commitlog::held_segments(). A rotated segment is listed here before its
+    // close is reported, the commitlog not awaiting the close (commitlog.cc,
+    // finish_and_get_new()), which is the only way to tell "no lower segment
+    // exists" from "its close has not arrived".
+    std::function<std::vector<db::segment_id_type>()> held_segments;
 };
 
 // A held segment's id to its path, or nothing: held_segment_path()'s shape.
 using segment_path_function = std::function<std::optional<sstring>(db::segment_id_type)>;
+using held_segments_function = std::function<std::vector<db::segment_id_type>()>;
 
 // What only the wiring knows about the chain this shard is about to start.
 struct chain_origin {
     utils::UUID host_id;       // part of every object key of the chain
     int64_t boot_epoch_us = 0; // one per boot, so every shard names the boot
-    // The highest id the commitlog holds when shipping starts, which is
-    // std::ranges::max(held_segments()) and not its last element: an id is
-    // assigned when a reserve segment is allocated and the hold is taken when
-    // it is written, so the two orders can differ. The chain's floor: below it
-    // a segment was written before the chain began, so it is released, not
-    // shipped (D27).
-    // Empty when nothing is held, which lets every later close ship.
+    // std::ranges::max(held_segments()) when shipping starts, not its last
+    // element: the hold order is not the id order. Below this floor a segment
+    // was written before the chain, so it is released, not shipped (D27).
+    // Empty when nothing is held, so every later close ships.
     std::optional<db::segment_id_type> floor;
 };
 
@@ -197,9 +194,9 @@ public:
 
 // Ships sealed commitlog segments to object storage, one per shard. While
 // shipping is on it runs the seal timer, uploads the segments whose close the
-// commitlog reports, and records each in the ledger in segment-id order,
-// releasing its hold once its entry is in the store. While off it owns no timer
-// or client, so a node without PITR behaves as before.
+// commitlog reports, and records each in the ledger in segment-id order, which
+// is what releases its hold. While off it owns no timer and no client, so a
+// node without PITR behaves as before.
 class pitr_shipper final {
 public:
     // Seals the active segment of the main commitlog only, skipping unused
@@ -207,10 +204,9 @@ public:
     // segment is gone from the active slot either way, and the next cycle seals
     // whatever is active then. A failed close arrives through segment_closed().
     using seal_function = seastar::noncopyable_function<future<>()>;
-    // count_cluster_nodes()'s count. A future, because the real one is read on
-    // shard 0; it runs every cycle, so it must be cheap. A count that could not
-    // be established must fail rather than return 0: any count but one turns
-    // shipping off for good, and so does a failure, except during stop().
+    // count_cluster_nodes()'s count, read on shard 0, so a future; it runs
+    // every cycle and must be cheap. A count that could not be established
+    // must fail rather than return 0: any count but one turns shipping off.
     using node_count_function = seastar::noncopyable_function<future<size_t>()>;
     // Flushes this shard's user tables once. See flush_after_start().
     using flush_function = seastar::noncopyable_function<future<>()>;
@@ -259,54 +255,59 @@ private:
     // not in the store yet.
     struct pending_segment {
         uint64_t used_size = 0;
-        // The capture in force when the close was reported, never a later one:
-        // a later capture can cover a write that went into a later segment.
-        int64_t covered_through_us = 0;
         uint32_t crc32 = 0;
         sstring file_name;
-        // Its bytes are in the store, so only its turn in the order is left.
+        // Its bytes are in the store: only its turn in the order is left.
         bool stored = false;
     };
-    // In segment-id order, because the entries go out in that order whatever
-    // order the uploads finish in. Bounded by the segments the commitlog
-    // holds, which its own hold limit bounds.
+    // In segment-id order, bounded by the held segments.
     std::map<db::segment_id_type, pending_segment> _pending;
-    // One entry put at a time per shard, so the store never holds a later entry
-    // than the one being written; `_recording_id` is the segment it is for.
+    // One entry put at a time; `_recording_id` is its segment.
     bool _recording = false;
     std::optional<db::segment_id_type> _recording_id;
     uint64_t _next_sequence = 0;
-    // The segment of the last entry written, which the next entry links to; 0
-    // before the first entry, which is what its link carries.
+    // The segment of the last entry, which the next one links to; 0 at first.
     db::segment_id_type _prev_recorded_id = 0;
-    // Aborts the entry put in flight. One per shard rather than one per
-    // segment, because every abort of it - stop(), a break, a rollback of the
-    // segment being recorded - also means no later entry is ever written.
+    // Aborts the entry put in flight; every abort of it also means no later
+    // entry is ever written, so one per shard is enough.
     abort_source _ledger_as;
-    // The latest coverage capture, which every close from now on carries. 0
-    // until the first seal cycle: a write from before the chain began can sit
-    // in a segment below the floor, which this chain does not hold.
-    int64_t _coverage_us = 0;
+    // One cycle's capture: the time, and the highest id the log held then.
+    // Every write acknowledged before the time is in that segment or below it,
+    // so only an entry at or above `top_held_id` may claim it.
+    struct coverage_capture {
+        db::segment_id_type top_held_id = 0;
+        int64_t covered_through_us = 0;
+    };
+    // In increasing `top_held_id`, pruned on the way in and at each entry.
+    std::deque<coverage_capture> _captures;
+    // The last entry's coverage, which a segment with no capture takes.
+    int64_t _prev_coverage_us = 0;
     uint64_t _segments_shipped = 0;
     uint64_t _segments_unshipped = 0;
 
     future<> seal_loop();
     future<> seal_cycle();
-    // Takes the coverage every segment closing from now on carries, before
-    // anything else a cycle does (P50).
-    void capture_coverage() noexcept;
+    // Takes a capture, before anything else a cycle does (P50).
+    void capture_coverage();
+    // The newest capture this segment may carry, else the previous entry's.
+    int64_t coverage_for(db::segment_id_type id);
+    // A segment held below `id` and at or above the floor whose close has not
+    // been reported: `id` cannot be recorded before it.
+    std::optional<db::segment_id_type> unreported_held_below(db::segment_id_type id) const;
+    // Drops holds one at a time, yielding, inside the upload gate.
+    future<> release_holds(std::vector<db::segment_id_type> ids);
     void break_shipping(shipping_state, sstring reason);
-    // Uploads one segment's used bytes and marks it ready to record. Reports
-    // its own failures rather than throwing.
+    // Uploads one segment and marks it ready to record; reports its own
+    // failures rather than throwing.
     future<> ship_segment(db::segment_id_type id, uint64_t used_size);
     // No success is recorded; the hold follows segment_closed()'s rule.
     void note_upload_aborted(db::segment_id_type id);
     void note_entry_aborted(db::segment_id_type id);
-    // Starts the recorder unless one is already running or nothing is ready.
+    // Starts the recorder unless one runs already or nothing is ready.
     void record_ready_entries();
-    // Writes the entry of every pending segment whose bytes are stored, lowest
-    // id first, releasing each hold once its entry is in the store. Stops at
-    // the first segment not stored yet; reports its own failures.
+    // Writes the entry of every stored pending segment, lowest id first,
+    // releasing each hold once its entry is in the store. Stops at the first
+    // segment not stored yet or not yet reported; reports its own failures.
     future<> record_entries();
 
 public:
@@ -321,26 +322,21 @@ public:
 
     // Stops the seal timer, aborts every upload and the entry put in flight,
     // and waits for the seal, the uploads and the recorder to unwind. The abort
-    // wins over an upload or a put that has just finished, so a segment aborted
-    // here keeps its hold, which the shutdown's own delete clears; the chain
-    // ends at the last entry written, and the restart is itself the break
-    // (SHP-7). Safe without a preceding start().
-    //
-    // It waits as long as the store client takes to abandon a request it has
-    // issued, which can be that client's own timeout: the S3 credential lookup
-    // does not watch the abort source, and a shutdown during one measured about
-    // 30 s per shard. Shutdown is not bounded by this unit.
+    // wins over one that has just finished, so a segment aborted here keeps its
+    // hold and the chain ends at the last entry written (SHP-7). Safe without a
+    // preceding start(). It waits as long as the store client takes to abandon
+    // a request, which can be that client's own timeout (about 30 s per shard
+    // for an S3 credential lookup), so shutdown is not bounded here.
     future<> stop();
 
     // Installs the hook that drops a hold, before the store client, as the hold
     // rule needs. It must outlive stop().
     void set_release_hook(release_hook hook);
 
-    // Installs the store client and the hooks uploads run with, and needs the
-    // release hook already installed. Takes effect only while shipping is
-    // active and before stop(); a second call is ignored. A call that takes
-    // effect is where this shard's chain begins: identity and floor come from
-    // `origin` and stay as they are until the node restarts.
+    // Installs the store client and the hooks uploads run with; needs the
+    // release hook installed, and takes effect only while shipping is active
+    // and before stop(), a second call being ignored. A call that takes effect
+    // is where the chain begins: its identity and floor come from `origin`.
     void start_shipping(seastar::shared_ptr<sstables::object_storage_client> client, segment_hooks hooks, chain_origin origin);
 
     // Empty until start_shipping() has taken effect. #9 and the bound file
@@ -356,9 +352,9 @@ public:
 
     // The one flush the wiring owes once shipping has started: a table never
     // written again would keep a later backup's bound below this chain's start,
-    // and that backup would be refused (D27). Runs in the background inside the
-    // gate stop() waits for; a failure is logged and breaks nothing. Dropped
-    // unless active and before stop().
+    // and that backup would be refused (D27). Runs in the background inside
+    // the gate stop() waits for, a failure being logged; dropped unless
+    // shipping is active and stop() has not begun.
     void flush_after_start(flush_function flush);
 
     // The commitlog's close notification for a held segment. It runs inside the
@@ -366,38 +362,27 @@ public:
     // `used_size` is the bytes a replay would read; `failed` means the segment
     // must not be shipped, and the commitlog has dropped its hold already.
     //
-    // What each close does, in order:
-    // - before start_shipping(), in every state, and once shipping has broken
-    //   (D25), the hold rule applies; with no release hook it is ignored;
-    // - `failed` at or above the floor ends the chain: that segment's writes
-    //   will never be in the store, so no entry above it may cover them. Its
-    //   upload or entry put in flight is aborted, so a file the rollback may
-    //   have erased is not recorded as shipped - but a put that had already
-    //   finalized cannot be taken back, so it is the break, not the abort,
-    //   that the chain relies on;
-    // - below chain_floor() it is released and not shipped, and a failed one
-    //   there is no hole in the chain: it was written before this chain, and
-    //   closes are not ordered by id (commitlog.hh);
+    // What each close does, in the order the cases are checked:
+    // - before start_shipping(), once shipping has broken (D25), or once stop()
+    //   has begun, the hold rule applies; with no release hook it is ignored;
+    // - `failed` at or above the floor ends the chain, because that segment's
+    //   writes will never be in the store and no entry above it may cover
+    //   them; its upload or entry put in flight is aborted;
+    // - below chain_floor() it is released and not shipped, failed or not: it
+    //   was written before this chain, and closes are not ordered by id;
     // - a repeat for a segment being shipped or waiting for its entry is
-    //   ignored, so it cannot start a second upload or release the hold early
-    //   by reporting a used size of 0;
+    //   ignored, so it cannot start a second upload or release the hold early;
     // - below the last entry recorded it breaks the chain too: it cannot be
-    //   appended without making the entries go backwards, and skipping it
-    //   would leave the entries above it covering writes it holds;
-    // - `used_size` 0 is released at once: an empty object would describe a
-    //   segment that holds nothing. Any other hold goes once its bytes are
-    //   stored and its ledger entry is in the store, which is also what makes
-    //   the segment part of the chain;
-    // - once stop() has begun it is released, and the chain ends at the last
-    //   segment shipped. The drain's closes arrive before stop(), so stop()
-    //   waits each out or aborts it, for as long as the client takes (see
-    //   stop()); an aborted one keeps its hold.
+    //   appended in order, and skipping it would leave the entries above it
+    //   covering writes it holds;
+    // - `used_size` 0 is released at once; any other hold goes once the bytes
+    //   and the ledger entry are both in the store, which is what puts the
+    //   segment in the chain.
     void segment_closed(db::segment_id_type id, uint64_t used_size, bool failed);
 
-    // Arms the seal timer and does nothing else. Dropped, and not remembered,
-    // unless shipping is already active and stop() has not begun, so it must
-    // follow note_cluster_size(1); a second call is ignored, so the timer is
-    // never armed twice. The timer only triggers seal_tick().
+    // Arms the seal timer and does nothing else, so it must follow
+    // note_cluster_size(1); dropped unless shipping is active and stop() has
+    // not begun, and a second call is ignored. The timer only ticks.
     void start_sealing(seal_function seal, node_count_function count_nodes);
 
     // One timer tick, which starts a seal cycle in the background. A tick during
@@ -434,10 +419,9 @@ public:
         return _last_failure;
     }
 
-    // Called once the node has joined, with count_cluster_nodes()'s count. The
-    // startup check; the seal cycle repeats it, so a node added later is
-    // noticed there. Anything but one node, zero included, refuses shipping
-    // until the next restart.
+    // Called once the node has joined, with count_cluster_nodes()'s count: the
+    // startup check, which every cycle repeats, so a node added later is
+    // noticed. Anything but one node, zero included, refuses shipping.
     void note_cluster_size(size_t node_count);
 
     // Instead of note_cluster_size() when the node has no commitlog: a cycle
@@ -445,10 +429,9 @@ public:
     void note_commitlog_disabled();
 
     // Called instead of start_shipping() when pitr_endpoint names an endpoint
-    // with no object_storage_endpoints entry. Refused with a reason naming the
+    // with no object_storage_endpoints entry: refused with a reason naming the
     // option, latched, and the seal timer dropped. Does nothing once shipping
-    // is off for another reason, and never throws: a mistyped option must not
-    // stop the node from booting.
+    // is off, and never throws, a mistyped option not being fatal.
     void note_endpoint_unknown();
 
     // The same for a configured endpoint whose client could not be built.
@@ -470,27 +453,24 @@ public:
     // Valid only while configured() holds.
     const shipper_config& shipping_config() const;
 
-    // What the entry of a segment closing now would carry: microseconds since
-    // the UNIX epoch, UTC, less coverage_margin, or 0 before the first cycle.
+    // The latest capture's coverage: microseconds since the UNIX epoch, UTC,
+    // less coverage_margin, 0 before the first cycle. An entry carries no more.
     int64_t covered_through_us() const noexcept {
-        return _coverage_us;
+        return _captures.empty() ? 0 : _captures.back().covered_through_us;
     }
 
-    // Bytes stored, ledger entry written and hold released: the segments this
-    // chain holds.
+    // Stored, recorded and released: the segments this chain holds.
     uint64_t segments_shipped() const noexcept {
         return _segments_shipped;
     }
 
-    // Segments that will not be shipped, each of which ends the chain: a failed
-    // close, an upload that failed for good, or an entry that could not be
-    // written.
+    // Segments that will not be shipped, each ending the chain: a failed
+    // close, an upload that failed for good, or an unwritable entry.
     uint64_t segments_unshipped() const noexcept {
         return _segments_unshipped;
     }
 
-    // Closed, taken for shipping and not recorded yet: uploading, waiting for
-    // a slot, or waiting their turn in the order.
+    // Closed, taken for shipping and not recorded yet.
     size_t segments_pending() const noexcept {
         return _pending.size();
     }
@@ -506,32 +486,25 @@ public:
 };
 
 // The hooks the wiring installs, built here rather than in main.cc so that the
-// key a segment is stored under is under test. Both throw for an id the log no
-// longer holds, which is a permanent upload failure: it breaks shipping on this
-// shard and releases every hold (D25). `shipper` must be the one they are
-// installed on, and must outlive them.
-segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path);
+// key a segment is stored under is under test. The path and name hooks throw
+// for an id the log no longer holds, which is a permanent upload failure (D25).
+// `shipper` must be the one they are installed on, and must outlive them.
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments);
 
 // What a snapshot's bound file asks this shard for (`db/pitr/bound_file.hh`).
-// It reads the shipper on every call, so one installed before start_shipping()
-// answers with nothing until the chain exists. `shipper` must outlive it, which
-// is why the wiring clears it before the shipper stops.
+// It reads the shipper on every call, so `shipper` must outlive it, which is
+// why the wiring clears it before the shipper stops. The sink is where the
+// wiring puts it: replica::database's, which db/pitr does not know about.
 chain_provider make_chain_provider(const pitr_shipper& shipper);
-
-// Where the wiring installs the provider: replica::database's, which db/pitr
-// does not know about.
 using chain_provider_sink = std::function<void(chain_provider)>;
 
 // Starts shipping on this shard, which is all the wiring at boot does: checks
 // pitr_endpoint against the node's endpoints, takes the chain floor from the
-// commitlog's held segments, installs the client and the hooks, and starts the
-// flush. Does nothing unless shipping is active, and never throws: a client
+// commitlog's held segments, installs the client, the hooks and - once the
+// chain exists - the chain provider, and starts the flush. Does nothing unless
+// shipping is active, and never throws: a client
 // that cannot be built turns shipping off rather than failing the boot. `log`
 // and the store manager must outlive `shipper`, which keeps using the log.
-//
-// `install_chain_provider` is called once the chain exists, so a snapshot taken
-// from then on carries it; it is dropped, like the flush, when shipping does not
-// start. It may be empty, which is what a test with no database passes.
 void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& sstm, db::commitlog& log, utils::UUID host_id, int64_t boot_epoch_us,
         pitr_shipper::flush_function flush, chain_provider_sink install_chain_provider = {});
 

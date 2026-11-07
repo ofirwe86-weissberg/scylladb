@@ -19,6 +19,7 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/core/shard_id.hh>
 #include <seastar/core/when_all.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/defer.hh>
 
 #include "db/commitlog/commitlog.hh"
@@ -233,8 +234,8 @@ void pitr_shipper::start_shipping(seastar::shared_ptr<sstables::object_storage_c
     if (!active() || _client || _upload_gate.is_closed()) {
         return;
     }
-    if (!client || !hooks.open_segment || !hooks.object_name_of || !_release_hold) {
-        seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client, both hooks and the release hook");
+    if (!client || !hooks.open_segment || !hooks.object_name_of || !hooks.held_segments || !_release_hold) {
+        seastar::on_internal_error(pitr_logger, "start_shipping() needs a store client, every hook and the release hook");
         return;
     }
     _client = std::move(client);
@@ -280,9 +281,9 @@ void pitr_shipper::flush_after_start(flush_function flush) {
     });
 }
 
-segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path) {
-    if (!segment_path) {
-        seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path function");
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments) {
+    if (!segment_path || !held_segments) {
+        seastar::on_internal_error(pitr_logger, "make_segment_hooks() needs a segment-path and a held-segments function");
     }
     // A segment the commitlog no longer holds has no path, and its file may be
     // gone. Throwing is a permanent upload failure, so it breaks shipping on
@@ -310,6 +311,7 @@ segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_funct
                         const auto file_name = std::filesystem::path(std::string(path_of(id))).filename().string();
                         return sstables::object_name(shipper.shipping_config().bucket, segment_object_key(*chain, file_name));
                     },
+            .held_segments = std::move(held_segments),
     };
 }
 
@@ -354,9 +356,13 @@ void start_shipping_on_shard(pitr_shipper& shipper, sstables::storage_manager& s
     }
     const auto held = log.held_segments();
     shipper.start_shipping(std::move(client),
-            make_segment_hooks(shipper,
+            make_segment_hooks(
+                    shipper,
                     [&log](db::segment_id_type id) {
                         return log.held_segment_path(id);
+                    },
+                    [&log] {
+                        return log.held_segments();
                     }),
             chain_origin{
                     .host_id = host_id,
@@ -457,12 +463,8 @@ void pitr_shipper::segment_closed(db::segment_id_type id, uint64_t used_size, bo
         return;
     }
     // Recorded before the upload starts, so the order the entries go out in is
-    // fixed by the closes rather than by the order the uploads finish in, and
-    // the coverage is the capture in force now rather than a later one.
-    _pending.emplace(id, pending_segment{
-                                 .used_size = used_size,
-                                 .covered_through_us = _coverage_us,
-                         });
+    // fixed by the closes rather than by the order the uploads finish in.
+    _pending.emplace(id, pending_segment{.used_size = used_size});
     // Background: the close this runs inside cannot wait. The gate is what
     // stop() waits for, and every continuation below runs inside it.
     (void)seastar::try_with_gate(_upload_gate, [this, id, used_size] {
@@ -578,22 +580,23 @@ future<> pitr_shipper::record_entries() {
     while (active() && !_ledger_as.abort_requested() && !_pending.empty() && _pending.begin()->second.stored) {
         const auto id = _pending.begin()->first;
         const auto& pending = _pending.begin()->second;
-        // Closes are not ordered by id (commitlog.hh), so a segment below this
-        // one can be reported later and under a newer capture. Its entry still
-        // comes first, and claiming that capture here would leave the segments
-        // above it - which can hold writes from before it - outside a restore
-        // that stops at this entry. Every other pending segment is above this
-        // one, so the lowest capture among them is the most this entry may
-        // claim. The coverage cannot fall below the entry before it either:
-        // that entry was held down by this set too.
-        //
-        // One pass per entry over the pending segments, which the commitlog's
-        // hold limit bounds, and each pass is separated from the next by a
-        // store request.
-        auto coverage = pending.covered_through_us;
-        for (const auto& [above_id, above] : _pending) {
-            coverage = std::min(coverage, above.covered_through_us);
+        // A segment the log still holds below this one has rotated without its
+        // close being reported, the commitlog not awaiting the close
+        // (commitlog.cc, finish_and_get_new()). Recording now would put the
+        // chain past a segment that still has to join it; the close is coming,
+        // since the hold is this shipper's, and it starts the recorder again.
+        if (const auto unreported = unreported_held_below(id)) {
+            pitr_logger.debug("Not recording segment {} yet: segment {} is held and its close has not been reported", id, *unreported);
+            co_return;
         }
+        // Closes are not ordered by id (commitlog.hh), and a segment below this
+        // one can be reported later. What keeps its writes covered is the
+        // capture's own rule: a capture may only be claimed by an entry whose
+        // segment is at or above the highest id the log held when it was taken,
+        // so a capture taken while a lower segment was still open is not this
+        // entry's to claim. A coverage lower than the entry before it is
+        // conservative, which is why nothing raises it back.
+        const auto coverage = coverage_for(id);
         // Copied out before the first suspension: the map can change while the
         // put is in flight.
         const segment_entry entry{
@@ -644,13 +647,16 @@ future<> pitr_shipper::record_entries() {
         }
         _recording_id.reset();
         // The abort can land in the gap between the put returning and this
-        // resumption, as ledger_writer.hh requires the caller to check: a
-        // rollback in that gap means this entry must not count, even though the
-        // object may be in the store. Nothing is awaited before the hold goes.
+        // resumption, which ledger_writer.hh requires the caller to check. It
+        // does not unwrite the object - a restore reads whatever finalized -
+        // and the entry is correct about bytes that are in the store. What it
+        // does is stop the chain here: this segment is not counted, its hold
+        // follows note_entry_aborted()'s rule, and no later entry is written.
         if (_ledger_as.abort_requested()) {
             note_entry_aborted(id);
             co_return;
         }
+        _prev_coverage_us = coverage;
         _prev_recorded_id = id;
         ++_next_sequence;
         ++_segments_shipped;
@@ -776,31 +782,99 @@ void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
     _ledger_as.request_abort();
     // The holds of the segments nothing is working on any more: the ones
     // uploading, and the one being recorded, are released by their own abort
-    // paths, which have to tell a break from a shutdown. O(1) per segment and
-    // no yield, so nothing changes the map under this loop.
+    // paths, which have to tell a break from a shutdown. The releases go to a
+    // fiber of their own, because this runs inside a close, which must not
+    // wait, and there can be thousands of them (D25).
+    std::vector<db::segment_id_type> to_release;
     for (auto it = _pending.begin(); it != _pending.end();) {
         if (_uploading.contains(it->first) || _recording_id == it->first) {
             ++it;
             continue;
         }
-        pitr_logger.debug("Segment {} will not be recorded: shipping broke, releasing its hold", it->first);
-        _release_hold(it->first);
+        to_release.push_back(it->first);
         it = _pending.erase(it);
+    }
+    if (!to_release.empty() && !_upload_gate.is_closed()) {
+        // A closed gate is a shutdown, which deletes the held segments anyway.
+        (void)seastar::try_with_gate(_upload_gate, [this, ids = std::move(to_release)]() mutable {
+            return release_holds(std::move(ids));
+        }).handle_exception([](std::exception_ptr ex) {
+            pitr_logger.error("Releasing the holds after the break ended unexpectedly: {}", ex);
+        });
     }
     // Every shard keeps its own latch, so the shard that breaks is the one that
     // has to say so: a break happens at most once per shard per boot.
     pitr_logger.error("Point-in-time recovery shipping is off on shard {}: {}", this_shard_id(), *_break_reason);
 }
 
-// The coverage every close from now on carries: an acknowledged write from
-// before this moment is in the segment this cycle is about to seal, or in one
-// already closed, so it is in this chain or in a segment the chain already
-// holds. Taken before the cycle counts the nodes, so a slow count or a join
-// during it cannot move the coverage past the seal (P50).
-void pitr_shipper::capture_coverage() noexcept {
+// One capture: the time, and the highest segment the log holds then. A write
+// acknowledged before the time is in that segment or below it, so an entry at
+// or above it covers every such write the chain is responsible for. Taken
+// before the count, so a slow count cannot move the coverage past the seal.
+void pitr_shipper::capture_coverage() {
     // The same clock a write's timestamp comes from, so the two are comparable.
     const auto now = api::new_timestamp();
-    _coverage_us = std::max(int64_t(0), now - coverage_margin.count());
+    const auto coverage = std::max(int64_t(0), now - coverage_margin.count());
+    // With no hooks the highest held id cannot be read, and a capture no entry
+    // can claim is the safe answer: shipping has not started yet.
+    auto top = std::numeric_limits<db::segment_id_type>::max();
+    if (_hooks.held_segments) {
+        const auto held = _hooks.held_segments();
+        top = held.empty() ? 0 : std::ranges::max(held);
+    }
+    while (!_captures.empty() && _captures.back().top_held_id >= top) {
+        // Anything that could claim the capture at the back can claim this one,
+        // which is newer, so the old one is unreachable.
+        _captures.pop_back();
+    }
+    _captures.push_back(coverage_capture{.top_held_id = top, .covered_through_us = coverage});
+}
+
+int64_t pitr_shipper::coverage_for(db::segment_id_type id) {
+    // The captures rise in top_held_id, so the ones this segment may claim are
+    // a prefix of them and the last of those is the newest.
+    auto chosen = _captures.end();
+    for (auto it = _captures.begin(); it != _captures.end() && it->top_held_id <= id; ++it) {
+        chosen = it;
+    }
+    if (chosen == _captures.end()) {
+        // Every capture was taken while a segment above this one was open, so
+        // one of them can hold writes this entry does not cover: it carries no
+        // more than the entry before it.
+        return _prev_coverage_us;
+    }
+    // Every segment recorded after this one has a higher id, so it can claim
+    // this capture or a newer one: the ones before it are dead.
+    _captures.erase(_captures.begin(), chosen);
+    return chosen->covered_through_us;
+}
+
+std::optional<db::segment_id_type> pitr_shipper::unreported_held_below(db::segment_id_type id) const {
+    if (!_hooks.held_segments) {
+        return std::nullopt;
+    }
+    // `id` is the lowest segment waiting to be recorded, so a held id below it
+    // is either below the chain floor - not in the chain - or a segment whose
+    // close has not been reported yet. One pass over the held ids, which the
+    // commitlog's hold limit bounds, per entry.
+    std::optional<db::segment_id_type> lowest;
+    for (auto held : _hooks.held_segments()) {
+        if (held >= id || (_chain_floor && held < *_chain_floor)) {
+            continue;
+        }
+        lowest = lowest ? std::min(*lowest, held) : std::optional<db::segment_id_type>(held);
+    }
+    return lowest;
+}
+
+future<> pitr_shipper::release_holds(std::vector<db::segment_id_type> ids) {
+    // One release per iteration with a yield between them: the commitlog scans
+    // its held segments on each, so thousands would hold the shard.
+    for (auto id : ids) {
+        pitr_logger.debug("Segment {} will not be recorded: shipping broke, releasing its hold", id);
+        _release_hold(id);
+        co_await coroutine::maybe_yield();
+    }
 }
 
 // Records every failure instead of throwing, so seal_loop() always finishes.
