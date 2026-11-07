@@ -2718,8 +2718,12 @@ future<compaction_reenablers_and_lock_holders> table::hold_compaction_off(sstrin
 }
 
 bool table::compaction_still_held(const compaction_reenablers_and_lock_holders& hold) {
-    if (!is_auto_compaction_disabled_by_user()) {
-        tlogger.warn("Auto-compaction of {}.{} was enabled while compaction was held off", schema()->ks_name(), schema()->cf_name());
+    // Either way of turning compaction off, as the pre-load check takes them:
+    // the schema option, which makes the configured strategy the null one, or
+    // nodetool having disabled it. A target created with
+    // `compaction = {'enabled': 'false'}` is the ordinary case.
+    if (schema()->compaction_enabled() && !is_auto_compaction_disabled_by_user()) {
+        tlogger.warn("Compaction of {}.{} was enabled while it was held off", schema()->ks_name(), schema()->cf_name());
         return false;
     }
     auto views = all_compaction_views(storage_groups());

@@ -75,10 +75,13 @@ enum class refusal_reason {
     // The backup's manifest will not parse, or does not hold what a replay
     // needs to find its sstables.
     backup_manifest_damaged,
+    // A file of the backup is larger than a replay reads: damage, or a prefix
+    // holding something else entirely.
+    backup_file_too_large,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 17> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 18> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
@@ -96,6 +99,7 @@ inline constexpr std::array<refusal_reason, 17> all_refusal_reasons{
         refusal_reason::replay_already_running,
         refusal_reason::target_uses_tablets,
         refusal_reason::backup_manifest_damaged,
+        refusal_reason::backup_file_too_large,
 };
 
 std::string_view reason_code(refusal_reason) noexcept;
