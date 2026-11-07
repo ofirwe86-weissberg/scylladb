@@ -97,6 +97,24 @@ std::string file_name_of(const seastar::sstring& path) {
 
 using closed_segments = std::vector<std::tuple<db::segment_id_type, uint64_t, bool>>;
 
+// The hooks the wiring builds, read off a real commitlog rather than a fake.
+db::pitr::segment_hooks hooks_of(const db::pitr::pitr_shipper& shipper, db::commitlog& log) {
+    return db::pitr::make_segment_hooks(
+            shipper,
+            [&log](db::segment_id_type id) {
+                return log.held_segment_path(id);
+            },
+            [&log] {
+                return log.held_segments();
+            },
+            [&log] {
+                return log.held_bytes();
+            },
+            [&log] {
+                return log.segment_hold_limit();
+            });
+}
+
 size_t partitions_in_memtables(replica::table& t) {
     size_t partitions = 0;
     t.for_each_active_memtable([&partitions](replica::memtable& m) {
@@ -218,14 +236,7 @@ SEASTAR_TEST_CASE(test_the_hooks_open_the_held_segments_own_file) {
             [](cql_test_env& e) {
                 with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
                     with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
-                        auto hooks = db::pitr::make_segment_hooks(
-                                shipper,
-                                [&log](db::segment_id_type id) {
-                                    return log.held_segment_path(id);
-                                },
-                                [&log] {
-                                    return log.held_segments();
-                                });
+                        auto hooks = hooks_of(shipper, log);
                         for (const auto& [id, used_size, failed] : closed) {
                             const auto path = log.held_segment_path(id);
                             BOOST_REQUIRE(path);
@@ -326,14 +337,7 @@ SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
                         // The key is this chain's, keeping the commitlog's own
                         // file name rather than one a test made up.
                         const auto id = std::get<0>(closed.front());
-                        const auto name = db::pitr::make_segment_hooks(
-                                shipper,
-                                [&log](db::segment_id_type id) {
-                                    return log.held_segment_path(id);
-                                },
-                                [&log] {
-                                    return log.held_segments();
-                                }).object_name_of(id);
+                        const auto name = hooks_of(shipper, log).object_name_of(id);
                         const auto expected = db::pitr::segment_object_key(*shipper.chain(), file_name_of(*log.held_segment_path(id)));
                         BOOST_REQUIRE_EQUAL(std::string(name.object()), std::string(expected));
                         BOOST_REQUIRE(name.object().find(seastar::format("-{}.log", id)) != std::string_view::npos);
