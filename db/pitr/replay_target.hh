@@ -74,4 +74,28 @@ public:
     }
 };
 
+// What a shard keeps for each target a replay is running into, so that two
+// replays into two tables do not share one slot: one would replace the other's
+// hold, and the first to finish would release what the other still needs.
+template <typename Hold>
+class per_target {
+    std::unordered_map<::table_id, Hold> _held;
+
+public:
+    void add(::table_id target, Hold hold) {
+        _held.insert_or_assign(target, std::move(hold));
+    }
+    // Only this target's, which is the whole point.
+    void erase(::table_id target) {
+        _held.erase(target);
+    }
+    const Hold* find(::table_id target) const {
+        auto it = _held.find(target);
+        return it == _held.end() ? nullptr : &it->second;
+    }
+    size_t size() const {
+        return _held.size();
+    }
+};
+
 } // namespace db::pitr

@@ -44,6 +44,10 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "replay_already_running";
     case refusal_reason::target_uses_tablets:
         return "target_uses_tablets";
+    case refusal_reason::backup_manifest_damaged:
+        return "backup_manifest_damaged";
+    case refusal_reason::backup_file_too_large:
+        return "backup_file_too_large";
     }
     return "unknown";
 }
