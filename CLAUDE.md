@@ -69,6 +69,15 @@ Upstream: `scylladb/scylladb`. Default branch: `master`. This checkout has two r
 
 Build modes: `debug`, `dev`, `release`, `sanitize`. Agents use `dev` by default. If `test.py` hits cgroup-metrics permission errors, add `--no-gather-metrics`. Logs land in `testlog/<mode>/`. A full build is long (hours on modest hardware, ~2–3 GB RAM per compile/link thread), so build the narrowest target. `configure.py --compiler-cache` defaults to `auto` and picks up the image's `sccache` (`build.ninja`: `cxx_launcher = /usr/bin/sccache`), which is what makes a rebuild in a fresh worktree survivable. Measured here at `-j6`: an incremental `build/dev/scylla` relink took 11m32s.
 
+**Use the helper scripts for repeated operations.** They live in `/home/ofirweissberg.guest/repo/scylladb/docs-work/scripts/`, with a table in its `README.md`. Agents in worktrees use that absolute path. Each script prints its usage when run without arguments.
+- **Rule:** any operation done more than twice gets a script there. Every agent and session then uses the script, not hand-rolled commands, so all threads do it the same way.
+- **Output:** each script keeps the full log in `build/pitr-logs/` and prints only a verdict and the log path.
+- **What they cover:** builds (`pitr-build.sh`), test runs at 5 or 100 repeats (`pitr-test.sh`), the deliberate break (`pitr-break.sh`), trial merges (`pitr-trial-merge.sh`), the PR size and review check (`pitr-pr-check.sh`), team state (`pitr-state.sh`), a task branch in a built worktree (`pitr-task-branch.sh`), signed GitHub comments (`pitr-gh-comment.sh`), and the timeline, worklog and catch-log rows (`pitr-record.sh`).
+- **Pitfalls they handle:**
+  - dbuild exits 125 when its output is redirected to a file or when it runs under a host `timeout`;
+  - `test.py` empties `testlog/` when it starts;
+  - parallel builds need their own sccache port.
+
 **Max parallel agents: 3, and only for tasks that don't block each other.** Every agent works in its own worktree with its own build tree, so N agents means N full builds competing for cores and RAM. The team lead's caution on this 15 GB VM is at most 2 heavy builds at once.
 
 **Before trusting a test result on this Lima VM:** `fs.aio-max-nr` is 1048576, and clangd background indexing is off (`--background-index=false`). Both produced failures with no code at fault.
