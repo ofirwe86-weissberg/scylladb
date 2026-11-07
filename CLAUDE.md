@@ -104,7 +104,7 @@ These apply to all implementation and review on this project.
 - While writing code, ask of every loop, parse, serialization, checksum and allocation: how big can its input get, and does it yield? Bound the work or yield with `coroutine::maybe_yield()`, and avoid large contiguous allocations. Never make a blocking call.
 - Reviewers check for stalls explicitly, on the worst-case input and not the typical one.
 - Passing tests don't show the absence of stalls: `test/pylib/cpp/base.py:47` sets `--blocked-reactor-notify-ms=2000000` for C++ tests, so stalls aren't reported there.
-- **If you're not sure whether something can stall, don't decide alone.** Discuss it with `architect-check` first, then raise a flag to the human with what you concluded and what's still unknown.
+- **If you're not sure whether something can stall, don't decide alone.** Discuss it with `code-reviewer` first, then raise a flag to the human with what you concluded and what's still unknown.
 
 **Tests are written with the code, not after it.**
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
@@ -141,7 +141,7 @@ These apply to all implementation and review on this project.
 ## Architecture constraints
 
 > Decisions already made that a change must not silently override. `architect-check` compares
-> structural changes against this list; `tl-intake` checks incoming requests against it.
+> a task's design against this list when the task is set up; `tl-intake` checks incoming requests against it.
 > Confirmed by the owner on 2026-11-06. The owner edits this list.
 
 **Concurrency model**
@@ -196,17 +196,17 @@ Every task issue carries one level label, `team:full` or `team:light`. `tl-intak
 
 When in doubt, use full.
 
-**The label is where a task starts, not a fixed decision.** The team lead checks the level again at every step: after the implementer's diff, after `architect-check`, and after each `code-reviewer` round. Each sub-task or piece has its own level, so one risky piece of a light issue goes full without moving the rest.
-- **Raising** is done at once by anyone who sees the risk (the team lead, `implementer`, `code-reviewer`, `pr-reviewer`, `architect-check`): a lifetime or concurrency question, a possible stall, a silent-wrong-data path, a structural change, or an overrun of the time box. The remaining steps switch to the full column straight away. The team lead updates the label and adds a signed issue comment saying what triggered it.
+**The label is where a task starts, not a fixed decision.** The team lead checks the level again at every step: after the implementer's diff and after each `code-reviewer` round. Each sub-task or piece has its own level, so one risky piece of a light issue goes full without moving the rest.
+- **Raising** is done at once by anyone who sees the risk (the team lead, `implementer`, `code-reviewer`, `pr-reviewer`): a lifetime or concurrency question, a possible stall, a silent-wrong-data path, a structural change, or an overrun of the time box. The remaining steps switch to the full column straight away. The team lead updates the label and adds a signed issue comment saying what triggered it.
 - **Lowering**, mid-task or not, needs the human's OK.
 
 | | `team:full` | `team:light` |
 |---|---|---|
-| Requirements | `product-manager` first, for feature work and product decisions | `product-manager` only if user-visible text changes |
+| Requirements | `product-manager` while the task is set up, for feature work and product decisions | `product-manager` only if user-visible text changes, while the task is set up |
 | Test plan | `tester` plan before code, for feature work | Tests written with the code |
 | Models | Opus for development and QA | Opus for development. Sonnet only for QA tests implemented from a detailed plan, reviewed by Opus |
 | Developer's tests before merge | The task's tests 5 of 5, composite binaries, then 100 of 100 | The task's own test binary and relevant cases, 5 of 5, plus one deliberate-break run; both outputs in the PR description |
-| Review | `implementer` → `architect-check` if structural → `code-reviewer` (builds and runs tests, rounds as needed) → PR → `pr-reviewer` | `implementer` → PR → `pr-reviewer` only: a cold read of the pushed head, which runs the task's test binary 5 of 5 plus one break of its own on a reused worktree (pasted output isn't trusted: twice it described code that wasn't pushed). A blocking finding gets a re-check of the fix only; nits go to a follow-up issue |
+| Review | `implementer` → `code-reviewer` (builds and runs tests, rounds as needed) → PR → `pr-reviewer` | `implementer` → PR → `pr-reviewer` only: a cold read of the pushed head, which runs the task's test binary 5 of 5 plus one break of its own on a reused worktree (pasted output isn't trusted: twice it described code that wasn't pushed). A blocking finding gets a re-check of the fix only; nits go to a follow-up issue |
 | PR size | 100-300 product lines, ceiling 500 | Up to ~400 product lines, ceiling 500 |
 | Sequencing | Each PR reviewed before the next starts | May overlap; stacked, merged in batches |
 | Full testing cycle | Before merge | After merge, once on the whole merged set (below) |
@@ -215,7 +215,8 @@ When in doubt, use full.
 
 The evidence behind this split, with what each step caught on the PITR work, is in `docs-work/catch-log.md`; its "New catches" table gets a row whenever a review, test run or post-merge cycle finds something.
 
-Flow at the full level: intake → implement → architect-check *if structural* → code-reviewer → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
+Flow at the full level: intake (with `product-manager` and `architect-check` if needed) → spec on the issue → implement → code-reviewer → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
+- **`product-manager` and `architect-check` work only while a task is set up,** before its spec is on the issue: requirements, design, structural review of the plan. Once the task is set, they are not involved, at either level and for R&D-internal tasks too. Questions that come up during implementation are settled by the team lead from the developer's and tester's own work (tests, breaks, measurements), checked by `code-reviewer` and `pr-reviewer`. A question that changes what the user sees, or one the team lead can't settle, goes to the human directly.
 - **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
 - **One commit and one PR per task,** on its own branch, with the PR title starting with the task ID. Dependent PRs stack on the previous task's branch.
 - **Review fixes go on the same branch,** as new commits pushed to the open PR (a normal push, not a force push), and the human squashes on merge. Don't open a replacement `-vN` PR for a review round: on PITR that cost 9 replacement PRs, each with its own description, re-review and retargeting.
