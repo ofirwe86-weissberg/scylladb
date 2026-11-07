@@ -208,29 +208,36 @@ future<> target_applier::operator()(const replay_entry& e) {
     // Stats of the first shard only: every shard converts and filters the same bytes against the same target schema, so
     // counting each would multiply one entry's cells by the number of owners.
     std::optional<entry_outcome> counted;
-    for (const auto shard : shards) {
-        const auto outcome = co_await _db.invoke_on(shard, [this, &e](replica::database& db) -> future<entry_outcome> {
-            auto& cf = db.find_column_family(_target);
-            const schema_ptr s = cf.schema();
-            if (const auto err = validation::is_cql_key_invalid(*s, e.mutation.key()); err) {
-                throw target_schema_mismatch(fmt::format("entry at {} has a key invalid for target {}.{}: {}", e.position, s->ks_name(), s->cf_name(), *err));
-            }
-            // The reader's mapping lives on the shard that reads; this shard converts with its own copy.
-            const column_mapping& mapping = _mappings.local().get(e.mutation.schema_version(), e.mapping);
-            mutation m(s, e.mutation.decorated_key(*s));
-            checking_converting_applier v(mapping, *s, m.partition(), e.position, _t);
-            e.mutation.partition().accept(mapping, v);
+    // A named local, passed by reference, and not a temporary argument to invoke_on: this is a coroutine lambda, so its
+    // captures live in the closure, and invoke_on for the shard it is called from invokes the functor inline and lets it
+    // go when it returns the unresolved future. The closure then dies at the end of that expression while the body is
+    // suspended in the filter, and `this` and `e` dangle. A cross-shard call keeps the functor in its submitted task, so
+    // only the owning shard that is also the replay's own shard lost its writes, which is what #103 was (silently: the
+    // outcome it returns is a value, so the counters still looked right).
+    auto apply_on_owner = [this, &e](replica::database& db) -> future<entry_outcome> {
+        auto& cf = db.find_column_family(_target);
+        const schema_ptr s = cf.schema();
+        if (const auto err = validation::is_cql_key_invalid(*s, e.mutation.key()); err) {
+            throw target_schema_mismatch(fmt::format("entry at {} has a key invalid for target {}.{}: {}", e.position, s->ks_name(), s->cf_name(), *err));
+        }
+        // The reader's mapping lives on the shard that reads; this shard converts with its own copy.
+        const column_mapping& mapping = _mappings.local().get(e.mutation.schema_version(), e.mapping);
+        mutation m(s, e.mutation.decorated_key(*s));
+        checking_converting_applier v(mapping, *s, m.partition(), e.position, _t);
+        e.mutation.partition().accept(mapping, v);
 
-            auto filtered = co_await filter_at_timestamp(m, _t);
-            // Cells of a column the target lacks that were above T anyway: dropped here, counted like the filter's own.
-            filtered.stats += v.dropped_above_t();
-            // An entry whose every write is above T is counted like any other: what it dropped is part of the result.
-            if (filtered.m.partition().empty()) {
-                co_return entry_outcome{.stats = filtered.stats, .applied = false};
-            }
-            co_await db.apply_in_memory(filtered.m, cf, db::rp_handle(), db::no_timeout);
-            co_return entry_outcome{.stats = filtered.stats, .applied = true};
-        });
+        auto filtered = co_await filter_at_timestamp(m, _t);
+        // Cells of a column the target lacks that were above T anyway: dropped here, counted like the filter's own.
+        filtered.stats += v.dropped_above_t();
+        // An entry whose every write is above T is counted like any other: what it dropped is part of the result.
+        if (filtered.m.partition().empty()) {
+            co_return entry_outcome{.stats = filtered.stats, .applied = false};
+        }
+        co_await db.apply_in_memory(filtered.m, cf, db::rp_handle(), db::no_timeout);
+        co_return entry_outcome{.stats = filtered.stats, .applied = true};
+    };
+    for (const auto shard : shards) {
+        const auto outcome = co_await _db.invoke_on(shard, std::ref(apply_on_owner));
         if (!counted) {
             counted = outcome;
         }
