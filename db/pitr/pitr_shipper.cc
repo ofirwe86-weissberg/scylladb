@@ -567,8 +567,21 @@ void pitr_shipper::break_shipping(shipping_state state, sstring reason) {
     pitr_logger.error("Point-in-time recovery shipping is off on shard {}: {}", this_shard_id(), *_break_reason);
 }
 
+// The coverage every close from now on carries: an acknowledged write from
+// before this moment is in the segment this cycle is about to seal, or in one
+// already closed, so it is in this chain or in a segment the chain already
+// holds. Taken before the cycle counts the nodes, so a slow count or a join
+// during it cannot move the coverage past the seal (P50).
+void pitr_shipper::capture_coverage() noexcept {
+    // The same clock a write's timestamp comes from, so the two are comparable.
+    const auto now = api::new_timestamp();
+    _coverage_us = std::max(int64_t(0), now - coverage_margin.count());
+}
+
 // Records every failure instead of throwing, so seal_loop() always finishes.
 future<> pitr_shipper::seal_cycle() {
+    // Before anything that can wait: see capture_coverage().
+    capture_coverage();
     // Every cycle repeats the startup check, because a node can join later.
     size_t node_count = 0;
     try {

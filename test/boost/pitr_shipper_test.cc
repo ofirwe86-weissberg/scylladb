@@ -1018,6 +1018,45 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_cycle_waiting_on_the_count_does_not_seal_afte
     BOOST_REQUIRE_EQUAL(the_probe.seals_started, 0);
 }
 
+// The coverage a cycle captures is taken before the cycle counts the nodes
+// (P50): a count that takes a while, and a join that lands during it, must not
+// move the coverage up past the writes the seal is about to close off.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_cycle_captures_its_coverage_before_it_counts) {
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    the_probe = probe{};
+    auto reset = seastar::defer([]() noexcept {
+        the_probe = probe{};
+    });
+    BOOST_REQUIRE_EQUAL(shipper.covered_through_us(), 0);
+
+    const auto before = api::new_timestamp();
+    the_probe.count_hold.emplace();
+    shipper.start_sealing(fake_seal(), fake_node_count());
+    shipper.seal_tick();
+    wait_until([] {
+        return the_probe.count_calls == 1;
+    });
+
+    // The count has not answered yet, so a capture taken after it would still
+    // read 0 here.
+    const auto captured = shipper.covered_through_us();
+    const auto after = api::new_timestamp();
+    BOOST_REQUIRE_GT(captured, 0);
+    // The margin the design asks for: a capture that skipped it would sit
+    // above this, and one that took it twice below the lower bound.
+    BOOST_REQUIRE_LE(captured, after - coverage_margin.count());
+    BOOST_REQUIRE_GE(captured, before - coverage_margin.count());
+
+    the_probe.count_hold->set_value();
+    the_probe.count_hold.reset();
+    shipper.wait_for_cycles(cycle_timeout).get();
+    shipper.stop().get();
+    BOOST_REQUIRE_EQUAL(the_probe.seals_started, 1);
+}
+
 // The count fails only after stop() has begun, so shutdown must not latch
 // shipping off: the state the node reports is the one it had while it ran.
 SEASTAR_THREAD_TEST_CASE(test_pitr_unreadable_count_after_stop_does_not_break) {

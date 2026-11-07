@@ -65,6 +65,12 @@ extern seastar::logger pitr_logger;
 // The interval is the floor of the recovery point objective, so refuse hours.
 constexpr std::chrono::seconds max_seal_interval = std::chrono::hours(1);
 
+// Subtracted from every coverage capture (design, "Ledger"). The capture itself
+// already precedes the seal, which is what makes an acknowledged write before it
+// shipped, so this is only a buffer against a stepping clock and against the
+// timestamps a client may choose for itself.
+constexpr std::chrono::microseconds coverage_margin = std::chrono::seconds(1);
+
 // The nodes the cluster holds, as the topology state machine sees them: normal
 // members, the ones a transition is moving, and the ones waiting to be joined.
 // Nodes that have left are not counted (issue #7). The one count source, for
@@ -238,11 +244,19 @@ private:
     // One per upload in flight, owned by the upload's frame. Per segment,
     // because a rollback cancels the one it erased; stop() aborts them all.
     std::unordered_map<db::segment_id_type, abort_source*> _uploading;
+    // The latest coverage capture, which every close from now on carries. 0
+    // until the first seal cycle: a write from before this chain began may sit
+    // in a segment below the floor, which is not in the chain, so nothing this
+    // chain holds covers it.
+    int64_t _coverage_us = 0;
     uint64_t _segments_shipped = 0;
     uint64_t _segments_unshipped = 0;
 
     future<> seal_loop();
     future<> seal_cycle();
+    // Takes the coverage every segment closing from now on carries, which is
+    // why it runs before anything else a cycle does (P50).
+    void capture_coverage() noexcept;
     void break_shipping(shipping_state, sstring reason);
     // Uploads one segment's used bytes, then releases its hold. Reports its own
     // failures rather than throwing.
@@ -399,6 +413,14 @@ public:
 
     // Valid only while configured() holds.
     const shipper_config& shipping_config() const;
+
+    // What the entry of a segment closing now would carry: microseconds since
+    // the UNIX epoch, UTC, less coverage_margin, or 0 before the first seal
+    // cycle. Every write acknowledged before it, and after this chain began,
+    // is in a segment this chain already holds or is shipping.
+    int64_t covered_through_us() const noexcept {
+        return _coverage_us;
+    }
 
     // Bytes stored and hold released.
     uint64_t segments_shipped() const noexcept {
