@@ -873,6 +873,7 @@ future<std::expected<replay_run_stats, refusal>> replay_history_into_target(shar
             }
             stats.entries_replayed += reader.entries_replayed;
             stats.incomplete_split_writes += reader.incomplete_split_writes;
+            stats.dropped_below_bound += reader.dropped_below_bound;
             replay_log.debug("replayed {} segment(s) of shard {}: {} entry/entries applied of {} read, {} split write(s) left incomplete", reader.segments_read,
                     shard.shard, reader.entries_replayed, reader.entries_read, reader.incomplete_split_writes);
         }
@@ -895,11 +896,11 @@ future<std::expected<replay_run_stats, refusal>> replay_history_into_target(shar
 sstring format_replay_result(const replay_to_params& p, const replay_start& start, const replay_run_stats& stats) {
     return seastar::format(
             "Point-in-time replay of {}.{} to t={} ({}us) is done: restored from backup '{}' of {}.{}; read {} shipped segment(s), {} byte(s); applied {} "
-            "cell(s) in {} write(s); dropped {} cell(s) written after t; {} cell(s) could not be verified; up to {} split write(s) were not replayed; one "
-            "table of one node was restored (limit 27)",
+            "cell(s) in {} write(s); dropped {} cell(s) written after t; {} entry/entries below the backup's bound; {} cell(s) could not be verified; up "
+            "to {} split write(s) were not replayed; one table of one node was restored (limit 27)",
             p.keyspace, p.table, p.t, start.t, p.snapshot, start.source_keyspace, start.source_table, stats.objects_read, stats.bytes_read,
-            stats.applier.cells_applied, stats.applier.entries_applied, stats.applier.cells_dropped_after_t, stats.applier.cells_not_verified,
-            stats.incomplete_split_writes);
+            stats.applier.cells_applied, stats.applier.entries_applied, stats.applier.cells_dropped_after_t, stats.dropped_below_bound,
+            stats.applier.cells_not_verified, stats.incomplete_split_writes);
 }
 
 } // namespace db::pitr

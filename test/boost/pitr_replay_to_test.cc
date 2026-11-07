@@ -750,6 +750,7 @@ SEASTAR_TEST_CASE(the_result_line_gives_t_the_backup_what_was_read_and_what_was_
             .objects_read = 7,
             .bytes_read = 123456,
             .entries_replayed = 41,
+            .dropped_below_bound = 5,
             .incomplete_split_writes = 2,
             .applier =
                     apply_stats{
@@ -775,6 +776,8 @@ SEASTAR_TEST_CASE(the_result_line_gives_t_the_backup_what_was_read_and_what_was_
         BOOST_REQUIRE(line.find("90 cell(s)") != sstring::npos);
         BOOST_REQUIRE(line.find("39 write(s)") != sstring::npos);
         BOOST_REQUIRE(line.find("11 cell(s) written after t") != sstring::npos);
+        // The count that tells a lost shard's history from a restore that had nothing to replay (#103).
+        BOOST_REQUIRE(line.find("5 entry/entries below the backup's bound") != sstring::npos);
         BOOST_REQUIRE(line.find("3 cell(s) could not be verified") != sstring::npos);
         // "up to", because an incomplete split write cannot be decoded, so not
         // even its table is readable (P22).

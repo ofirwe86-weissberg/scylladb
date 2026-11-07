@@ -204,6 +204,10 @@ struct replay_run_stats {
     uint64_t objects_read = 0;
     uint64_t bytes_read = 0;
     uint64_t entries_replayed = 0;
+    // Entries the reader dropped as below the backup's bound: the snapshot's
+    // sstables hold them. A non-zero count with nothing replayed on a shard is
+    // the shape of #103, where the chain was missing the bound's own segment.
+    uint64_t dropped_below_bound = 0;
     // Split writes a chain ended inside. Counted and not applied, and reported
     // as "up to N": an incomplete write cannot be decoded, so neither its table
     // nor its timestamp is readable (P22, `replay_reader_stats`).
