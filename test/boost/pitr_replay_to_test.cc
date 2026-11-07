@@ -27,9 +27,11 @@
 #include <seastar/core/seastar.hh>
 #include <seastar/util/file.hh>
 
+#include "compaction/compaction_manager.hh"
 #include "cql3/description.hh"
 #include "db/config.hh"
 #include "sstables/sstables_manager.hh"
+#include "utils/rjson.hh"
 #include "db/pitr/replay_to.hh"
 #include "replica/database.hh"
 #include "replica/schema_describe_helper.hh"
@@ -218,6 +220,80 @@ SEASTAR_TEST_CASE(a_target_missing_the_backups_dropped_column_is_refused) {
 }
 
 
+namespace {
+
+// The manifest a snapshot writes, cut down to the fields a replay reads.
+sstring manifest_json(const char* snapshot, const char* keyspace, const char* table, const char* sstables) {
+    return seastar::format(R"({{"manifest":{{"version":"1.0","scope":"node"}},"snapshot":{{"name":"{}","created_at":1}},)"
+                           R"("table":{{"keyspace_name":"{}","table_name":"{}","table_id":"x","tablets_type":"none","tablet_count":1}},)"
+                           R"("sstables":[{}]}})",
+            snapshot, keyspace, table, sstables);
+}
+
+const char* two_sstables = R"({"id":"a","toc_name":"me-1-big-TOC.txt","data_size":1,"index_size":1,"first_token":1,"last_token":2,"tablet_id":0},)"
+                           R"({"id":"b","toc_name":"me-2-big-TOC.txt","data_size":1,"index_size":1,"first_token":3,"last_token":4,"tablet_id":0})";
+
+rjson::chunked_content content_of(const sstring& text) {
+    rjson::chunked_content content;
+    content.push_back(temporary_buffer<char>(text.data(), text.size()));
+    return content;
+}
+
+std::expected<backup_manifest, refusal> manifest_of(const sstring& text, const char* expected_snapshot = "backup-1") {
+    return parse_backup_manifest(content_of(text), expected_snapshot).get();
+}
+
+} // namespace
+
+// One prefix is one backup, so a prefix naming another backup is a user error
+// and must not be restored under the name the call gave.
+SEASTAR_TEST_CASE(a_manifest_naming_another_snapshot_is_refused) {
+    return seastar::async([] {
+        auto refused = manifest_of(manifest_json("another-backup", "ks", "source", two_sstables));
+        BOOST_REQUIRE(!refused);
+        BOOST_REQUIRE(refused.error().code() == "backup_names_another_table");
+        // The reason names what the manifest said, so the user can find the
+        // prefix they meant.
+        BOOST_REQUIRE(refused.error().detail.find("another-backup") != sstring::npos);
+    });
+}
+
+SEASTAR_TEST_CASE(a_manifest_gives_the_backups_sstables_in_order) {
+    return seastar::async([] {
+        auto manifest = manifest_of(manifest_json("backup-1", "ks", "source", two_sstables));
+        BOOST_REQUIRE(manifest);
+        BOOST_REQUIRE_EQUAL(manifest->snapshot, "backup-1");
+        BOOST_REQUIRE_EQUAL(manifest->keyspace, "ks");
+        BOOST_REQUIRE_EQUAL(manifest->table, "source");
+        BOOST_REQUIRE_EQUAL(manifest->toc_names.size(), 2u);
+        BOOST_REQUIRE_EQUAL(manifest->toc_names[0], "me-1-big-TOC.txt");
+        BOOST_REQUIRE_EQUAL(manifest->toc_names[1], "me-2-big-TOC.txt");
+    });
+}
+
+// A backup of a table that held nothing is a backup like any other: the replay
+// loads no sstable and goes on to the history.
+SEASTAR_TEST_CASE(a_manifest_with_no_sstables_is_not_refused) {
+    return seastar::async([] {
+        auto manifest = manifest_of(manifest_json("backup-1", "ks", "source", ""));
+        BOOST_REQUIRE(manifest);
+        BOOST_REQUIRE(manifest->toc_names.empty());
+    });
+}
+
+SEASTAR_TEST_CASE(a_damaged_manifest_is_refused) {
+    return seastar::async([] {
+        // Not JSON, no snapshot object, and an sstable entry with no toc_name:
+        // none may read as a backup a replay can use.
+        for (const auto& text : {sstring("{nonsense"), sstring(R"({"table":{}})"),
+                     manifest_json("backup-1", "ks", "source", R"({"id":"a","first_token":1,"last_token":2,"tablet_id":0})")}) {
+            auto refused = manifest_of(text);
+            BOOST_REQUIRE_MESSAGE(!refused, fmt::format("'{}' was not refused", text));
+            BOOST_REQUIRE(refused.error().code() == "backup_manifest_damaged");
+        }
+    });
+}
+
 // Two calls on one target would write over each other's work, and the second
 // one cannot tell its own writes from the first one's (P62).
 BOOST_AUTO_TEST_CASE(one_target_takes_one_replay_at_a_time) {
@@ -361,6 +437,94 @@ SEASTAR_TEST_CASE(a_second_call_on_a_target_a_replay_is_running_into_is_refused)
                 BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target"), in_flight).code() == "replay_already_running");
             },
             replay_config());
+}
+
+
+namespace {
+
+replica::table& target_table(cql_test_env& e, const char* table) {
+    return e.local_db().find_column_family(ks_name, table);
+}
+
+} // namespace
+
+// A compaction in the middle of a replay purges a tombstone before the writes
+// it covers are replayed, so the run holds every compaction of the target off,
+// a major included, and says so at the end.
+SEASTAR_TEST_CASE(a_held_table_reports_every_compaction_disabled) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+        e.db().invoke_on_all([](replica::database& db) {
+                  return db.find_column_family(ks_name, "target").disable_auto_compaction();
+              }).get();
+        auto& t = target_table(e, "target");
+        auto hold = t.hold_compaction_off("point-in-time replay test").get();
+        BOOST_REQUIRE(!hold.cres.empty());
+        BOOST_REQUIRE(t.compaction_still_held(hold));
+    });
+}
+
+// Released, the table compacts again: the hold may not outlive the run.
+SEASTAR_TEST_CASE(a_released_table_no_longer_reports_compaction_disabled) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+        e.db().invoke_on_all([](replica::database& db) {
+                  return db.find_column_family(ks_name, "target").disable_auto_compaction();
+              }).get();
+        auto& t = target_table(e, "target");
+        auto hold = t.hold_compaction_off("point-in-time replay test").get();
+        auto released = std::move(hold.cres);
+        released.clear();
+        BOOST_REQUIRE(!t.compaction_still_held(hold));
+    });
+}
+
+// Auto-compaction turned back on while the run holds the table is exactly the
+// case the hold cannot stop, so the run has to fail instead.
+SEASTAR_TEST_CASE(auto_compaction_enabled_under_a_hold_is_reported) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+        e.db().invoke_on_all([](replica::database& db) {
+                  return db.find_column_family(ks_name, "target").disable_auto_compaction();
+              }).get();
+        auto& t = target_table(e, "target");
+        auto hold = t.hold_compaction_off("point-in-time replay test").get();
+        BOOST_REQUIRE(t.compaction_still_held(hold));
+        t.enable_auto_compaction();
+        BOOST_REQUIRE(!t.compaction_still_held(hold));
+    });
+}
+
+
+// The hold is what stops a compaction asked for by hand: auto-compaction being
+// off does not. A major asked for while a replay holds the target waits for it
+// rather than running between the backup's sstables and the replayed history.
+SEASTAR_TEST_CASE(a_major_compaction_asked_for_under_a_hold_does_not_run) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+        e.db().invoke_on_all([](replica::database& db) {
+                  return db.find_column_family(ks_name, "target").disable_auto_compaction();
+              }).get();
+        // Two sstables, so a major has something to do.
+        for (int i = 0; i < 2; ++i) {
+            e.execute_cql(seastar::format("INSERT INTO ks.target (pk, value) VALUES ('{}', {})", i, i)).get();
+            e.db().invoke_on_all([](replica::database& db) {
+                      return db.flush_all_memtables();
+                  }).get();
+        }
+        auto& t = target_table(e, "target");
+        auto hold = t.hold_compaction_off("point-in-time replay test").get();
+        auto major = t.compact_all_sstables(tasks::make_empty_task_info());
+        // A few rounds of the reactor: enough for a major that could
+        // run to have run, and no sleep.
+        for (int i = 0; i < 100; ++i) {
+            seastar::yield().get();
+        }
+        BOOST_REQUIRE(!major.available());
+        BOOST_REQUIRE(t.compaction_still_held(hold));
+        hold.cres.clear();
+        major.get();
+    });
 }
 
 BOOST_AUTO_TEST_SUITE_END()

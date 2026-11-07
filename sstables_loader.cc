@@ -21,6 +21,7 @@
 #include "sstables_loader.hh"
 #include "db/config.hh"
 #include "dht/auto_refreshing_sharder.hh"
+#include "compaction/compaction_manager.hh"
 #include "replica/distributed_loader.hh"
 #include "replica/database.hh"
 #include "sstables/sstables_manager.hh"
@@ -904,6 +905,8 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
     });
 }
 
+sstables_loader::~sstables_loader() = default;
+
 future<> sstables_loader::stop() {
     co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
@@ -951,6 +954,75 @@ static std::filesystem::path pitr_replay_state_dir(const db::config& cfg) {
     return std::filesystem::path(cfg.work_directory()) / "pitr" / "replay";
 }
 
+// The restore path takes a plain vector. One sstring per sstable of the
+// backup, the same allocation /storage_service/restore makes from its request.
+static std::vector<sstring> toc_names_of(const utils::chunked_vector<sstring>& names) {
+    return std::vector<sstring>(names.begin(), names.end());
+}
+
+future<> sstables_loader::hold_pitr_compaction(table_id target) {
+    co_await container().invoke_on_all([target](sstables_loader& loader) -> future<> {
+        auto hold = co_await loader._db.local().find_column_family(target).hold_compaction_off("point-in-time replay");
+        loader._pitr_compaction_hold = std::make_unique<replica::compaction_reenablers_and_lock_holders>(std::move(hold));
+    });
+}
+
+future<bool> sstables_loader::pitr_compaction_still_held(table_id target) {
+    co_return co_await container().map_reduce0(
+            [target](sstables_loader& loader) {
+                return loader._pitr_compaction_hold && loader._db.local().find_column_family(target).compaction_still_held(*loader._pitr_compaction_hold);
+            },
+            true, std::logical_and<bool>());
+}
+
+future<> sstables_loader::release_pitr_compaction() noexcept {
+    // Never throws: it runs on the way out of a run that may already be
+    // failing, and a hold left behind would stop the table compacting for good.
+    try {
+        co_await container().invoke_on_all([](sstables_loader& loader) {
+            loader._pitr_compaction_hold.reset();
+        });
+    } catch (...) {
+        llog.error("Could not release the point-in-time replay's compaction hold: {}", std::current_exception());
+    }
+}
+
+future<> sstables_loader::load_backup_into_target(
+        const db::pitr::replay_to_params& params, const std::vector<sstring>& toc_names, download_progress& progress, table_id target, abort_source& as) {
+    // Before the load, and held until the run ends: a compaction between the
+    // backup's sstables landing and the history being replayed over them
+    // purges a tombstone before the writes it covers (P52).
+    co_await hold_pitr_compaction(target);
+    std::exception_ptr ex;
+    try {
+        if (toc_names.empty()) {
+            llog.info("Point-in-time replay of {}.{}: backup '{}' holds no sstable, nothing to load", params.keyspace, params.table, params.snapshot);
+        } else {
+            co_await download_and_stream(progress, params.endpoint, params.bucket, params.keyspace, params.table, params.prefix, toc_names, stream_scope::all,
+                    primary_replica_only(false), as);
+        }
+        llog.info("Point-in-time replay of {}.{}: backup '{}' loaded", params.keyspace, params.table, params.snapshot);
+        // Between the load and the check, so that a test can compact the
+        // target, or turn its auto-compaction back on, while the run holds it.
+        co_await utils::get_local_injector().inject("pitr_replay_loaded", utils::wait_for_message(std::chrono::minutes(2)));
+
+        // The hold cannot stop a compaction of a group that appeared while the
+        // load ran, nor auto-compaction being turned back on, so the run says
+        // whether it still holds what it took, and fails if it does not.
+        if (!co_await pitr_compaction_still_held(target)) {
+            throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} cannot be trusted: a compaction of the target became possible while the "
+                                                 "backup was loading, so a tombstone may have been purged before the writes it covers",
+                    params.keyspace, params.table));
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await release_pitr_compaction();
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+}
+
 future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& params, abort_source& as) {
     auto start = co_await db::pitr::start_replay_to(_db, _storage_manager, _pitr_replays, pitr_replay_state_dir(_db.local().get_config()), params, as);
     if (!start) {
@@ -961,9 +1033,28 @@ future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& pa
     // ep.3. Until they land the task ends in failure and never in `done`: the
     // target carries the `started` mark, so it reads as incomplete, and a
     // recovery that did not replay anything may not read as a finished one.
-    throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} to {} is not built yet: the target was checked and marked, backup '{}' is not loaded, "
-                                         "and the target stays incomplete",
-            params.keyspace, params.table, params.t, params.snapshot));
+    auto progress = make_lw_shared<download_progress>();
+    std::exception_ptr load_error;
+    try {
+        co_await load_backup_into_target(params, toc_names_of(start->toc_names), *progress, start->target, as);
+    } catch (...) {
+        load_error = std::current_exception();
+    }
+    co_await progress->stop();
+    if (load_error) {
+        // A load that failed leaves the target marked, so it reads as
+        // incomplete and a second call is refused: the user drops it and
+        // replays into a new table.
+        std::rethrow_exception(std::move(load_error));
+    }
+
+    // The replay of the shipped history is ep.3. Until it lands the task ends
+    // in failure and never in `done`: the target carries the `started` mark, so
+    // it reads as incomplete, and a recovery that replayed nothing may not read
+    // as a finished one.
+    throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} to {} is not built yet: backup '{}' is loaded, {} sstable(s), and the target stays "
+                                         "incomplete until the history is replayed",
+            params.keyspace, params.table, params.t, params.snapshot, start->toc_names.size()));
 }
 
 future<tasks::task_id> sstables_loader::pitr_replay_to(db::pitr::replay_to_params params) {

@@ -2689,6 +2689,53 @@ future<compaction_reenablers_and_lock_holders> table::get_compaction_reenablers_
     co_return ret;
 }
 
+// Every view of every compaction group of the table, gathered without
+// suspending: a suspension here lets set_split_mode() create a group that the
+// caller would then not hold.
+static std::vector<compaction::compaction_group_view*> all_compaction_views(const storage_group_map& sgs) {
+    std::vector<compaction::compaction_group_view*> views;
+    for (const auto& sg : sgs | std::views::values) {
+        sg->for_each_compaction_group([&views](const compaction_group_ptr& cg) {
+            for (auto* view : cg->all_views()) {
+                views.push_back(view);
+            }
+        });
+    }
+    return views;
+}
+
+future<compaction_reenablers_and_lock_holders> table::hold_compaction_off(sstring reason) {
+    auto views = all_compaction_views(storage_groups());
+    auto hold = compaction_reenablers_and_lock_holders();
+    hold.cres.reserve(views.size());
+    // parallel_for_each and not a loop: every view has to be disabled from the
+    // same continuation the list was built in.
+    co_await coroutine::parallel_for_each(views, [this, &hold, reason](compaction::compaction_group_view* view) -> future<> {
+        hold.cres.push_back(std::make_unique<compaction::compaction_reenabler>(co_await _compaction_manager.stop_and_disable_compaction(reason, *view)));
+    });
+    tlogger.info("Disabled every compaction of {}.{} for {}: {} view(s)", schema()->ks_name(), schema()->cf_name(), reason, hold.cres.size());
+    co_return hold;
+}
+
+bool table::compaction_still_held(const compaction_reenablers_and_lock_holders& hold) {
+    if (!is_auto_compaction_disabled_by_user()) {
+        tlogger.warn("Auto-compaction of {}.{} was enabled while compaction was held off", schema()->ks_name(), schema()->cf_name());
+        return false;
+    }
+    auto views = all_compaction_views(storage_groups());
+    if (views.size() != hold.cres.size()) {
+        tlogger.warn("{}.{} has {} compaction view(s), {} were held off", schema()->ks_name(), schema()->cf_name(), views.size(), hold.cres.size());
+        return false;
+    }
+    for (auto* view : views) {
+        if (!_compaction_manager.compaction_disabled(*view)) {
+            tlogger.warn("Compaction of {}.{} is no longer disabled on {}", schema()->ks_name(), schema()->cf_name(), *view);
+            return false;
+        }
+    }
+    return true;
+}
+
 future<> table::clear_being_repaired_for_range(dht::token_range range) {
     auto sgs = storage_groups_for_token_range(range);
     for (auto& sg : sgs) {

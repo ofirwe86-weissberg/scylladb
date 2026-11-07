@@ -26,6 +26,7 @@ using namespace seastar;
 
 namespace replica {
 class database;
+struct compaction_reenablers_and_lock_holders;
 }
 
 struct minimal_sst_info;
@@ -143,6 +144,23 @@ private:
     // arrived on, so one of them is refused rather than writing over the other.
     db::pitr::replay_in_flight _pitr_replays;
 
+    // This shard's share of the compaction hold a running replay keeps on its
+    // target. Per shard, because a reenabler belongs to the shard that took it:
+    // it is released here, or with this service if the node stops first. By
+    // pointer, so that the header does not have to see a compaction reenabler.
+    std::unique_ptr<replica::compaction_reenablers_and_lock_holders> _pitr_compaction_hold;
+
+    // Takes, checks and releases the hold on every shard. The check is what
+    // tells a replay that nothing compacted its target while it ran.
+    future<> hold_pitr_compaction(table_id target);
+    future<bool> pitr_compaction_still_held(table_id target);
+    future<> release_pitr_compaction() noexcept;
+
+    // Loads the backup's sstables into the target through the restore path,
+    // with compaction held off for the whole of it.
+    future<> load_backup_into_target(
+            const db::pitr::replay_to_params& params, const std::vector<sstring>& toc_names, download_progress& progress, table_id target, abort_source& as);
+
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
     future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
     future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
@@ -157,6 +175,10 @@ public:
             sstables::storage_manager& sstm,
             db::system_distributed_keyspace& sys_dist_ks,
             seastar::scheduling_group sg);
+
+    // Out of line, because _pitr_compaction_hold points at a type the header
+    // only declares.
+    ~sstables_loader();
 
     future<> stop();
 

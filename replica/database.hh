@@ -1587,6 +1587,24 @@ public:
             const service::frozen_topology_guard& guard, dht::token_range range);
     future<uint64_t> estimated_partitions_in_range(dht::token_range tr) const;
 
+    // Holds every compaction of this table off for as long as the holder
+    // lives, a major and a scrub included: disable_auto_compaction() alone does
+    // not stop one that was asked for by hand. A point-in-time replay holds it
+    // for its whole run, because a compaction in the middle of one purges a
+    // tombstone before the writes it covers are replayed (P52).
+    //
+    // Takes every view of every compaction group before the first suspension
+    // point, so a group created while this ran cannot slip in unguarded, and
+    // records how many it took: compaction_still_held() compares that.
+    future<compaction_reenablers_and_lock_holders> hold_compaction_off(sstring reason);
+
+    // Whether nothing could have compacted since the hold was taken: the table
+    // still has exactly the views the hold covers, every one of them still has
+    // compaction disabled, and auto-compaction is still off. A replay that
+    // cannot say this fails rather than reporting a recovery it cannot vouch
+    // for.
+    bool compaction_still_held(const compaction_reenablers_and_lock_holders& hold);
+
     bool ready_for_writes() const {
         return !_readonly;
     }

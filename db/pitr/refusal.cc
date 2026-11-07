@@ -42,6 +42,8 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "backup_names_another_table";
     case refusal_reason::replay_already_running:
         return "replay_already_running";
+    case refusal_reason::backup_manifest_damaged:
+        return "backup_manifest_damaged";
     }
     return "unknown";
 }

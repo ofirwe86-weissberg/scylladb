@@ -25,6 +25,8 @@
 #include "mutation/timestamp.hh"
 #include "schema/schema_fwd.hh"
 #include "seastarx.hh"
+#include "utils/chunked_vector.hh"
+#include "utils/rjson.hh"
 
 namespace seastar {
 class abort_source;
@@ -43,7 +45,7 @@ namespace db::pitr {
 
 // The endpoint's parameters as they arrived. T stays text: a malformed one is
 // ordinary user input and comes back as a refusal, not as a bad request. There
-// is no list of sstables: a replay takes them from the backup itself.
+// is no list of sstables: a replay takes the backup's own manifest.
 struct replay_to_params {
     // The same three the restore endpoint takes.
     sstring endpoint;
@@ -52,15 +54,43 @@ struct replay_to_params {
     // The target the backup is replayed into, which the user created.
     sstring keyspace;
     sstring table;
-    // The backup, as its snapshot was named; recorded in the mark.
+    // The backup, as its snapshot was named. Checked against the manifest, so
+    // that a prefix naming another backup is refused and not restored.
     sstring snapshot;
     sstring t;
 };
 
-// A larger schema.cql is damage or a wrong prefix, and is refused unread.
+// Caps on what a replay reads before anything is loaded: a larger object is
+// damage or a wrong prefix, and is refused unread. The manifest's is the one
+// that grows with the backup, at about 300 bytes per sstable.
 constexpr size_t max_schema_cql_size = 1024 * 1024;
+constexpr size_t max_manifest_size = 32 * 1024 * 1024;
 
 constexpr const char* schema_cql_file_name = "schema.cql";
+constexpr const char* manifest_file_name = "manifest.json";
+
+// What a replay takes from the backup's manifest.
+struct backup_manifest {
+    // The backup's own names, for the log and the refusal: the target may be
+    // named differently, which is the point of a replay (P52).
+    sstring snapshot;
+    sstring keyspace;
+    sstring table;
+    // The TOC object key of every sstable of the backup, relative to the
+    // prefix, as the restore path takes them. Empty for a backup of a table
+    // that held nothing.
+    utils::chunked_vector<sstring> toc_names;
+};
+
+// Reads the manifest's fields a replay needs and refuses one that names a
+// snapshot other than the call's: one prefix is one backup, so a prefix
+// pointing at another backup is a user error and not a restore.
+//
+// The keyspace and the table are read but not checked: the target of a replay
+// is allowed to be a table of another name, so only its schema is compared.
+//
+// Yields while parsing and once per sstable entry; the caller caps the bytes.
+future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chunked_content&& content, const sstring& expected_snapshot);
 
 // The targets a replay is running into on this node, so that a second call on
 // one target is refused rather than writing over the first one's work (P62).
@@ -155,15 +185,20 @@ struct replay_start {
     // T, microseconds since the UNIX epoch, UTC.
     api::timestamp_type t = 0;
     bound_file bound;
+    // The backup's sstables, from its manifest.
+    utils::chunked_vector<sstring> toc_names;
     // Held until the run ends, so no second replay enters this target.
     replay_in_flight::guard in_flight;
 };
 
 // Runs every check a replay makes before it loads anything, in this order, and
 // then writes the `started` mark: T parses, a store location was given and is
-// known, the target exists, no replay is running into it, its auto-compaction
-// is off, it is empty, no mark exists for it, the backup carries a bound file
-// the strict reader accepts, and the target's schema matches the backup's. The cheap local checks come first, so
+// known, the target exists, no replay is running into it, no mark exists for
+// it, its auto-compaction is off, it is empty, the backup's manifest names the
+// call's snapshot, it carries a bound file the strict reader accepts, and the
+// target's schema matches the backup's. The mark comes before the state of the
+// table, because a marked target is answered with "drop it" whatever state a
+// run left it in. The cheap local checks come first, so
 // a plainly wrong call never reaches the store, and the mark is written last,
 // so a refusal leaves the node as it was.
 //
@@ -171,8 +206,9 @@ struct replay_start {
 // meet there whichever shards they arrived on.
 //
 // A refusal is the answer to a question about the call; a store or disk error is
-// an exception, since it says nothing about the backup. Reads two small
-// objects, yields per read, and needs every reference to outlive the call.
+// an exception, since it says nothing about the backup. Reads three objects,
+// yields per read and per manifest entry, and needs every reference to outlive
+// the call.
 future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
         std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
 
