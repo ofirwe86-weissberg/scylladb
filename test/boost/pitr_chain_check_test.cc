@@ -261,6 +261,20 @@ void store_chain(fake_store& store, uint64_t count) {
     }
 }
 
+// A chain whose sequences are dense and whose segment ids are the ones given,
+// which is what a shipper that skipped a segment leaves behind: the ids come
+// from `++_ids` and skip reserve and recycled segments, so a hole in them is
+// invisible to the sequence numbers.
+void store_chain_of_ids(fake_store& store, const std::vector<uint64_t>& segment_ids) {
+    for (uint64_t sequence = 0; sequence < segment_ids.size(); ++sequence) {
+        auto entry = make_entry(sequence);
+        entry.segment_id = segment_ids[sequence];
+        entry.prev_segment_id = sequence == 0 ? 0 : segment_ids[sequence - 1];
+        entry.file_name = fmt::format("CommitLog-2-{}.log", segment_ids[sequence]);
+        store_entry(store, entry, sequence);
+    }
+}
+
 future<std::expected<checked_chain, refusal>> check(fake_store& store, int64_t target_time_us, chain_bound bound = make_bound()) {
     fake_client client(store);
     abort_source as;
@@ -441,6 +455,49 @@ SEASTAR_TEST_CASE(test_a_missing_entry_ends_the_chain_before_it) {
     BOOST_REQUIRE_EQUAL(chain.entries_read, 2);
     BOOST_REQUIRE_EQUAL(chain.covered_through_us, covered_us_of(1));
     BOOST_REQUIRE_EQUAL(chain.segments.size(), 2);
+}
+
+// REF-4, #103: the ledger can miss the segment that was open when the snapshot
+// was taken, which is the one holding the writes the backup's sstables do not.
+// The sequence numbers stay dense over the hole, so only the bound's own id
+// shows it.
+SEASTAR_TEST_CASE(test_a_chain_without_the_bounds_own_segment_is_refused) {
+    fake_store store;
+    store_chain_of_ids(store, {segment_id_of(0), segment_id_of(1), segment_id_of(3), segment_id_of(4)});
+    const auto result = co_await check(store, covered_us_of(3), make_bound(segment_id_of(2)));
+    const auto& r = refused(result, refusal_reason::protection_records_missing);
+    // The shard and the id, because the user's next step is to look for that
+    // segment of that shard, or to restore from a later backup.
+    BOOST_REQUIRE(r.detail.find(fmt::format("shard {}", test_shard)) != sstring::npos);
+    BOOST_REQUIRE(r.detail.find(fmt::format("{}", segment_id_of(2))) != sstring::npos);
+}
+
+SEASTAR_TEST_CASE(test_a_chain_holding_the_bounds_own_segment_is_accepted) {
+    fake_store store;
+    store_chain_of_ids(store, {segment_id_of(0), segment_id_of(1), segment_id_of(2), segment_id_of(3)});
+    const auto result = co_await check(store, covered_us_of(3), make_bound(segment_id_of(2)));
+    BOOST_REQUIRE_EQUAL(accepted(result).segments.size(), 4);
+}
+
+SEASTAR_TEST_CASE(test_a_chain_that_skips_an_id_above_the_bound_is_accepted) {
+    fake_store store;
+    // A reserve or recycled segment takes an id and is never written to, so a
+    // hole anywhere but at the bound is what a healthy chain looks like.
+    store_chain_of_ids(store, {segment_id_of(0), segment_id_of(1), segment_id_of(3)});
+    const auto result = co_await check(store, covered_us_of(2), make_bound(segment_id_of(1)));
+    BOOST_REQUIRE_EQUAL(accepted(result).segments.size(), 3);
+}
+
+SEASTAR_TEST_CASE(test_a_chain_wholly_below_the_bound_is_left_to_the_coverage_rule) {
+    fake_store store;
+    store_chain(store, 3);
+    // Nothing after the snapshot was shipped, so there is no segment to name:
+    // what the chain cannot cover is the coverage rule's answer, and its
+    // interval is what tells the user where to retry.
+    const auto result = co_await check(store, covered_us_of(2) + 1, make_bound(segment_id_of(5)));
+    const auto& r = refused(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE(r.interval.has_value());
+    BOOST_REQUIRE_EQUAL(r.interval->through_us, covered_us_of(2));
 }
 
 SEASTAR_TEST_CASE(test_a_t_past_a_shortened_chain_is_refused) {
