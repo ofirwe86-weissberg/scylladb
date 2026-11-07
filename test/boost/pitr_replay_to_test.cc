@@ -53,6 +53,8 @@ replay_state make_state() {
             .phase = replay_phase::started,
             .snapshot = "backup-1",
             .t = "2026-11-04T14:05:00.000000Z",
+            .source_keyspace = "ks",
+            .source_table = "source",
             .started_at_us = 1762400000000000LL,
     };
 }
@@ -146,9 +148,17 @@ BOOST_AUTO_TEST_CASE(decoding_a_mark_refuses_damage) {
     // each is damage and none may read as a mark of its own.
     BOOST_REQUIRE_THROW(decode_replay_state(whole.substr(0, whole.size() / 2)), std::runtime_error);
     BOOST_REQUIRE_THROW(decode_replay_state(""), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=2\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=half\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=-1\n"), std::runtime_error);
+    BOOST_REQUIRE_THROW(
+            decode_replay_state("format=pitr-replay\nversion=2\nphase=started\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=1\n"),
+            std::runtime_error);
+    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=half\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=1\n"),
+            std::runtime_error);
+    BOOST_REQUIRE_THROW(
+            decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=-1\n"),
+            std::runtime_error);
+    // A mark written before the source was recorded is damage, not a mark with
+    // two fields missing: the keys are the format.
+    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
     BOOST_REQUIRE_THROW(decode_replay_state(whole + "phase=done\n"), std::runtime_error);
 }
 
@@ -217,6 +227,56 @@ SEASTAR_TEST_CASE(a_target_missing_the_backups_dropped_column_is_refused) {
     });
 }
 
+
+// Nothing in a WITH clause may differ, only the three above: a replay into a
+// target whose options are not the backup's does not restore the backup's
+// behaviour. Each option gets a case of its own, because a normaliser that
+// drops one line too many drops them all silently.
+SEASTAR_TEST_CASE(a_target_whose_clustering_order_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text, ck int, value int, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck ASC)").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text, ck int, value int, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+SEASTAR_TEST_CASE(a_target_whose_default_time_to_live_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int) WITH default_time_to_live = 0").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH default_time_to_live = 3600").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+SEASTAR_TEST_CASE(a_target_whose_gc_grace_seconds_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int) WITH gc_grace_seconds = 864000").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH gc_grace_seconds = 1234").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+// The other side of the same rule: the id is the one thing in the WITH clause
+// a replay must ignore, since the target is a table of its own.
+SEASTAR_TEST_CASE(two_statements_differing_only_in_their_id_match) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int)").get();
+        auto backup = schema_cql_of(e, "source");
+        auto target = backup;
+        auto id = e.local_db().find_schema(ks_name, "source")->id().to_sstring();
+        auto at = target.find(id);
+        BOOST_REQUIRE(at != sstring::npos);
+        target = target.substr(0, at) + "11112222-3333-4444-5555-666677778888" + target.substr(at + id.size());
+        BOOST_REQUIRE(target != backup);
+        BOOST_REQUIRE(!check_schema_match(target, backup).get());
+    });
+}
 
 // Two calls on one target would write over each other's work, and the second
 // one cannot tell its own writes from the first one's (P62).

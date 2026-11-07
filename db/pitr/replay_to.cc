@@ -52,7 +52,8 @@ static std::string_view phase_name(replay_phase phase) {
 }
 
 sstring encode(const replay_state& state) {
-    for (const auto& value : {std::string_view(state.snapshot), std::string_view(state.t)}) {
+    for (const auto& value :
+            {std::string_view(state.snapshot), std::string_view(state.t), std::string_view(state.source_keyspace), std::string_view(state.source_table)}) {
         if (value.find('\n') != std::string_view::npos) {
             throw std::runtime_error("pitr replay mark: a value may not hold a newline");
         }
@@ -60,8 +61,8 @@ sstring encode(const replay_state& state) {
     if (state.started_at_us < 0) {
         throw std::runtime_error("pitr replay mark: started_at_us may not be negative");
     }
-    return seastar::format("format={}\nversion={}\nphase={}\nsnapshot={}\nt={}\nstarted_at_us={}\n", replay_state_format, replay_state_version_1,
-            phase_name(state.phase), state.snapshot, state.t, state.started_at_us);
+    return seastar::format("format={}\nversion={}\nphase={}\nsnapshot={}\nt={}\nsource_keyspace={}\nsource_table={}\nstarted_at_us={}\n", replay_state_format,
+            replay_state_version_1, phase_name(state.phase), state.snapshot, state.t, state.source_keyspace, state.source_table, state.started_at_us);
 }
 
 // The value of `key`, or an error naming what was there instead: a reader built
@@ -98,6 +99,8 @@ replay_state decode_replay_state(std::string_view text) {
     }
     state.snapshot = sstring(take_line(text, "snapshot"));
     state.t = sstring(take_line(text, "t"));
+    state.source_keyspace = sstring(take_line(text, "source_keyspace"));
+    state.source_table = sstring(take_line(text, "source_table"));
     auto started = take_line(text, "started_at_us");
     auto [end, ec] = std::from_chars(started.data(), started.data() + started.size(), state.started_at_us);
     if (ec != std::errc() || end != started.data() + started.size() || state.started_at_us < 0) {
@@ -188,10 +191,12 @@ future<sstring> normalize_schema_cql(std::string_view text) {
         if (line.empty()) {
             continue;
         }
+        // Only where describe writes it, which is the line that closes the
+        // column list: anywhere else those words are a value, not the option.
         // The `ID` option opens the WITH clause, so the next line's `AND` still
         // reads as a continuation of a `WITH` that now carries no option.
-        if (auto id = line.find("WITH ID = "); id != std::string_view::npos) {
-            line = line.substr(0, id + 4);
+        if (line.starts_with(") WITH ID = ")) {
+            line = ") WITH";
         }
         sstring kept;
         if (auto renamed = without_table_name(line, "CREATE TABLE ")) {

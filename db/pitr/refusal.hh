@@ -63,7 +63,8 @@ enum class refusal_reason {
     // The bound file is there but its strict reader refuses it.
     bound_file_damaged,
     // The backup under the prefix is not the one the call named: its manifest
-    // records another snapshot, keyspace or table.
+    // records another snapshot. The keyspace and the table it records are not
+    // checked, because a replay into a table of another name is the point.
     backup_names_another_table,
     // A replay is running into this target right now, so a second one would
     // write over it (P62).
