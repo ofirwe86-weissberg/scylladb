@@ -342,11 +342,27 @@ BOOST_AUTO_TEST_CASE(test_a_file_that_is_not_a_bound_file_is_refused) {
 namespace {
 
 // Every shard's bound, taken the way the snapshot takes it.
-std::vector<db::replay_position> capture_bounds(cql_test_env& e) {
+// What the snapshot would record for each shard, by the rule the bound file
+// holds (lowest_safe_bound(), table.cc): the lower of what the sstables
+// recorded and the commitlog's floor, or - with nothing flushed and no chain -
+// base segment 1 of the shard. Restated here on purpose: it is the contract
+// under test, so a change to it must change this too.
+std::vector<db::replay_position> expected_bounds(cql_test_env& e, std::optional<uint64_t> chain_floor = std::nullopt) {
     std::vector<db::replay_position> bounds(this_smp_shard_count());
-    e.db().invoke_on_all([&bounds](replica::database& db) -> future<> {
+    e.db().invoke_on_all([&bounds, chain_floor](replica::database& db) -> future<> {
               auto& t = db.find_column_family(ks_name, cf_name);
-              bounds[this_shard_id()] = (co_await t.snapshot_sstables()).commitlog_bound;
+              auto capture = co_await t.snapshot_sstables();
+              const auto floor = capture.commitlog_min_position;
+              auto with_floor = [floor](db::replay_position rp) {
+                  return floor == db::replay_position() ? rp : std::min(rp, floor);
+              };
+              if (capture.commitlog_bound != db::replay_position()) {
+                  bounds[this_shard_id()] = with_floor(capture.commitlog_bound);
+              } else if (chain_floor) {
+                  bounds[this_shard_id()] = with_floor(db::replay_position(*chain_floor, 0));
+              } else {
+                  bounds[this_shard_id()] = db::replay_position(this_shard_id(), db::segment_id_type(1), 0);
+              }
           }).get();
     return bounds;
 }
@@ -401,18 +417,16 @@ SEASTAR_TEST_CASE(test_a_snapshot_holding_the_bound_file_loads_through_the_uploa
             pitr_config());
 }
 
-// The file holds one row per shard, and each row's bound is that shard's own:
-// a bound taken from another shard, or from another moment, falls outside the
-// sandwich, because nothing flushes between the two observations.
+// The file holds one row per shard, and each row's bound is that shard's own,
+// by the rule above. Flushed, so every shard's sstables record a position and
+// the row is the lower of it and the commitlog's floor.
 SEASTAR_TEST_CASE(test_a_snapshot_with_pitr_configured_records_every_shard_bound) {
     return do_with_cql_env_thread(
             [](cql_test_env& e) {
                 create_and_fill(e);
-                auto before = capture_bounds(e);
+                take_snapshot(e, false);
+                auto expected = expected_bounds(e);
 
-                take_snapshot(e);
-
-                auto after = capture_bounds(e);
                 auto content = seastar::util::read_entire_file_contiguous(snapshot_dir(e) / bound_file_name).get();
                 auto f = decode_bound_file(content);
 
@@ -424,11 +438,73 @@ SEASTAR_TEST_CASE(test_a_snapshot_with_pitr_configured_records_every_shard_bound
                         const auto& row = f.shards[shard];
                         BOOST_REQUIRE_EQUAL(row.shard, shard);
                         BOOST_REQUIRE_EQUAL(row.bound.shard_id(), shard);
-                        BOOST_REQUIRE(before[shard] <= row.bound);
-                        BOOST_REQUIRE(row.bound <= after[shard]);
+                        // Nothing flushes between the snapshot and the reading
+                        // above, so the rule gives one value, not a range.
+                        BOOST_REQUIRE(row.bound == expected[shard]);
                         // Nothing installs a provider in this environment, so
                         // every shard reports no chain (#8, piece 2b).
                         BOOST_REQUIRE(!row.chain);
+                    }
+                }
+            },
+            pitr_config());
+}
+
+// Nothing flushed, so no sstable records a position: the row falls back to the
+// chain's floor, capped by the commitlog's floor. A bound above an unflushed
+// write would drop it, which is what the cap is for.
+SEASTAR_TEST_CASE(test_a_shard_with_nothing_flushed_records_the_chain_floor) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                constexpr uint64_t floor_base = 7;
+                create_and_fill(e);
+                e.db().invoke_on_all([](replica::database& db) {
+                          db.set_pitr_chain_provider([]() -> std::optional<shard_chain> {
+                              return shard_chain{.host_id = utils::UUID_gen::get_time_UUID(),
+                                      .boot_epoch_us = 1,
+                                      .chain_start_us = 2,
+                                      .chain = chain_id(utils::UUID_gen::get_time_UUID()),
+                                      .floor_segment_id = db::replay_position(this_shard_id(), floor_base, 0).id};
+                          });
+                      }).get();
+
+                // skip_flush, so no sstable of this table exists anywhere.
+                take_snapshot(e);
+
+                auto content = seastar::util::read_entire_file_contiguous(snapshot_dir(e) / bound_file_name).get();
+                auto f = decode_bound_file(content);
+                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                    BOOST_TEST_CONTEXT("shard " << shard) {
+                        const auto& row = f.shards[shard];
+                        const auto per_shard_floor = db::replay_position(shard, floor_base, 0);
+                        // Each shard's own floor, never shard 0's: the id carries
+                        // the shard, and a row built from another shard's would
+                        // fail the file's own shard check.
+                        BOOST_REQUIRE_EQUAL(row.bound.shard_id(), shard);
+                        BOOST_REQUIRE(row.bound <= per_shard_floor);
+                        BOOST_REQUIRE(row.chain);
+                    }
+                }
+            },
+            pitr_config());
+}
+
+// Nothing flushed and no chain: the lowest encodable bound, base segment 1 of
+// the shard. Such a backup has no history to replay and a restore refuses it
+// for the missing chain, so this only has to be a real position.
+SEASTAR_TEST_CASE(test_a_shard_with_nothing_flushed_and_no_chain_records_segment_one) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+
+                take_snapshot(e);
+
+                auto content = seastar::util::read_entire_file_contiguous(snapshot_dir(e) / bound_file_name).get();
+                auto f = decode_bound_file(content);
+                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                    BOOST_TEST_CONTEXT("shard " << shard) {
+                        BOOST_REQUIRE(f.shards[shard].bound == db::replay_position(shard, db::segment_id_type(1), 0));
+                        BOOST_REQUIRE(!f.shards[shard].chain);
                     }
                 }
             },

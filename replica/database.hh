@@ -1225,11 +1225,16 @@ public:
     // critical section as the list.
     struct snapshot_sstable_list {
         std::vector<sstables::shared_sstable> sstables;
-        // The lowest commitlog position that can still be replayed after a reboot, as
-        // of the moment `sstables` was copied. Every write that `sstables` does not
-        // hold is at or above it, so point-in-time recovery replaying from here misses
-        // no write (#12). Default-constructed when the table has no commitlog.
+        // Where point-in-time recovery may start replaying, as of the moment `sstables`
+        // was copied: every write that `sstables` does not hold is at or above it (#12).
+        // Default-constructed when no sstable of this shard recorded a position, which
+        // leaves the lowest safe value to the caller (lowest_safe_bound(), table.cc).
         db::replay_position commitlog_bound;
+        // The commitlog's own floor at the same moment, which the caller takes the
+        // minimum with: a write can be given its position before the flush and reach
+        // the memtable after it, so `commitlog_bound` alone can sit above it (#103).
+        // Default-constructed when the table has no commitlog.
+        db::replay_position commitlog_min_position;
         sstable_list_permit permit;
     };
 
