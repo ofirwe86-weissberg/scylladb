@@ -152,8 +152,6 @@ pitr_prefix: pitr/node1
 pitr_seal_interval_in_seconds: 60
 ```
 
-The lookup is an exact string match on `name`.
-
 **Store permissions.** The node's credentials need write access
 (`s3:PutObject`) to the shipping prefix and the backup prefix, and read
 access (`s3:GetObject`) to both for a restore. A restore also needs
@@ -199,8 +197,6 @@ Instead of the `'enabled': 'false'` compaction option, you can run
 `nodetool disableautocompaction ks t_restored` after the CREATE. T is UTC in
 ISO-8601, ending in an upper-case `Z`, with at most six fractional digits:
 `YYYY-MM-DDThh:mm:ss[.ffffff]Z`. Missing digits below the second count as zero.
-URL-encode the endpoint name if it contains characters a query string can't
-carry.
 
 ## RPO and RTO
 
