@@ -71,9 +71,17 @@ void write_raw(const std::filesystem::path& path, std::string_view body) {
 
 refusal refusal_of(cql_test_env& e, const tmpdir& state_dir, const replay_to_params& params, replay_in_flight& in_flight) {
     abort_source as;
-    auto result = start_replay_to(e.db(), e.get_sstorage_manager().local(), in_flight, state_dir.path(), params, as).get();
-    BOOST_REQUIRE_MESSAGE(!result, "the replay was not refused");
-    return result.error();
+    try {
+        auto result = start_replay_to(e.db(), e.get_sstorage_manager().local(), in_flight, state_dir.path(), params, as).get();
+        BOOST_REQUIRE_MESSAGE(!result, "the replay was not refused");
+        return std::move(result.error());
+    } catch (const std::exception& ex) {
+        // A check that is skipped by mistake runs on to the store, which these
+        // tests do not have: report that as the failed assertion it is, rather
+        // than as an I/O error from an endpoint nobody meant to reach.
+        BOOST_FAIL(fmt::format("the replay reached the store instead of refusing: {}", ex.what()));
+        throw;
+    }
 }
 
 // The statement a snapshot writes to schema.cql, from this node's own describe.
