@@ -105,7 +105,7 @@ SEAL_SECONDS = 1
 
 
 class Reason:
-    """Reason codes in a refusal's text. The first group is real: db/pitr/refusal.cc on pitr/18-ep1b-endpoint."""
+    """Reason codes in a refusal's text. All but the last three are real: db/pitr/refusal.cc on pitr/18-ep3c-splits."""
     T_INVALID = 't_invalid'
     T_PAST_COVERAGE = 't_past_coverage'
     RECORDS_MISSING = 'protection_records_missing'
@@ -121,11 +121,14 @@ class Reason:
     BOUND_FILE_DAMAGED = 'bound_file_damaged'
     BACKUP_NAMES_ANOTHER_TABLE = 'backup_names_another_table'
     REPLAY_ALREADY_RUNNING = 'replay_already_running'
-    # Proposed, until the piece that refuses for it lands and names its code: ep.3 (damaged segments, compaction during
-    # replay), 15-b/c (truncate, schema change) and 12-2.2 (upload unfinished). Change the spelling here when it does.
+    BACKUP_MANIFEST_DAMAGED = 'backup_manifest_damaged'
+    BACKUP_FILE_TOO_LARGE = 'backup_file_too_large'
+    TARGET_USES_TABLETS = 'target_uses_tablets'
     SEGMENT_MISSING = 'shipped_object_missing'
     SEGMENT_DAMAGED = 'shipped_object_damaged'
-    TARGET_COMPACTED = 'target_compacted'
+    # Proposed: no real code exists yet for these. They need 15-b/c (TRUNCATE, schema change) and 12-2.2 (upload unfinished),
+    # which aren't built (their tests are untouched). Change the spelling here when the piece lands and names its code. A compaction during a replay has no
+    # code either: T3 accepts any real one.
     TRUNCATED = 'source_truncated'
     SCHEMA_CHANGED = 'source_schema_changed'
     BACKUP_UNFINISHED = 'backup_upload_unfinished'
@@ -138,6 +141,9 @@ HISTORY_DAMAGED = {Reason.RECORDS_MISSING, Reason.RECORDS_DAMAGED, Reason.SEGMEN
 # RTN-1, verbatim: requirements-must.md.
 WRONG_WAY_BACK = ("Don't load this copy's files into the original unless it's been truncated: "
                   "later deletes in the original still win, and rows stay missing with no error.")
+# The line the node logs when a replay ends in `done` (db/pitr/replay_to.cc, format_replay_result). Tasks carry no success text
+# (#100), so the log is where the result is.
+RESULT_MARK = 'is done: restored from backup'
 PAST_COVERAGE_WORDS = ['lag']
 # P68 (PM-67): the refusal on a done table says where the result was written.
 RESULT_LOGGED_WORDS = ['log']
@@ -213,12 +219,20 @@ async def wait_replay(manager, server, task_id) -> Outcome:
     return parse_outcome(await wait_for(ended, deadline(), label=f'replay task {task_id}'))
 
 
+async def result_line(pitr) -> str | None:
+    """The `done` result line of a replay into this node, from its log, or None if there is none."""
+    log = await pitr.manager.server_open_log(server_id=pitr.server.server_id)
+    found = await log.grep(re.escape(RESULT_MARK))
+    return found[-1][0] if found else None
+
+
 async def get_status(manager, server) -> Status | None:
     """None while st.1 hasn't landed and the URI doesn't exist. Once it has, a missing status is an error."""
     try:
         return parse_status(await manager.api.client.get_json(STATUS_URI, host=server.ip_addr))
     except HTTPError as e:
-        if e.code == 404 and not landed('st.1'):
+        # RUN_SKIPPED must not claim the endpoint exists: the status GET (#14) isn't built, so a 404 is the answer.
+        if e.code == 404 and 'st.1' not in LANDED_PHASES:
             return None
         raise
 
@@ -892,6 +906,7 @@ class Pitr:
     backup_keys: set = field(default_factory=set)
     _probe: str | None = None
     _pulse_pks: list = field(default_factory=list)
+    _pulse_checked: bool = False
 
     async def write(self, statements, table=None):
         await apply(self.cql, self.ks, table or self.cf, statements)
@@ -973,6 +988,12 @@ class Pitr:
             self._pulse_pks = keys_on_every_shard(1, 10_000)
         for pk in self._pulse_pks:
             await self.cql.run_async(f'INSERT INTO {self.ks}.pulse (pk, v) VALUES ({pk}, {now_us()})')
+        if not self._pulse_checked:
+            # Ask the node where the keys went: an idle shard holds coverage at 0, and the test would only time out.
+            rows = await self.cql.run_async(f'SELECT pk, token(pk) FROM {self.ks}.pulse')
+            reached = {shard_of(r[1]) for r in rows if r[0] in self._pulse_pks}
+            assert reached == set(range(SHARDS)), f'the pulse must reach every shard, it reaches {sorted(reached)}'
+            self._pulse_checked = True
 
     async def covered_through(self) -> int | None:
         """The node's covered-through time, from status. Until status lands, from the probe: a replay to a far-future T on one
