@@ -313,6 +313,18 @@ std::expected<backup_manifest, refusal> manifest_of(const sstring& text, const c
     return parse_backup_manifest(content_of(text), expected_snapshot).get();
 }
 
+// A manifest of `count` sstables, big enough that the parse cannot finish
+// inside one task quota.
+sstring manifest_with_many_sstables(size_t count) {
+    sstring entries;
+    for (size_t i = 0; i < count; ++i) {
+        entries += seastar::format(R"({}{{"id":"{}","toc_name":"me-{}-big-TOC.txt","data_size":1,"index_size":1,"first_token":{},"last_token":{},)"
+                                   R"("tablet_id":0}})",
+                i ? "," : "", i, i, i, i + 1);
+    }
+    return manifest_json("backup-1", "ks", "source", entries.c_str());
+}
+
 } // namespace
 
 // One prefix is one backup, so a prefix naming another backup is a user error
@@ -674,6 +686,21 @@ BOOST_AUTO_TEST_CASE(a_hold_is_kept_and_released_per_target) {
     BOOST_REQUIRE(!holds.find(other));
     BOOST_REQUIRE(holds.find(test_target));
     BOOST_REQUIRE_EQUAL(*holds.find(test_target), 1);
+}
+
+
+// `rjson::parse_yieldable` yields through `seastar::thread::maybe_yield()`, so
+// it must run in a thread: called from a plain coroutine, the yield has no
+// thread to switch to and the node crashes. Every other test here goes through
+// `seastar::async`, which is a thread context and hides the bug, so this one
+// deliberately does not: it is a coroutine, like the endpoint's own caller, and
+// the manifest is large enough that the parse is preempted.
+SEASTAR_TEST_CASE(a_large_manifest_parses_from_a_coroutine) {
+    constexpr size_t sstables = 20000;
+    auto manifest = co_await parse_backup_manifest(content_of(manifest_with_many_sstables(sstables)), "backup-1");
+    BOOST_REQUIRE(manifest);
+    BOOST_REQUIRE_EQUAL(manifest->toc_names.size(), sstables);
+    BOOST_REQUIRE_EQUAL(manifest->toc_names.back(), seastar::format("me-{}-big-TOC.txt", sstables - 1));
 }
 
 BOOST_AUTO_TEST_SUITE_END()
