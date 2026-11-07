@@ -227,6 +227,8 @@ add_scylla_test(pitr_ledger_writer_test
   KIND SEASTAR)
 add_scylla_test(pitr_replay_reader_test
   KIND SEASTAR)
+add_scylla_test(pitr_replay_to_test
+  KIND SEASTAR)
 add_scylla_test(pitr_segment_upload_test
   KIND SEASTAR)
 add_scylla_test(pitr_shipper_test

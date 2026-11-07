@@ -40,15 +40,54 @@ enum class refusal_reason {
     // The backup's bound is below the first segment the chain shipped, so the
     // commitlog between the two was never shipped (D27).
     backup_before_shipping,
+    // The call named no object-storage location, or one this node does not
+    // know: nothing can be read, so nothing is (P51).
+    store_location_missing,
+    // The target table the call names does not exist. The user creates it.
+    target_missing,
+    // The target holds data. A replay writes the backup and the history over
+    // it, and could not tell its own writes from what was there.
+    target_not_empty,
+    // The target's schema differs from the backup's in more than its name, its
+    // id and its compaction options (P52).
+    target_schema_differs,
+    // Auto-compaction is on for the target, so a compaction could purge a
+    // tombstone before the writes it covers are replayed.
+    target_auto_compaction_enabled,
+    // A replay already ran, or started to run, into this target (P62). Carries
+    // where the mark that says so lives.
+    target_already_replayed,
+    // A file the backup must carry is not under the prefix: the wrong prefix,
+    // or a backup taken with shipping off. Carries the file.
+    backup_file_missing,
+    // The bound file is there but its strict reader refuses it.
+    bound_file_damaged,
+    // The backup under the prefix is not the one the call named: its manifest
+    // records another snapshot. The keyspace and the table it records are not
+    // checked, because a replay into a table of another name is the point.
+    backup_names_another_table,
+    // A replay is running into this target right now, so a second one would
+    // write over it (P62).
+    replay_already_running,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 5> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 15> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
         refusal_reason::protection_records_damaged,
         refusal_reason::backup_before_shipping,
+        refusal_reason::store_location_missing,
+        refusal_reason::target_missing,
+        refusal_reason::target_not_empty,
+        refusal_reason::target_schema_differs,
+        refusal_reason::target_auto_compaction_enabled,
+        refusal_reason::target_already_replayed,
+        refusal_reason::backup_file_missing,
+        refusal_reason::bound_file_damaged,
+        refusal_reason::backup_names_another_table,
+        refusal_reason::replay_already_running,
 };
 
 std::string_view reason_code(refusal_reason) noexcept;
