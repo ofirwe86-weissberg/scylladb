@@ -22,6 +22,26 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "protection_records_damaged";
     case refusal_reason::backup_before_shipping:
         return "backup_before_shipping";
+    case refusal_reason::store_location_missing:
+        return "store_location_missing";
+    case refusal_reason::target_missing:
+        return "target_missing";
+    case refusal_reason::target_not_empty:
+        return "target_not_empty";
+    case refusal_reason::target_schema_differs:
+        return "target_schema_differs";
+    case refusal_reason::target_auto_compaction_enabled:
+        return "target_auto_compaction_enabled";
+    case refusal_reason::target_already_replayed:
+        return "target_already_replayed";
+    case refusal_reason::backup_file_missing:
+        return "backup_file_missing";
+    case refusal_reason::bound_file_damaged:
+        return "bound_file_damaged";
+    case refusal_reason::backup_names_another_table:
+        return "backup_names_another_table";
+    case refusal_reason::replay_already_running:
+        return "replay_already_running";
     }
     return "unknown";
 }
