@@ -2424,6 +2424,13 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                       }
                   }).get();
             });
+            // The same rule as the close slot: the provider reads the shipper,
+            // so it goes before the shipper does.
+            auto clear_pitr_chain_provider = defer_verbose_shutdown("point-in-time recovery chain provider", [&db] {
+                db.invoke_on_all([](replica::database& db) {
+                      db.set_pitr_chain_provider(nullptr);
+                  }).get();
+            });
             // From here on the shipper takes the closes, and releases a hold at
             // once until start_shipping() runs: see pitr_shipper.hh.
             pitr_shipper
@@ -2786,9 +2793,14 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                                 // A guard: shipping is active only where it holds.
                                 return;
                             }
-                            db::pitr::start_shipping_on_shard(shipper, sstm.local(), *log, host_id.id, pitr_boot_epoch_us, [&db] {
-                                return db.local().flush_all_memtables();
-                            });
+                            db::pitr::start_shipping_on_shard(
+                                    shipper, sstm.local(), *log, host_id.id, pitr_boot_epoch_us,
+                                    [&db] {
+                                        return db.local().flush_all_memtables();
+                                    },
+                                    [&db](db::pitr::chain_provider provider) {
+                                        db.local().set_pitr_chain_provider(std::move(provider));
+                                    });
                         })
                         .get();
             }
