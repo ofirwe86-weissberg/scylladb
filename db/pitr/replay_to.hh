@@ -66,8 +66,7 @@ struct backup_manifest {
 // snapshot other than the call's: one prefix is one backup, so a prefix
 // pointing at another is a user error and not a restore. The keyspace and the
 // table are read but not checked, since a replay into a table of another name
-// is the point; only the schema is compared. Yields while parsing and per
-// entry; the caller caps the bytes.
+// is the point. Yields while parsing and per entry; the caller caps the bytes.
 future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chunked_content&& content, const sstring& expected_snapshot);
 
 // `incomplete` until `done` replaces `started` (requirement 12).
@@ -83,8 +82,7 @@ struct replay_state {
     sstring snapshot;
     sstring t;
     // The table the backup was taken from, as its manifest records it: the
-    // target may be named differently, so this is the only record of what was
-    // loaded. Empty when no manifest was read.
+    // only record of what was loaded. Empty when no manifest was read.
     sstring source_keyspace;
     sstring source_table;
     // When the mark was written, microseconds since the UNIX epoch, UTC.
@@ -114,7 +112,7 @@ future<std::optional<replay_state>> read_replay_state(const std::filesystem::pat
 // Drops from a snapshot's `schema.cql` what a replay into another table is
 // allowed to differ in: the table's name wherever a statement names it, its
 // `ID` option and its `compaction` option (P52). Both sides come from the same
-// describe code, one option per line, so this works line by line. Yields.
+// describe code, one option per line, so this works by line. Yields.
 future<sstring> normalize_schema_cql(std::string_view);
 
 // Compares the two statements, ignoring the three above.
