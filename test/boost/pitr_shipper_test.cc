@@ -26,6 +26,7 @@
 #include <string>
 #include <tuple>
 #include <unordered_map>
+#include <set>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -55,6 +56,7 @@
 #include "test/lib/test_utils.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/UUID_gen.hh"
+#include "utils/crc.hh"
 #include "utils/memory_data_sink.hh"
 #include "utils/upload_progress.hh"
 
@@ -1018,6 +1020,45 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_cycle_waiting_on_the_count_does_not_seal_afte
     BOOST_REQUIRE_EQUAL(the_probe.seals_started, 0);
 }
 
+// The coverage a cycle captures is taken before the cycle counts the nodes
+// (P50): a count that takes a while, and a join that lands during it, must not
+// move the coverage up past the writes the seal is about to close off.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_cycle_captures_its_coverage_before_it_counts) {
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    the_probe = probe{};
+    auto reset = seastar::defer([]() noexcept {
+        the_probe = probe{};
+    });
+    BOOST_REQUIRE_EQUAL(shipper.covered_through_us(), 0);
+
+    const auto before = api::new_timestamp();
+    the_probe.count_hold.emplace();
+    shipper.start_sealing(fake_seal(), fake_node_count());
+    shipper.seal_tick();
+    wait_until([] {
+        return the_probe.count_calls == 1;
+    });
+
+    // The count has not answered yet, so a capture taken after it would still
+    // read 0 here.
+    const auto captured = shipper.covered_through_us();
+    const auto after = api::new_timestamp();
+    BOOST_REQUIRE_GT(captured, 0);
+    // The margin the design asks for: a capture that skipped it would sit
+    // above this, and one that took it twice below the lower bound.
+    BOOST_REQUIRE_LE(captured, after - coverage_margin.count());
+    BOOST_REQUIRE_GE(captured, before - coverage_margin.count());
+
+    the_probe.count_hold->set_value();
+    the_probe.count_hold.reset();
+    shipper.wait_for_cycles(cycle_timeout).get();
+    shipper.stop().get();
+    BOOST_REQUIRE_EQUAL(the_probe.seals_started, 1);
+}
+
 // The count fails only after stop() has begun, so shutdown must not latch
 // shipping off: the state the node reports is the one it had while it ran.
 SEASTAR_THREAD_TEST_CASE(test_pitr_unreadable_count_after_stop_does_not_break) {
@@ -1384,7 +1425,9 @@ public:
     }
 };
 
-// What the fake store recorded and what it was told to do.
+// What the fake store recorded and what it was told to do. Segment objects and
+// ledger entries are counted apart, so that a test about one is not moved by
+// the other going through the same store.
 struct fake_store {
     // Only finalized objects, as a store's listing holds only those.
     std::unordered_map<std::string, std::string> objects;
@@ -1397,12 +1440,49 @@ struct fake_store {
     std::optional<seastar::shared_promise<>> hold_put;
     size_t sinks_open = 0;
     size_t max_sinks_open = 0;
+    // The same three for the ledger's entries.
+    unsigned entry_sinks_created = 0;
+    unsigned entry_puts = 0;
+    unsigned fail_first_entry_sinks = 0;
+    std::optional<seastar::shared_promise<>> hold_entry_put;
+    size_t entry_sinks_open = 0;
+    size_t max_entry_sinks_open = 0;
+    // Puts of one named object wait for their own promise, which is how one
+    // segment's upload is parked while another finishes.
+    std::unordered_map<std::string, seastar::shared_promise<>> holds;
+
+    bool is_entry(const std::string& name) const {
+        return name.ends_with(db::pitr::entry_key_suffix);
+    }
+    void hold_object(std::string name) {
+        holds.try_emplace(std::move(name));
+    }
+    void let_object_go(const std::string& name) {
+        if (auto it = holds.find(name); it != holds.end()) {
+            it->second.set_value();
+            holds.erase(it);
+        }
+    }
+    // Lets every hold go, so that nothing is parked when a shipper has to stop.
+    void let_everything_go() noexcept {
+        for (auto& [name, hold] : holds) {
+            hold.set_value();
+        }
+        holds.clear();
+        for (auto* hold : {&hold_put, &hold_entry_put}) {
+            if (*hold) {
+                (*hold)->set_value();
+                hold->reset();
+            }
+        }
+    }
 };
 
 class fake_sink_impl final : public data_sink_impl {
     fake_store& _store;
     std::string _name;
     abort_source* _as;
+    bool _is_entry;
     unsigned _index;
     std::string _pending;
 
@@ -1411,19 +1491,30 @@ public:
         : _store(store)
         , _name(std::move(name))
         , _as(as)
-        , _index(_store.sinks_created++) {
-        _store.max_sinks_open = std::max(_store.max_sinks_open, ++_store.sinks_open);
+        , _is_entry(_store.is_entry(_name))
+        , _index(_is_entry ? _store.entry_sinks_created++ : _store.sinks_created++) {
+        if (_is_entry) {
+            _store.max_entry_sinks_open = std::max(_store.max_entry_sinks_open, ++_store.entry_sinks_open);
+        } else {
+            _store.max_sinks_open = std::max(_store.max_sinks_open, ++_store.sinks_open);
+        }
     }
     future<> put(std::span<temporary_buffer<char>> bufs) override {
         std::string bytes;
         for (auto& buf : bufs) {
-            ++_store.puts;
+            ++(_is_entry ? _store.entry_puts : _store.puts);
             bytes.append(buf.get(), buf.size());
         }
-        if (_index < _store.fail_first_sinks) {
+        if (_index < (_is_entry ? _store.fail_first_entry_sinks : _store.fail_first_sinks)) {
             return make_exception_future<>(store_error());
         }
-        auto wait = _store.hold_put ? _store.hold_put->get_shared_future() : make_ready_future<>();
+        const auto& held = _is_entry ? _store.hold_entry_put : _store.hold_put;
+        auto wait = held ? held->get_shared_future() : make_ready_future<>();
+        if (auto it = _store.holds.find(_name); it != _store.holds.end()) {
+            wait = wait.then([own = it->second.get_shared_future()]() mutable {
+                return std::move(own);
+            });
+        }
         return wait.then([this, bytes = std::move(bytes)] {
             _pending.append(bytes);
         });
@@ -1432,7 +1523,7 @@ public:
         return make_ready_future<>();
     }
     future<> close() override {
-        --_store.sinks_open;
+        --(_is_entry ? _store.entry_sinks_open : _store.sinks_open);
         // GCS-style: the close is what finalizes, unless the upload was
         // aborted, in which case the sink abandons it.
         if (!_as || !_as->abort_requested()) {
@@ -1546,6 +1637,19 @@ struct ship_probe {
     // held at the moment the hold was released. Must not throw, as the hook
     // must not.
     std::function<void(db::segment_id_type)> on_release;
+    // Replaces the object name a segment is stored under, which is also where
+    // the file name in its ledger entry comes from.
+    std::function<sstables::object_name(db::segment_id_type)> name_of;
+    // What the commitlog holds, which is what the shipper reads to tell a
+    // segment that has rotated without its close being reported yet from one
+    // that does not exist. A hold starts with the first write to the segment
+    // and ends when the shipper releases it.
+    std::set<db::segment_id_type> held;
+
+    // The segment becomes the one being written: held, not reported.
+    void rotate_to(db::segment_id_type id) {
+        held.insert(id);
+    }
 
     db::pitr::segment_hooks hooks() {
         return db::pitr::segment_hooks{
@@ -1554,8 +1658,15 @@ struct ship_probe {
                             return seastar::open_file_dma(paths.at(id), seastar::open_flags::ro);
                         },
                 .object_name_of =
-                        [](db::segment_id_type id) {
+                        [this](db::segment_id_type id) {
+                            if (name_of) {
+                                return name_of(id);
+                            }
                             return sstables::object_name("pitr-bucket", seastar::format("chains/segments/CommitLog-4-{}.log", id));
+                        },
+                .held_segments =
+                        [this] {
+                            return std::vector<db::segment_id_type>(held.begin(), held.end());
                         },
         };
     }
@@ -1564,6 +1675,8 @@ struct ship_probe {
             if (on_release) {
                 on_release(id);
             }
+            // The commitlog drops the hold at once, as release_segment() does.
+            held.erase(id);
             released.push_back(id);
         };
     }
@@ -1577,6 +1690,30 @@ struct ship_probe {
     }
 };
 
+// The ledger entries the store holds, in the sequence order a restore reads
+// them in: the first missing sequence ends the chain, as chain_check does.
+std::vector<db::pitr::segment_entry> entries_of(const ship_probe& probe, const db::pitr::chain_key_parts& chain) {
+    std::vector<db::pitr::segment_entry> entries;
+    for (uint64_t sequence = 0;; ++sequence) {
+        const auto key = sstables::object_name("pitr-bucket", db::pitr::entry_object_key(chain, sequence)).str();
+        auto it = probe.store.objects.find(key);
+        if (it == probe.store.objects.end()) {
+            return entries;
+        }
+        const auto& body = it->second;
+        entries.push_back(db::pitr::decode_segment_entry(bytes_view(reinterpret_cast<const int8_t*>(body.data()), body.size())));
+    }
+}
+
+// The segment ids the chain's entries name, in sequence order.
+std::vector<db::segment_id_type> recorded_ids(const ship_probe& probe, const db::pitr::chain_key_parts& chain) {
+    std::vector<db::segment_id_type> ids;
+    for (const auto& entry : entries_of(probe, chain)) {
+        ids.push_back(entry.segment_id);
+    }
+    return ids;
+}
+
 // An active shipper with the fake store installed, handed to the test body.
 template <typename Func>
 void with_shipping(ship_probe& probe, Func&& f) {
@@ -1588,11 +1725,8 @@ void with_shipping(ship_probe& probe, Func&& f) {
     shipper.note_cluster_size(1);
     auto stop = seastar::defer([&shipper, &probe]() noexcept {
         try {
-            // A parked upload would keep the gate from closing.
-            if (probe.store.hold_put) {
-                probe.store.hold_put->set_value();
-                probe.store.hold_put.reset();
-            }
+            // A parked put would keep the gate from closing.
+            probe.store.let_everything_go();
             shipper.stop().get();
         } catch (...) {
             BOOST_ERROR(seastar::format("stopping the shipper failed: {}", std::current_exception()));
@@ -1926,49 +2060,50 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_during_an_upload_is_not_recorded) 
 // has to check for itself. The sweep walks the rollback one reactor turn at a
 // time past the point the object is finalized, so it lands at every point of
 // the unwinding rather than at a timed one.
+// A fresh shipper per turn, because the rollback ends the chain for the rest of
+// the node's life.
 SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_as_an_upload_finishes_is_not_recorded) {
-    ship_probe probe;
-    with_shipping(probe, [&](pitr_shipper& shipper) {
-        std::unordered_set<db::segment_id_type> rolled_back;
-        std::vector<db::segment_id_type> released_after_rollback;
-        probe.on_release = [&](db::segment_id_type id) {
-            if (rolled_back.contains(id)) {
-                released_after_rollback.push_back(id);
-            }
-        };
-        unsigned shipped_turns = 0;
-        for (int turn = 0; turn < sweep_turns; ++turn) {
+    unsigned shipped_turns = 0;
+    for (int turn = 0; turn < sweep_turns; ++turn) {
+        ship_probe probe;
+        with_shipping(probe, [&](pitr_shipper& shipper) {
             const db::segment_id_type id = 1000 + turn;
-            const auto shipped_before = shipper.segments_shipped();
             probe.paths[id] = make_segment_file(probe.dir, id, sweep_used);
             shipper.segment_closed(id, sweep_used, false);
             report_after_turns(probe, id, turn, [&] {
-                rolled_back.insert(id);
                 shipper.segment_closed(id, sweep_used, true);
             });
             wait_until([&] {
-                return shipper.uploads_in_flight() == 0;
+                return shipper.uploads_in_flight() == 0 && shipper.segments_pending() == 0;
             });
+            settle();
 
-            // A success and a release go together: either both happened before
-            // the rollback was reported, or neither did. Checking only the
-            // release would let a success recorded without one pass.
-            const auto shipped_now = shipper.segments_shipped() - shipped_before;
-            const auto releases = unsigned(std::ranges::count(probe.released, id));
-            BOOST_REQUIRE_EQUAL(shipped_now, releases);
-            shipped_turns += shipped_now;
-        }
-
-        BOOST_TEST_MESSAGE(seastar::format("shipped={} unshipped={}", shipper.segments_shipped(), shipper.segments_unshipped()));
-        BOOST_REQUIRE_MESSAGE(released_after_rollback.empty(), seastar::format("released after a rollback: {}", released_after_rollback));
-        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), shipped_turns);
-        // Some turn has to land before the success is recorded, and some after,
-        // or the sweep is not reaching the window it is here to cover.
-        BOOST_REQUIRE_LT(shipped_turns, unsigned(sweep_turns));
-        BOOST_REQUIRE_GT(shipped_turns, 0u);
-        // Every segment's rollback was reported, whatever its upload was doing.
-        BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), unsigned(sweep_turns));
-    });
+            // The rollback ends the chain whichever side of the recording it
+            // fell on: the segment's writes are gone from the commitlog, so
+            // nothing above it may claim to cover them.
+            BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_chain_broken);
+            BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 1u);
+            // A recorded segment and a released hold go together: either both
+            // happened before the rollback was reported, or neither did.
+            // Checking only the release would let a success recorded without
+            // one pass.
+            const auto shipped = unsigned(shipper.segments_shipped());
+            BOOST_REQUIRE_LE(shipped, 1u);
+            BOOST_REQUIRE_EQUAL(unsigned(probe.released.size()), shipped);
+            // The entry's own object can be in the store even when the abort
+            // beat the recording, since a put that has finalized cannot be
+            // taken back; what must never happen is an entry for another
+            // segment, which would read as the chain carrying on past this one.
+            const auto recorded = recorded_ids(probe, *shipper.chain());
+            BOOST_REQUIRE(recorded.empty() || recorded == std::vector<db::segment_id_type>{id});
+            shipped_turns += shipped;
+        });
+    }
+    BOOST_TEST_MESSAGE(seastar::format("turns that recorded the segment before the rollback: {} of {}", shipped_turns, sweep_turns));
+    // A sweep where every turn recorded first, or none did, would never reach
+    // the window this test exists for: both sides of the recording are covered.
+    BOOST_REQUIRE_LT(shipped_turns, unsigned(sweep_turns));
+    BOOST_REQUIRE_GT(shipped_turns, 0u);
 }
 
 // The same sweep with a break in place of the rollback, which takes the other
@@ -2317,6 +2452,9 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_below_the_chain_floor_is_released_and
         BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
         BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
         BOOST_REQUIRE(!probe.has_object(29));
+        // Not in the chain, so no entry claims it either.
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 0u);
     });
 }
 
@@ -2383,6 +2521,594 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_stop_began_is_released_and_not_
     BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{40});
     BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
     BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+    // Nothing is recorded once stop() has begun: the chain ends at the last
+    // entry written before it.
+    BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+}
+
+// The ledger entries the recorder writes: one per shipped segment, in segment
+// id order, dense from sequence 0, with the hold released once the entry is in
+// the store (issue #9).
+
+namespace {
+
+// Drives seal cycles by hand with a seal that can be parked, so that a close
+// can be placed inside a cycle or between two of them. One node, so no cycle
+// breaks shipping.
+struct seal_driver {
+    int seals = 0;
+    std::optional<seastar::shared_promise<>> hold;
+
+    void install(pitr_shipper& shipper) {
+        shipper.start_sealing(
+                [this]() -> future<> {
+                    ++seals;
+                    if (hold) {
+                        co_await hold->get_shared_future();
+                    }
+                },
+                [] {
+                    return make_ready_future<size_t>(1);
+                });
+    }
+    // One cycle, run to its end, which captures the coverage every close from
+    // then on carries.
+    int64_t run_a_cycle(pitr_shipper& shipper) {
+        const auto before = seals;
+        shipper.seal_tick();
+        shipper.wait_for_cycles(cycle_timeout).get();
+        BOOST_REQUIRE_EQUAL(seals, before + 1);
+        BOOST_REQUIRE(shipper.active());
+        return shipper.covered_through_us();
+    }
+    void let_the_seal_go() {
+        if (hold) {
+            hold->set_value();
+            hold.reset();
+        }
+    }
+};
+
+// A segment the log holds, as it does from the segment's first write: its file
+// exists and it is the one being written until the next one takes over. Its
+// close is reported separately, which is what the commitlog does - it starts
+// the close without awaiting it, so a rotated segment is held and unreported
+// for a while.
+void start_writing(ship_probe& probe, db::segment_id_type id, size_t used) {
+    probe.paths[id] = make_segment_file(probe.dir, id, used);
+    probe.rotate_to(id);
+}
+
+uint32_t crc32_of(const std::string& bytes) {
+    utils::crc32 crc;
+    crc.process(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size());
+    return crc.get();
+}
+
+} // namespace
+
+// Everything a restore reads out of one entry: the segment it names, the chain
+// it belongs to and the coverage it carries.
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_entry_describes_its_segment_and_its_chain) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        seal_driver seals;
+        seals.install(shipper);
+        constexpr size_t used = 8192;
+        // 61 is the segment being written when the cycle captures, so the seal
+        // closes it and its entry carries that capture.
+        probe.paths[61] = make_segment_file(probe.dir, 61, used, 4096);
+        probe.rotate_to(61);
+        const auto coverage = seals.run_a_cycle(shipper);
+        start_writing(probe, 62, used);
+        shipper.segment_closed(61, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+        const auto& entry = entries.front();
+        BOOST_REQUIRE_EQUAL(entry.sequence, 0u);
+        BOOST_REQUIRE_EQUAL(entry.segment_id, 61u);
+        // The chain's first entry names no segment before it.
+        BOOST_REQUIRE_EQUAL(entry.prev_segment_id, 0u);
+        BOOST_REQUIRE_EQUAL(entry.used_size, used);
+        // The checksum covers the bytes that were stored, so the recycled tail
+        // the file also holds must not be in it.
+        BOOST_REQUIRE_EQUAL(entry.segment_crc32, crc32_of(probe.object_of(61)));
+        BOOST_REQUIRE_EQUAL(entry.covered_through_us, coverage);
+        BOOST_REQUIRE_GE(entry.upload_time_us, coverage);
+        // The file name a replay derives the segment's base position from, and
+        // which names the segment's own object.
+        BOOST_REQUIRE_EQUAL(entry.file_name, "CommitLog-4-61.log");
+        // The identity the chain reader checks the key against.
+        const auto& chain = *shipper.chain();
+        BOOST_REQUIRE_EQUAL(entry.chain, chain.chain);
+        BOOST_REQUIRE_EQUAL(entry.host_id, chain.host_id);
+        BOOST_REQUIRE_EQUAL(entry.shard, chain.shard);
+        BOOST_REQUIRE_EQUAL(entry.boot_epoch_us, chain.boot_epoch_us);
+        BOOST_REQUIRE_EQUAL(entry.chain_start_us, chain.chain_start_us);
+    });
+}
+
+// The sequence is dense from 0 and every entry links to the segment of the one
+// before it: a restore has nothing else to tell it what the chain holds.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_sequence_is_dense_and_the_entries_are_linked) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        const std::vector<db::segment_id_type> ids = {70, 73, 74};
+        for (auto id : ids) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+            shipper.segment_closed(id, used, false);
+        }
+        wait_until([&] {
+            return shipper.segments_shipped() == ids.size();
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), ids.size());
+        uint64_t prev = 0;
+        for (size_t i = 0; i < entries.size(); ++i) {
+            BOOST_REQUIRE_EQUAL(entries[i].sequence, i);
+            BOOST_REQUIRE_EQUAL(entries[i].segment_id, ids[i]);
+            // Ids have gaps, so the link is the only thing that says which
+            // segment comes before this one.
+            BOOST_REQUIRE_EQUAL(entries[i].prev_segment_id, prev);
+            prev = entries[i].segment_id;
+        }
+    });
+}
+
+// A segment that filled up and rotated on its own closes with no cycle in
+// between, so its entry carries the coverage of the last capture and not a
+// newer one: the writes that went into the segment after it are not covered.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_self_rotated_segment_takes_its_predecessors_coverage) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        start_writing(probe, 80, used);
+        const auto first = seals.run_a_cycle(shipper);
+        // 80 closed because the cycle sealed it; 81 because it filled up, with
+        // no cycle of its own, so it carries 80's coverage.
+        start_writing(probe, 81, used);
+        shipper.segment_closed(80, used, false);
+        start_writing(probe, 82, used);
+        shipper.segment_closed(81, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+        // Only now does the next cycle move the coverage on, for the segment
+        // it is about to seal.
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+        start_writing(probe, 83, used);
+        shipper.segment_closed(82, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 3;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 3u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+        BOOST_REQUIRE_EQUAL(entries[1].covered_through_us, first);
+        BOOST_REQUIRE_EQUAL(entries[2].covered_through_us, second);
+    });
+}
+
+// A segment that had already rotated when a cycle captured must not carry that
+// capture, even though its close is only reported afterwards: the segment above
+// it was open at the capture, so it can hold writes from before that time. The
+// commitlog starts a close without awaiting it, so this is the normal case, not
+// a race. The segment the capture's seal closes does carry it.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_segment_that_rotated_before_a_capture_does_not_carry_it) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        start_writing(probe, 90, used);
+        const auto first = seals.run_a_cycle(shipper);
+        // The cycle sealed 90, so 91 is being written and 90 is reported.
+        start_writing(probe, 91, used);
+        shipper.segment_closed(90, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        // 91 fills up and rotates on its own: 92 is being written, and 91 is
+        // held with its close still on the way.
+        start_writing(probe, 92, used);
+        // The next cycle captures with 91 and 92 both held, so its capture is
+        // 92's to claim, not 91's.
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+
+        // Only now does 91's close arrive, after the capture.
+        shipper.segment_closed(91, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+        start_writing(probe, 93, used);
+        shipper.segment_closed(92, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 3;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 3u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+        // 91 keeps the older capture: a restore stopping here would otherwise
+        // be told it covers writes that are in 92.
+        BOOST_REQUIRE_EQUAL(entries[1].covered_through_us, first);
+        // 92 was the segment being written when the capture was taken, so the
+        // coverage does move on with it.
+        BOOST_REQUIRE_EQUAL(entries[2].covered_through_us, second);
+    });
+}
+
+// An entry cannot be written while a segment below it is held with its close
+// still unreported: that segment has to join the chain first, and an entry
+// above it would claim a run of segments the chain does not have.
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_entry_waits_for_a_held_segment_that_was_not_reported) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        // 10 rotated and its close is slow; 11 rotated after it and is
+        // reported first, which the commitlog's unawaited close allows.
+        start_writing(probe, 10, used);
+        start_writing(probe, 11, used);
+        start_writing(probe, 12, used);
+        const auto capture = seals.run_a_cycle(shipper);
+        shipper.segment_closed(11, used, false);
+        wait_until([&] {
+            return probe.has_object(11);
+        });
+        settle();
+
+        // Stored, but not recorded and not released: 10 is still to come.
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()).empty());
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE(shipper.active());
+
+        shipper.segment_closed(10, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+
+        // Both are in the chain, in id order, and the chain never broke.
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == (std::vector<db::segment_id_type>{10, 11}));
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{10, 11}));
+        BOOST_REQUIRE(shipper.active());
+        const auto entries = entries_of(probe, *shipper.chain());
+        // 12 was open at the capture, so neither of them may claim it.
+        BOOST_REQUIRE_LT(entries[0].covered_through_us, capture);
+        BOOST_REQUIRE_LT(entries[1].covered_through_us, capture);
+    });
+}
+
+// A capture taken while the entry is still being written is not that entry's
+// to claim either: the segment above it was open when the capture was taken.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_capture_during_an_upload_is_not_claimed_by_it) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        start_writing(probe, 95, used);
+        const auto first = seals.run_a_cycle(shipper);
+        start_writing(probe, 96, used);
+        // Parked in its upload, so the next capture lands between the close
+        // and the entry being built.
+        probe.store.hold_object(segment_object(95));
+        shipper.segment_closed(95, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 1;
+        });
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+
+        probe.store.let_object_go(segment_object(95));
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 1u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+    });
+}
+
+// Closes are not ordered by id, so a lower segment can be reported after a
+// higher one and under a newer capture. Its entry comes first, and its coverage
+// is held down to what the segments above it carry: a restore that stopped at
+// it would otherwise miss writes the higher segment holds.
+SEASTAR_THREAD_TEST_CASE(test_pitr_coverage_never_passes_a_segment_still_to_be_recorded) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        seal_driver seals;
+        seals.install(shipper);
+        start_writing(probe, 96, used);
+        const auto first = seals.run_a_cycle(shipper);
+        start_writing(probe, 97, used);
+        start_writing(probe, 98, used);
+        for (db::segment_id_type id : {96, 97}) {
+            probe.store.hold_object(segment_object(id));
+        }
+        // 97 is reported first; nothing is recorded yet, because its upload is
+        // parked and 96 is held and unreported anyway.
+        shipper.segment_closed(97, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 1;
+        });
+        const auto second = seals.run_a_cycle(shipper);
+        BOOST_REQUIRE_GT(second, first);
+        // 96 is reported late, so it carries the newer capture.
+        shipper.segment_closed(96, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 2;
+        });
+
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+
+        const auto entries = entries_of(probe, *shipper.chain());
+        BOOST_REQUIRE_EQUAL(entries.size(), 2u);
+        BOOST_REQUIRE_EQUAL(entries[0].segment_id, 96u);
+        BOOST_REQUIRE_EQUAL(entries[1].segment_id, 97u);
+        BOOST_REQUIRE_EQUAL(entries[0].covered_through_us, first);
+        BOOST_REQUIRE_EQUAL(entries[1].covered_through_us, first);
+        // Never backwards, whatever order the closes arrived in.
+        BOOST_REQUIRE_LE(entries[0].covered_through_us, entries[1].covered_through_us);
+    });
+}
+
+// The bytes are in the store and the entry is not: the hold has to stay, or a
+// restore would find a segment no entry names.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_hold_is_kept_while_the_entry_put_retries) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.store.fail_first_entry_sinks = 2;
+        probe.paths[65] = make_segment_file(probe.dir, 65, used);
+        shipper.segment_closed(65, used, false);
+        wait_until([&] {
+            return probe.store.entry_sinks_created >= 2;
+        });
+
+        BOOST_REQUIRE(probe.has_object(65));
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 1u);
+
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+        BOOST_REQUIRE_EQUAL(probe.store.entry_sinks_created, 3u);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{65});
+        BOOST_REQUIRE_EQUAL(recorded_ids(probe, *shipper.chain()).size(), 1u);
+    });
+}
+
+// An entry no writer may produce - here a segment whose key carries no file
+// name - is not something a retry can fix: the chain ends at the entry before
+// it, nothing above it is recorded, and every hold goes (D25).
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_entry_that_cannot_be_written_breaks_shipping) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.name_of = [](db::segment_id_type id) {
+            return sstables::object_name("pitr-bucket", seastar::format("chains/segments/{}/", id));
+        };
+        for (db::segment_id_type id : {66, 67}) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+        }
+        // 66's upload is parked, so by the time its entry fails, 67 is stored
+        // and waiting its turn in the order: the hold D25 releases is 67's,
+        // and nothing else in the shipper is working on it.
+        probe.store.hold_object(probe.name_of(66).str());
+        shipper.segment_closed(66, used, false);
+        shipper.segment_closed(67, used, false);
+        wait_until([&] {
+            return probe.store.puts >= 2;
+        });
+        settle();
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 2u);
+        BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 1u);
+
+        probe.store.let_everything_go();
+        wait_until([&] {
+            return !shipper.active() && probe.released.size() == 2;
+        });
+        settle();
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_ledger_failed);
+        BOOST_REQUIRE(shipper.break_reason());
+        BOOST_REQUIRE_EQUAL(shipper.break_reason()->find("ledger_failed:"), 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 1u);
+        // Refused before any store request, so nothing half written is left.
+        BOOST_REQUIRE_EQUAL(probe.store.entry_sinks_created, 0u);
+        BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+        // Both holds go: the one that failed and the one that was waiting for
+        // its turn in the order.
+        auto released = probe.released;
+        std::ranges::sort(released);
+        BOOST_REQUIRE(released == (std::vector<db::segment_id_type>{66, 67}));
+        BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 0u);
+    });
+}
+
+// "Shipped, then rolled back": the commitlog reports a segment that is already
+// in the chain as failed, so its writes are gone and nothing above it may
+// cover them. The entry already written stays - it is correct about bytes that
+// are in the store - and no later entry is ever added.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_rollback_of_a_recorded_segment_breaks_the_chain) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[75] = make_segment_file(probe.dir, 75, used);
+        shipper.segment_closed(75, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        shipper.segment_closed(75, used, true);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_chain_broken);
+        BOOST_REQUIRE(shipper.break_reason()->find("chain_broken:") == 0u);
+
+        probe.paths[76] = make_segment_file(probe.dir, 76, used);
+        shipper.segment_closed(76, used, false);
+        settle();
+
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{75});
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 1u);
+        BOOST_REQUIRE(!probe.has_object(76));
+        // 75's hold went with its entry; 76 is released at once after a break.
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{75, 76}));
+    });
+}
+
+// A close that arrives below the last entry recorded cannot be appended in
+// order, and leaving it out would let the entries above it cover writes it
+// holds: the chain ends instead.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_below_the_last_recorded_entry_breaks_the_chain) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[78] = make_segment_file(probe.dir, 78, used);
+        probe.paths[77] = make_segment_file(probe.dir, 77, used);
+        shipper.segment_closed(78, used, false);
+        wait_until([&] {
+            return shipper.segments_shipped() == 1;
+        });
+
+        shipper.segment_closed(77, used, false);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_chain_broken);
+        settle();
+
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == std::vector<db::segment_id_type>{78});
+        BOOST_REQUIRE(!probe.has_object(77));
+        // Nothing is left to keep the segment for, so its hold goes at once.
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{78, 77}));
+    });
+}
+
+// stop() with an entry put in flight: it waits the put out, writes no entry,
+// and keeps the hold, since the shutdown deletes the held segments anyway.
+SEASTAR_THREAD_TEST_CASE(test_pitr_stop_during_an_entry_put_writes_no_entry_and_keeps_the_hold) {
+    ship_probe probe;
+    tmpdir dir;
+    probe.dir = dir.path().string();
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    shipper.set_release_hook(probe.release_hook());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
+
+    constexpr size_t used = 4096;
+    probe.store.hold_entry_put.emplace();
+    probe.paths[85] = make_segment_file(probe.dir, 85, used);
+    shipper.segment_closed(85, used, false);
+    wait_until([&] {
+        return probe.store.entry_puts >= 1;
+    });
+    BOOST_REQUIRE(probe.released.empty());
+
+    auto stopping = shipper.stop();
+    settle();
+    // The recorder runs inside the gate stop() waits for, so it cannot be left
+    // writing into a shipper that is gone.
+    BOOST_REQUIRE(!stopping.available());
+    probe.store.let_everything_go();
+    stopping.get();
+
+    BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+    BOOST_REQUIRE(probe.released.empty());
+    BOOST_REQUIRE(entries_of(probe, *shipper.chain()).empty());
+    BOOST_REQUIRE_EQUAL(shipper.segments_pending(), 0u);
+}
+
+// Uploads finish in the order the store answers in, which is not the order the
+// segments were written in; the entries must go out in segment id order, since
+// a restore reads them as one run with no gap.
+SEASTAR_THREAD_TEST_CASE(test_pitr_entries_are_written_in_segment_id_order) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        const std::vector<db::segment_id_type> order = {52, 50, 51};
+        for (auto id : order) {
+            probe.paths[id] = make_segment_file(probe.dir, id, used);
+        }
+        // The lowest id's upload is parked, so the two above it finish first
+        // and have to wait for it before any entry can be written.
+        probe.store.hold_object(segment_object(50));
+        for (auto id : order) {
+            shipper.segment_closed(id, used, false);
+        }
+        wait_until([&] {
+            return probe.has_object(51) && probe.has_object(52);
+        });
+        settle();
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()).empty());
+        BOOST_REQUIRE(probe.released.empty());
+
+        probe.store.let_object_go(segment_object(50));
+        wait_until([&] {
+            return shipper.segments_shipped() == 3;
+        });
+
+        BOOST_REQUIRE(recorded_ids(probe, *shipper.chain()) == (std::vector<db::segment_id_type>{50, 51, 52}));
+        // A hold goes with its own entry, so the releases follow the same order.
+        BOOST_REQUIRE(probe.released == (std::vector<db::segment_id_type>{50, 51, 52}));
+        // One entry at a time: two puts in flight could leave the later entry
+        // in the store while the earlier one failed.
+        BOOST_REQUIRE_EQUAL(probe.store.max_entry_sinks_open, 1u);
+    });
+}
+
+// What a snapshot's bound file reads off this shard: the chain, and the floor
+// below which a bound is refused (D27, D29).
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_chain_provider_answers_from_the_shipper) {
+    ship_probe probe;
+    probe.floor = 33;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        auto provider = make_chain_provider(shipper);
+        // Nothing before the chain exists: a snapshot taken now is not
+        // protected, and the bound file has to say so rather than name a chain.
+        BOOST_REQUIRE(!provider());
+
+        shipper.note_cluster_size(1);
+        shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
+        const auto chain = provider();
+        BOOST_REQUIRE(chain);
+        BOOST_REQUIRE_EQUAL(chain->host_id, test_host_id);
+        BOOST_REQUIRE_EQUAL(chain->boot_epoch_us, test_boot_epoch_us);
+        BOOST_REQUIRE_EQUAL(chain->chain, shipper.chain()->chain);
+        BOOST_REQUIRE_EQUAL(chain->chain_start_us, shipper.chain()->chain_start_us);
+        BOOST_REQUIRE(chain->floor_segment_id == std::optional<uint64_t>(33));
+    });
+}
+
+// No segment was held when shipping started, so the chain has no floor: the
+// D27 check is vacuous, and 0 must not stand in for it (D29).
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_chain_provider_reports_no_floor_when_nothing_was_held) {
+    ship_probe probe;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        const auto chain = make_chain_provider(shipper)();
+        BOOST_REQUIRE(chain);
+        BOOST_REQUIRE(!chain->floor_segment_id);
+    });
 }
 
 // The keys a shipped segment is stored under, which a restore has to find.
@@ -2441,12 +3167,17 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_store_a_segment_under_its_chain) {
     probe.dir = dir.path().string();
     with_an_active_shipper(probe, [&](pitr_shipper& shipper, stop_once&) {
         const auto path = make_segment_file(probe.dir, 42, 4096);
-        auto hooks = make_segment_hooks(shipper, [&](db::segment_id_type id) -> std::optional<seastar::sstring> {
-            if (id != 42) {
-                return std::nullopt;
-            }
-            return path;
-        });
+        auto hooks = make_segment_hooks(
+                shipper,
+                [&](db::segment_id_type id) -> std::optional<seastar::sstring> {
+                    if (id != 42) {
+                        return std::nullopt;
+                    }
+                    return path;
+                },
+                [&probe] {
+                    return std::vector<db::segment_id_type>(probe.held.begin(), probe.held.end());
+                });
 
         const auto name = hooks.object_name_of(42);
         BOOST_REQUIRE_EQUAL(std::string(name.bucket()), std::string("pitr-bucket"));
@@ -2474,9 +3205,14 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_store_a_segment_under_its_chain) {
 SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_refuse_to_name_an_object_without_a_chain) {
     ship_probe probe;
     with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
-        auto hooks = make_segment_hooks(shipper, [](db::segment_id_type) {
-            return std::optional<seastar::sstring>("/tmp/CommitLog-4-1.log");
-        });
+        auto hooks = make_segment_hooks(
+                shipper,
+                [](db::segment_id_type) {
+                    return std::optional<seastar::sstring>("/tmp/CommitLog-4-1.log");
+                },
+                [] {
+                    return std::vector<db::segment_id_type>();
+                });
         BOOST_REQUIRE(!shipper.chain());
         BOOST_REQUIRE_THROW(hooks.object_name_of(1), std::runtime_error);
     });

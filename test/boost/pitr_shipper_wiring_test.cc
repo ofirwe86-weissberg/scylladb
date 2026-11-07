@@ -218,9 +218,14 @@ SEASTAR_TEST_CASE(test_the_hooks_open_the_held_segments_own_file) {
             [](cql_test_env& e) {
                 with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments& closed) {
                     with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
-                        auto hooks = db::pitr::make_segment_hooks(shipper, [&log](db::segment_id_type id) {
-                            return log.held_segment_path(id);
-                        });
+                        auto hooks = db::pitr::make_segment_hooks(
+                                shipper,
+                                [&log](db::segment_id_type id) {
+                                    return log.held_segment_path(id);
+                                },
+                                [&log] {
+                                    return log.held_segments();
+                                });
                         for (const auto& [id, used_size, failed] : closed) {
                             const auto path = log.held_segment_path(id);
                             BOOST_REQUIRE(path);
@@ -321,9 +326,14 @@ SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
                         // The key is this chain's, keeping the commitlog's own
                         // file name rather than one a test made up.
                         const auto id = std::get<0>(closed.front());
-                        const auto name = db::pitr::make_segment_hooks(shipper, [&log](db::segment_id_type id) {
-                            return log.held_segment_path(id);
-                        }).object_name_of(id);
+                        const auto name = db::pitr::make_segment_hooks(
+                                shipper,
+                                [&log](db::segment_id_type id) {
+                                    return log.held_segment_path(id);
+                                },
+                                [&log] {
+                                    return log.held_segments();
+                                }).object_name_of(id);
                         const auto expected = db::pitr::segment_object_key(*shipper.chain(), file_name_of(*log.held_segment_path(id)));
                         BOOST_REQUIRE_EQUAL(std::string(name.object()), std::string(expected));
                         BOOST_REQUIRE(name.object().find(seastar::format("-{}.log", id)) != std::string_view::npos);
@@ -331,6 +341,78 @@ SEASTAR_TEST_CASE(test_a_known_endpoint_starts_shipping_with_a_chain) {
                 });
             },
             pitr_config(true));
+}
+
+// The chain a snapshot's bound file reads off the database is installed by the
+// wiring, from the shipper's own chain and floor: without it a snapshot would
+// be taken as unprotected even while the shard ships.
+SEASTAR_TEST_CASE(test_the_wiring_installs_the_bound_files_chain_provider) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                with_a_held_closed_segment(e, [&](db::commitlog& log, const closed_segments&) {
+                    auto& db = e.local_db();
+                    // Nothing is installed in this environment, so a snapshot
+                    // taken now carries no chain.
+                    BOOST_REQUIRE(!db.pitr_chain());
+                    auto clear = seastar::defer([&db]() noexcept {
+                        db.set_pitr_chain_provider(nullptr);
+                    });
+                    with_an_active_shipper(e, log, [&](db::pitr::pitr_shipper& shipper) {
+                        db::pitr::start_shipping_on_shard(
+                                shipper, e.get_sstorage_manager().local(), log, utils::UUID_gen::get_time_UUID(), test_boot_epoch_us,
+                                [] {
+                                    return make_ready_future<>();
+                                },
+                                [&db](db::pitr::chain_provider provider) {
+                                    db.set_pitr_chain_provider(std::move(provider));
+                                });
+                        BOOST_REQUIRE(shipper.chain());
+
+                        const auto chain = db.pitr_chain();
+                        BOOST_REQUIRE(chain);
+                        BOOST_REQUIRE_EQUAL(chain->chain, shipper.chain()->chain);
+                        BOOST_REQUIRE_EQUAL(chain->host_id, shipper.chain()->host_id);
+                        BOOST_REQUIRE_EQUAL(chain->boot_epoch_us, test_boot_epoch_us);
+                        BOOST_REQUIRE_EQUAL(chain->chain_start_us, shipper.chain()->chain_start_us);
+                        // Segments were held when shipping started, so the
+                        // bound file carries the floor a lower bound is
+                        // refused against (D27, D29).
+                        BOOST_REQUIRE(chain->floor_segment_id);
+                        BOOST_REQUIRE_EQUAL(*chain->floor_segment_id, *shipper.chain_floor());
+                    });
+                    // Cleared the way the shutdown does, before the shipper it
+                    // reads is gone: a snapshot after that carries no chain.
+                    db.set_pitr_chain_provider(nullptr);
+                    BOOST_REQUIRE(!db.pitr_chain());
+                });
+            },
+            pitr_config(true));
+}
+
+// An endpoint the node does not have: no chain, so no provider either, and a
+// snapshot stays unprotected rather than naming a chain that ships nothing.
+SEASTAR_TEST_CASE(test_an_unknown_endpoint_installs_no_chain_provider) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                auto* log = e.local_db().commitlog();
+                BOOST_REQUIRE(log);
+                with_an_active_shipper(e, *log, [&](db::pitr::pitr_shipper& shipper) {
+                    bool installed = false;
+                    db::pitr::start_shipping_on_shard(
+                            shipper, e.get_sstorage_manager().local(), *log, utils::UUID_gen::get_time_UUID(), test_boot_epoch_us,
+                            [] {
+                                return make_ready_future<>();
+                            },
+                            [&installed](db::pitr::chain_provider) {
+                                installed = true;
+                            });
+
+                    BOOST_REQUIRE(shipper.state() == db::pitr::shipping_state::off_unknown_endpoint);
+                    BOOST_REQUIRE(!installed);
+                    BOOST_REQUIRE(!e.local_db().pitr_chain());
+                });
+            },
+            pitr_config(false));
 }
 
 // The floor is the newest segment the commitlog holds when shipping starts, not
