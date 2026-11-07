@@ -55,6 +55,16 @@ public:
     using std::runtime_error::runtime_error;
 };
 
+// Brings one listed segment to local disk and returns the path to read it from,
+// whose file name must still be the source's: the segment's id, shard and entry
+// format are read from the name and not from where the file sits. Called once
+// per segment, in list order, after the list's own checks and before the file's.
+using segment_opener = std::function<future<sstring>(const shipped_segment&)>;
+// Called with what `open` returned once the segment has been read, on a failure
+// of the read too, so a caller that fetched the file can delete it again.
+// Throwing from it fails the call like any other error.
+using segment_closer = std::function<future<>(const sstring& local_path)>;
+
 // Per source shard: the bound, the floor and the reassembly are all per shard.
 struct shard_replay_params {
     // Read in this order, which must be ascending segment id without duplicates, and must all come from one boot of the
@@ -75,6 +85,12 @@ struct shard_replay_params {
     // normal replay has it. Default means no truncation, and drops nothing: no entry sits at position zero.
     db::replay_position truncate_floor;
     const db::extensions* extensions = nullptr;
+    // Unset: the paths in `segments` are read where they are. Set: the whole
+    // chain is read in one call while one segment at a time is on local disk,
+    // which is what keeps the reassembly state shared across a chain the caller
+    // fetches segment by segment (#18).
+    segment_opener open_segment;
+    segment_closer close_segment;
 };
 
 struct replay_reader_stats {
@@ -107,8 +123,8 @@ struct replay_reader_stats {
 // or too large to parse, another shard, or a header that is zeroed, is not a commitlog header, or names another segment. So is a bound or
 // floor of another shard, and a bound left at the default position on any shard. Any read error, decode error or consumer failure fails the
 // call, where normal replay counts the damage and carries on. A split write is reassembled from one state shared by the shard's segments
-// and delivered once, whole. Every entry is decoded, dropped or not, since an entry carries its schema version's mapping only when the segment had forgotten the version: the
-// mappings are kept across the shard's segments, and a surviving entry whose version none of them covers refuses the segment. The caller
+// and delivered once, whole. Every entry is decoded, dropped or not, since an entry carries its schema version's mapping only when the segment had forgotten
+// the version: the mappings are kept across the shard's segments, and a surviving entry whose version none of them covers refuses the segment. The caller
 // therefore remembers nothing.
 //
 // Not guaranteed, and known open (#17): a zeroed sector in the middle of a segment of the recorded size with an intact header is not
@@ -121,6 +137,11 @@ struct replay_reader_stats {
 //
 // Positions are delivered in ascending order, as a healthy log writes them, with one exception: a split write arrives
 // when its last fragment is read, at the position of its first, so it can arrive after a position above it.
+//
+// Memory: the fragments of the split writes still pending, each bounded by the largest entry the source's commitlog
+// accepts (`commitlog::max_record_size()`, a quarter of a segment), plus one column mapping per schema version read. A
+// healthy stream has at most one write pending, since an oversized write takes every request-controller permit, so its
+// fragments are contiguous and exclusive; rolled-back ones add to that until the read ends.
 //
 // Yields between segments and entries. Decoding one entry does not, and is not bounded here: a write can be as large as the commitlog
 // allows, and the highest position read is kept for one compare more per entry. Counting the incomplete split writes at the end does

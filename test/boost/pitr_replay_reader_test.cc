@@ -1848,4 +1848,136 @@ SEASTAR_TEST_CASE(test_the_header_read_closes_the_outermost_wrapper) {
     BOOST_REQUIRE_EQUAL(obfuscated_closes, 1u);
 }
 
+// Stands in for the restore's fetch: brings one listed segment into a directory
+// of its own under the source's file name, and takes it away again once the
+// reader is done with it. A hard link, not a copy: the reader reads it the same
+// way, and what the cases below are about is which segments are present at
+// once, not where their bytes live.
+struct fetching_store {
+    sstring local_dir;
+    size_t opened = 0;
+    size_t closed = 0;
+    // The most segments the directory ever held at the same time, which a
+    // restore of a long chain needs to be one.
+    size_t most_at_once = 0;
+
+    segment_opener opener() {
+        return [this](const shipped_segment& seg) -> future<sstring> {
+            const auto before = (co_await segment_names(local_dir)).size();
+            const auto local = std::filesystem::path(std::string(local_dir)) / std::filesystem::path(std::string(seg.path)).filename();
+            co_await link_file(seg.path, local.string());
+            ++opened;
+            most_at_once = std::max(most_at_once, before + 1);
+            co_return sstring(local.string());
+        };
+    }
+
+    segment_closer closer() {
+        return [this](const sstring& path) -> future<> {
+            ++closed;
+            return remove_file(path);
+        };
+    }
+};
+
+// What the restore does with a chain: one call for the whole of it, with each
+// segment fetched just before it is read and dropped just after. The reassembly
+// state is the reader's and spans the call, so a write split over a segment
+// boundary comes back whole although no two of its segments were ever on local
+// disk together (#18).
+SEASTAR_TEST_CASE(test_a_split_write_fetched_segment_by_segment_arrives_whole) {
+    tmpdir tmp;
+    tmpdir local;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position rp;
+    bytes_ostream frozen;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        auto m = make_mutation(s, "big", 2 * log.max_record_size());
+        frozen = freeze(m).representation();
+        BOOST_REQUIRE_GT(frozen.size(), log.max_record_size());
+        rp = co_await write_mutation(log, s, m);
+    });
+
+    auto params = co_await params_for(dir, s->id(), rp);
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+    fetching_store store{.local_dir = sstring(local.path().string())};
+    params.open_segment = store.opener();
+    params.close_segment = store.closer();
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE_EQUAL(to_str(c.positions), to_str(std::vector<replay_position>{rp}));
+    BOOST_REQUIRE_EQUAL(stats.entries_replayed, 1u);
+    // The bytes, not just their count: a reassembly fed from two states would
+    // either lose the write or put it back in the wrong order.
+    BOOST_REQUIRE(c.blobs.at(0) == frozen);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 0u);
+    // Every segment was fetched, every one given back, and never two at once.
+    BOOST_REQUIRE_EQUAL(store.opened, params.segments.size());
+    BOOST_REQUIRE_EQUAL(store.closed, store.opened);
+    BOOST_REQUIRE_EQUAL(store.most_at_once, 1u);
+    BOOST_REQUIRE_EQUAL((co_await segment_names(sstring(local.path().string()))).size(), 0u);
+}
+
+// The same chain with its last segment missing, which is a history that ends
+// inside the split write: nothing of it is applied and it is counted, so the
+// restore reports it as "up to N" rather than claiming the write (P22).
+SEASTAR_TEST_CASE(test_a_split_write_missing_its_tail_is_counted_when_fetched_segment_by_segment) {
+    tmpdir tmp;
+    tmpdir local;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+    replay_position rp;
+
+    co_await with_log(dir, fragmenting_segments(), [&](commitlog& log) -> future<> {
+        rp = co_await write_mutation(log, s, make_mutation(s, "big", 2 * log.max_record_size()));
+    });
+
+    auto params = co_await params_for(dir, s->id(), rp);
+    BOOST_REQUIRE_GT(params.segments.size(), 1u);
+    params.segments.pop_back();
+    fetching_store store{.local_dir = sstring(local.path().string())};
+    params.open_segment = store.opener();
+    params.close_segment = store.closer();
+
+    capture c;
+    auto stats = co_await replay_shard_segments(params, c.consumer());
+
+    BOOST_REQUIRE(c.positions.empty());
+    BOOST_REQUIRE_EQUAL(stats.entries_replayed, 0u);
+    BOOST_REQUIRE_EQUAL(stats.incomplete_split_writes, 1u);
+    BOOST_REQUIRE_EQUAL(to_str({stats.earliest_incomplete_split_write}), to_str({rp}));
+    BOOST_REQUIRE_EQUAL(store.closed, store.opened);
+    BOOST_REQUIRE_EQUAL(store.most_at_once, 1u);
+}
+
+// A read that fails leaves the restore holding the local copy, which it must
+// give back: the chain is dropped either way, and the next run must not meet it.
+SEASTAR_TEST_CASE(test_a_failed_read_still_gives_the_fetched_segment_back) {
+    tmpdir tmp;
+    tmpdir local;
+    auto dir = sstring(tmp.path().string());
+    auto s = make_schema("cf");
+
+    co_await with_log(dir, small_segments(), [&](commitlog& log) -> future<> {
+        co_await write_mutation(log, s, make_mutation(s, "one", 16));
+    });
+
+    auto params = co_await params_for(dir, s->id());
+    fetching_store store{.local_dir = sstring(local.path().string())};
+    params.open_segment = store.opener();
+    params.close_segment = store.closer();
+
+    capture c;
+    c.fail_at = 0;
+    BOOST_REQUIRE_THROW(co_await replay_shard_segments(params, c.consumer()), std::runtime_error);
+
+    BOOST_REQUIRE_EQUAL(store.opened, 1u);
+    BOOST_REQUIRE_EQUAL(store.closed, 1u);
+    BOOST_REQUIRE_EQUAL((co_await segment_names(sstring(local.path().string()))).size(), 0u);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

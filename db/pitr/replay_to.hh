@@ -223,9 +223,10 @@ struct replay_run_stats {
 // exception, and so is anything the applier refuses, since the target is already
 // marked and the run is over either way.
 //
-// Each segment is read once per call to the reader, so a write split across two
-// segments does not reassemble and is counted in `incomplete_split_writes`
-// instead of being applied (#18).
+// A chain is read in one call to the reader, which fetches through a hook and
+// drops each segment before the next, so one reassembly state spans the chain
+// and a write split over a segment boundary is applied whole. One still
+// incomplete where the chain ends is counted, not applied.
 //
 // Runs on the shard the run runs on; the apply of each entry happens on the
 // shard that owns its key. Yields per fetched chunk, per segment and per entry.

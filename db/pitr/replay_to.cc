@@ -793,6 +793,18 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     };
 }
 
+// A refusal raised from inside the reader's fetch hook. The reader answers with
+// stats or an exception and has no refusal of its own, so this carries one out
+// of the hook to the one caller that installed it.
+class fetch_refused : public std::runtime_error {
+public:
+    refusal reason;
+    explicit fetch_refused(refusal r)
+        : std::runtime_error(fmt::format("{}", r))
+        , reason(std::move(r)) {
+    }
+};
+
 future<std::expected<replay_run_stats, refusal>> replay_history_into_target(sharded<replica::database>& db, sstables::object_storage_client& client,
         sstring bucket, const replay_start& start, std::filesystem::path restore_dir, abort_source& as) {
     if (start.history.chains.size() != start.bound.shards.size()) {
@@ -815,43 +827,52 @@ future<std::expected<replay_run_stats, refusal>> replay_history_into_target(shar
         for (size_t shard_index = 0; shard_index < start.history.chains.size() && !refused; ++shard_index) {
             const auto& chain = start.history.chains[shard_index];
             const auto& shard = start.bound.shards[shard_index];
-            for (size_t i = 0; i < chain.segments.size() && !refused; ++i) {
+            shard_replay_params params;
+            params.segments = chain.segments;
+            params.filename_prefix = filename_prefix;
+            params.shard = shard.shard;
+            params.source_table = start.source_table_id;
+            params.bound = shard.bound;
+            params.extensions = &extensions;
+            // One call for the whole chain, so a write split over a segment
+            // boundary is reassembled, while the hooks keep one segment of local
+            // disk at a time. The reader opens them in list order, which is what
+            // pairs a segment with its recorded checksum.
+            size_t next = 0;
+            params.open_segment = [&](const shipped_segment& segment) -> future<sstring> {
                 as.check();
-                const auto& segment = chain.segments[i];
-                auto fetched = co_await fetch_segment(client, bucket, segment, chain.segment_crc32s[i], restore_dir, as);
+                if (next >= chain.segments.size() || segment.path != chain.segments[next].path) {
+                    on_internal_error(replay_log, seastar::format("the reader asked for {} where the chain's segment {} was expected", segment.path, next));
+                }
+                auto fetched = co_await fetch_segment(client, bucket, segment, chain.segment_crc32s[next], restore_dir, as);
+                ++next;
                 if (!fetched) {
-                    refused = std::move(fetched.error());
-                    break;
+                    // The reader has no refusal of its own, so this leaves
+                    // through the exception the caller unwraps below.
+                    co_await coroutine::return_exception(fetch_refused{std::move(fetched.error())});
                 }
                 ++stats.objects_read;
                 stats.bytes_read += segment.used_size;
-                shard_replay_params params;
-                params.segments.push_back(shipped_segment{.path = sstring(fetched->native()), .used_size = segment.used_size});
-                params.filename_prefix = filename_prefix;
-                params.shard = shard.shard;
-                params.source_table = start.source_table_id;
-                params.bound = shard.bound;
-                params.extensions = &extensions;
-                replay_reader_stats reader;
-                std::exception_ptr replay_error;
-                try {
-                    reader = co_await replay_shard_segments(params, [&applier](const replay_entry& entry) {
-                        return applier(entry);
-                    });
-                } catch (...) {
-                    replay_error = std::current_exception();
-                }
-                // Before the next fetch, and on a failure too: the local copy
-                // is of no use to anything once the reader is done with it.
-                co_await remove_quietly(*fetched);
-                if (replay_error) {
-                    std::rethrow_exception(std::move(replay_error));
-                }
-                stats.entries_replayed += reader.entries_replayed;
-                stats.incomplete_split_writes += reader.incomplete_split_writes;
-                replay_log.debug("replayed {} of shard {}: {} entry/entries applied of {} read", segment.path, shard.shard, reader.entries_replayed,
-                        reader.entries_read);
+                co_return sstring(fetched->native());
+            };
+            params.close_segment = [](const sstring& local_path) -> future<> {
+                // The local copy is of no use to anything once the reader is
+                // done with it, and the next fetch needs the disk.
+                return remove_quietly(std::filesystem::path(std::string_view(local_path)));
+            };
+            replay_reader_stats reader;
+            try {
+                reader = co_await replay_shard_segments(params, [&applier](const replay_entry& entry) {
+                    return applier(entry);
+                });
+            } catch (const fetch_refused& e) {
+                refused = e.reason;
+                break;
             }
+            stats.entries_replayed += reader.entries_replayed;
+            stats.incomplete_split_writes += reader.incomplete_split_writes;
+            replay_log.debug("replayed {} segment(s) of shard {}: {} entry/entries applied of {} read, {} split write(s) left incomplete", reader.segments_read,
+                    shard.shard, reader.entries_replayed, reader.entries_read, reader.incomplete_split_writes);
         }
         stats.applier = applier.stats();
     } catch (...) {
