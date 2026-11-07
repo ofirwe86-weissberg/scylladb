@@ -52,7 +52,8 @@ static std::string_view phase_name(replay_phase phase) {
 }
 
 sstring encode(const replay_state& state) {
-    for (const auto& value : {std::string_view(state.snapshot), std::string_view(state.t)}) {
+    for (const auto& value :
+            {std::string_view(state.snapshot), std::string_view(state.t), std::string_view(state.source_keyspace), std::string_view(state.source_table)}) {
         if (value.find('\n') != std::string_view::npos) {
             throw std::runtime_error("pitr replay mark: a value may not hold a newline");
         }
@@ -60,8 +61,8 @@ sstring encode(const replay_state& state) {
     if (state.started_at_us < 0) {
         throw std::runtime_error("pitr replay mark: started_at_us may not be negative");
     }
-    return seastar::format("format={}\nversion={}\nphase={}\nsnapshot={}\nt={}\nstarted_at_us={}\n", replay_state_format, replay_state_version_1,
-            phase_name(state.phase), state.snapshot, state.t, state.started_at_us);
+    return seastar::format("format={}\nversion={}\nphase={}\nsnapshot={}\nt={}\nsource_keyspace={}\nsource_table={}\nstarted_at_us={}\n", replay_state_format,
+            replay_state_version_1, phase_name(state.phase), state.snapshot, state.t, state.source_keyspace, state.source_table, state.started_at_us);
 }
 
 // The value of `key`, or an error naming what was there instead: a reader built
@@ -98,6 +99,8 @@ replay_state decode_replay_state(std::string_view text) {
     }
     state.snapshot = sstring(take_line(text, "snapshot"));
     state.t = sstring(take_line(text, "t"));
+    state.source_keyspace = sstring(take_line(text, "source_keyspace"));
+    state.source_table = sstring(take_line(text, "source_table"));
     auto started = take_line(text, "started_at_us");
     auto [end, ec] = std::from_chars(started.data(), started.data() + started.size(), state.started_at_us);
     if (ec != std::errc() || end != started.data() + started.size() || state.started_at_us < 0) {
@@ -149,8 +152,6 @@ future<std::optional<replay_state>> read_replay_state(const std::filesystem::pat
     co_return decode_replay_state(body);
 }
 
-// The identifier of the table a `CREATE TABLE` or `ALTER TABLE` line names,
-// which a replay into another table is allowed to differ in.
 static constexpr std::string_view table_name_placeholder = "<table>";
 
 static std::string_view trim(std::string_view line) {
@@ -188,10 +189,12 @@ future<sstring> normalize_schema_cql(std::string_view text) {
         if (line.empty()) {
             continue;
         }
+        // Only where describe writes it, which is the line that closes the
+        // column list: anywhere else those words are a value, not the option.
         // The `ID` option opens the WITH clause, so the next line's `AND` still
         // reads as a continuation of a `WITH` that now carries no option.
-        if (auto id = line.find("WITH ID = "); id != std::string_view::npos) {
-            line = line.substr(0, id + 4);
+        if (line.starts_with(") WITH ID = ")) {
+            line = ") WITH";
         }
         sstring kept;
         if (auto renamed = without_table_name(line, "CREATE TABLE ")) {
@@ -229,11 +232,8 @@ future<std::optional<refusal>> check_schema_match(std::string_view target_cql, s
 }
 
 // Reads one whole file of the backup, or nothing when the store does not hold
-// it. A read error is told from an absent object by asking the store, so a
-// failing read never reads as a backup taken without the file.
-//
-// The key parts come by value: this suspends, and a reference parameter would
-// outlive nothing a caller passing a literal built.
+// it: a read error is told from an absent object by asking the store. The key
+// parts come by value, since this suspends.
 static future<std::optional<sstring>> read_backup_file(
         sstables::object_storage_client& client, sstring bucket, sstring prefix, sstring name, size_t cap, abort_source& as) {
     auto object = sstables::object_name(bucket, prefix, name);
@@ -243,8 +243,8 @@ static future<std::optional<sstring>> read_backup_file(
         auto is = input_stream<char>(client.make_download_source(object, &as));
         std::exception_ptr ex;
         try {
-            // One byte over the cap tells an oversized object from a read this
-            // code truncated itself; either way the parse refuses it.
+            // One byte over the cap tells an oversized object from a read
+            // this code truncated; either way the parse refuses it.
             while (body.size() <= cap) {
                 auto buf = co_await is.read();
                 if (buf.empty()) {
@@ -398,7 +398,7 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     }
     if (p.endpoint.empty() || p.bucket.empty() || !sm.is_known_endpoint(p.endpoint)) {
         co_return refuse(refusal_reason::store_location_missing,
-                "The replay was given no object-storage location this node knows, so the backup cannot be read. Name a configured endpoint and its bucket.",
+                "The replay was given no object-storage location this node knows. Name a configured endpoint and its bucket.",
                 seastar::format("endpoint='{}' bucket='{}'", p.endpoint, p.bucket));
     }
 
@@ -411,8 +411,16 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     auto target_schema = local.find_schema(p.keyspace, p.table);
     auto target = target_schema->id();
 
-    // Before the first suspension point, so that two calls cannot both pass
-    // this and both go on to write a mark.
+    // Before anything that touches the table: a replay restores one table of
+    // one node from its own commitlog, which vnodes give and tablets do not
+    // (REF-1), and a tablet split would add a compaction group under the hold.
+    if (local.find_column_family(target).uses_tablets()) {
+        co_return refuse(refusal_reason::target_uses_tablets,
+                "The target's keyspace uses tablets, which point-in-time recovery does not support. Create it with tablets disabled.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+
+    // Before the first suspension point: two calls must not both pass it.
     auto held = in_flight.try_take(target);
     if (!held) {
         co_return refuse(refusal_reason::replay_already_running,
@@ -425,9 +433,10 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     try {
         existing = co_await read_replay_state(state_dir, target);
     } catch (...) {
-        // A mark that cannot be read is not a table no replay ever touched.
+        // Damage is not a target no replay ever touched.
         co_return refuse(refusal_reason::target_already_replayed,
-                "A replay already ran into the target table and its mark cannot be read. Replay into a table created for it.",
+                "A replay already ran into the target table and its mark cannot be read. Replay into a "
+                "table created for it.",
                 seastar::format("{}: {}", mark_path.native(), std::current_exception()));
     }
     if (existing) {
@@ -435,23 +444,25 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                 seastar::format("{} says {}, from backup '{}' to {}", mark_path.native(), phase_name(existing->phase), existing->snapshot, existing->t));
     }
 
-    // Every shard, because the target is one table on all of them: compaction
-    // left on on one shard purges that shard's tombstones.
-    auto compacting_shards = co_await db.map_reduce0(
-            [target](replica::database& db) {
-                return size_t(!db.find_column_family(target).is_auto_compaction_disabled_by_user());
-            },
-            size_t(0), std::plus<size_t>());
+    // Either way counts: the schema option the refusal asks for, or nodetool
+    // having disabled it on every shard - the run's hold is what stops a
+    // compaction. Every shard, because one left on purges its own tombstones.
+    auto compacting_shards = target_schema->compaction_enabled()
+                                     ? co_await db.map_reduce0(
+                                               [target](replica::database& db) {
+                                                   return size_t(!db.find_column_family(target).is_auto_compaction_disabled_by_user());
+                                               },
+                                               size_t(0), std::plus<size_t>())
+                                     : size_t(0);
     if (compacting_shards) {
         co_return refuse(refusal_reason::target_auto_compaction_enabled,
-                "Auto-compaction is enabled on the target table, so a compaction could purge a tombstone before the writes it covers are replayed. Disable it "
-                "on the table and call the replay again.",
+                "Compaction is enabled on the target, so it could purge a tombstone before the writes it covers are replayed. Create it with compaction = "
+                "{'enabled': 'false'}, or disable it, then call the replay again.",
                 seastar::format("{}.{}, on {} shard(s)", p.keyspace, p.table, compacting_shards));
     }
 
     // Sstables and the memtables that hold writes this node took: a replay
-    // writes the backup and then the history over the target, and could not
-    // tell its own writes from whatever was there before.
+    // could not tell its own writes from what was there before.
     auto occupied_shards = co_await db.map_reduce0(
             [target](replica::database& db) {
                 auto& t = db.find_column_family(target);
@@ -509,8 +520,7 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
         co_return std::unexpected(std::move(*mismatch));
     }
 
-    // Last, so that every refusal above leaves the node as it was. From here on
-    // the target reads as `incomplete` until a replay writes `done` over it.
+    // Last, so every refusal above leaves the node as it was.
     co_await write_replay_state(state_dir, target,
             replay_state{
                     .phase = replay_phase::started,

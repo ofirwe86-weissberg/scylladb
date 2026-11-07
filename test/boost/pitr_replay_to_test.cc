@@ -45,7 +45,9 @@ BOOST_AUTO_TEST_SUITE(pitr_replay_to_test)
 
 namespace {
 
-constexpr const char* test_endpoint = "https://pitr-replay.test";
+// A loopback address and not a name: a check that is skipped by mistake must
+// fail on the refusal-code assertion, not 50 s later on a DNS lookup.
+constexpr const char* test_endpoint = "https://127.0.0.1:1";
 constexpr const char* ks_name = "ks";
 
 const ::table_id test_target{utils::UUID("55556666-0000-4000-8000-00000000000c")};
@@ -55,6 +57,8 @@ replay_state make_state() {
             .phase = replay_phase::started,
             .snapshot = "backup-1",
             .t = "2026-11-04T14:05:00.000000Z",
+            .source_keyspace = "ks",
+            .source_table = "source",
             .started_at_us = 1762400000000000LL,
     };
 }
@@ -148,9 +152,17 @@ BOOST_AUTO_TEST_CASE(decoding_a_mark_refuses_damage) {
     // each is damage and none may read as a mark of its own.
     BOOST_REQUIRE_THROW(decode_replay_state(whole.substr(0, whole.size() / 2)), std::runtime_error);
     BOOST_REQUIRE_THROW(decode_replay_state(""), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=2\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=half\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
-    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=-1\n"), std::runtime_error);
+    BOOST_REQUIRE_THROW(
+            decode_replay_state("format=pitr-replay\nversion=2\nphase=started\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=1\n"),
+            std::runtime_error);
+    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=half\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=1\n"),
+            std::runtime_error);
+    BOOST_REQUIRE_THROW(
+            decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nsource_keyspace=k\nsource_table=c\nstarted_at_us=-1\n"),
+            std::runtime_error);
+    // A mark written before the source was recorded is damage, not a mark with
+    // two fields missing: the keys are the format.
+    BOOST_REQUIRE_THROW(decode_replay_state("format=pitr-replay\nversion=1\nphase=started\nsnapshot=s\nt=t\nstarted_at_us=1\n"), std::runtime_error);
     BOOST_REQUIRE_THROW(decode_replay_state(whole + "phase=done\n"), std::runtime_error);
 }
 
@@ -219,6 +231,56 @@ SEASTAR_TEST_CASE(a_target_missing_the_backups_dropped_column_is_refused) {
     });
 }
 
+
+// Nothing in a WITH clause may differ, only the three above: a replay into a
+// target whose options are not the backup's does not restore the backup's
+// behaviour. Each option gets a case of its own, because a normaliser that
+// drops one line too many drops them all silently.
+SEASTAR_TEST_CASE(a_target_whose_clustering_order_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text, ck int, value int, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck ASC)").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text, ck int, value int, PRIMARY KEY (pk, ck)) WITH CLUSTERING ORDER BY (ck DESC)").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+SEASTAR_TEST_CASE(a_target_whose_default_time_to_live_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int) WITH default_time_to_live = 0").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH default_time_to_live = 3600").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+SEASTAR_TEST_CASE(a_target_whose_gc_grace_seconds_differs_is_refused) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int) WITH gc_grace_seconds = 864000").get();
+        e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH gc_grace_seconds = 1234").get();
+        auto refused = check_schema_match(schema_cql_of(e, "target"), schema_cql_of(e, "source")).get();
+        BOOST_REQUIRE(refused);
+        BOOST_REQUIRE(refused->code() == "target_schema_differs");
+    });
+}
+
+// The other side of the same rule: the id is the one thing in the WITH clause
+// a replay must ignore, since the target is a table of its own.
+SEASTAR_TEST_CASE(two_statements_differing_only_in_their_id_match) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        e.execute_cql("CREATE TABLE ks.source (pk text PRIMARY KEY, value int)").get();
+        auto backup = schema_cql_of(e, "source");
+        auto target = backup;
+        auto id = e.local_db().find_schema(ks_name, "source")->id().to_sstring();
+        auto at = target.find(id);
+        BOOST_REQUIRE(at != sstring::npos);
+        target = target.substr(0, at) + "11112222-3333-4444-5555-666677778888" + target.substr(at + id.size());
+        BOOST_REQUIRE(target != backup);
+        BOOST_REQUIRE(!check_schema_match(target, backup).get());
+    });
+}
 
 namespace {
 
@@ -439,6 +501,42 @@ SEASTAR_TEST_CASE(a_second_call_on_a_target_a_replay_is_running_into_is_refused)
             replay_config());
 }
 
+
+// A replay restores one table of one node from that node's own commitlog, which
+// vnodes give and tablets do not (REF-1). Refused before anything touches the
+// table, which also keeps the run's compaction hold away from tablet splits.
+SEASTAR_TEST_CASE(a_target_in_a_tablets_keyspace_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE KEYSPACE tks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = "
+                              "{'enabled': true}")
+                        .get();
+                e.execute_cql("CREATE TABLE tks.target (pk text PRIMARY KEY, value int)").get();
+                auto params = params_for("target");
+                params.keyspace = "tks";
+                BOOST_REQUIRE(refusal_of(e, state_dir, params).code() == "target_uses_tablets");
+            },
+            replay_config());
+}
+
+// The refusal asks the user to create the target with compaction disabled, so
+// a target created that way must pass the check that raises it.
+SEASTAR_TEST_CASE(a_target_created_with_compaction_disabled_passes_the_check) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH compaction = {'class': 'SizeTieredCompactionStrategy', "
+                              "'enabled': 'false'}")
+                        .get();
+                // Nothing disabled it by hand, so only the schema says so. One
+                // row makes the next check refuse, which is how this one proves
+                // it passed without a store to read.
+                e.execute_cql("INSERT INTO ks.target (pk, value) VALUES ('a', 1)").get();
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target")).code() == "target_not_empty");
+            },
+            replay_config());
+}
 
 namespace {
 

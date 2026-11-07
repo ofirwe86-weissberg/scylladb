@@ -20,6 +20,7 @@
 #include <seastar/util/short_streams.hh> 
 #include "sstables_loader.hh"
 #include "db/config.hh"
+#include "db/pitr/replay_to.hh"
 #include "dht/auto_refreshing_sharder.hh"
 #include "compaction/compaction_manager.hh"
 #include "replica/distributed_loader.hh"

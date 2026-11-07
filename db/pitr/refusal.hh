@@ -63,18 +63,22 @@ enum class refusal_reason {
     // The bound file is there but its strict reader refuses it.
     bound_file_damaged,
     // The backup under the prefix is not the one the call named: its manifest
-    // records another snapshot, keyspace or table.
+    // records another snapshot. The keyspace and the table it records are not
+    // checked, because a replay into a table of another name is the point.
     backup_names_another_table,
     // A replay is running into this target right now, so a second one would
     // write over it (P62).
     replay_already_running,
+    // The target's keyspace uses tablets. A replay restores one table of one
+    // node, which vnodes give and tablets do not (REF-1).
+    target_uses_tablets,
     // The backup's manifest will not parse, or does not hold what a replay
     // needs to find its sstables.
     backup_manifest_damaged,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 16> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 17> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
@@ -90,6 +94,7 @@ inline constexpr std::array<refusal_reason, 16> all_refusal_reasons{
         refusal_reason::bound_file_damaged,
         refusal_reason::backup_names_another_table,
         refusal_reason::replay_already_running,
+        refusal_reason::target_uses_tablets,
         refusal_reason::backup_manifest_damaged,
 };
 

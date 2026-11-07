@@ -21,7 +21,10 @@ from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 
 logger = logging.getLogger(__name__)
 
-RF_1 = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'}"
+# Vnodes: a replay restores one table of one node from that node's own commitlog, which tablets do
+# not give, and a tablets target is refused (REF-1).
+RF_1 = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': false}"
+TABLETS_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': true}"
 T = '2026-11-04T14:05:00.000000Z'
 
 
@@ -74,6 +77,15 @@ async def test_replay_refuses_a_target_that_does_not_exist(manager: ScyllaCluste
     async with new_test_keyspace(manager, RF_1) as ks:
         status = await replay(manager, server, object_storage, ks, 'no_such_table', 'snap', 'prefix')
         assert 'target_missing' in refusal_of(status), refusal_of(status)
+
+
+async def test_replay_refuses_a_target_in_a_tablets_keyspace(manager: ScyllaClusterManager, object_storage):
+    server = await one_server(manager, object_storage)
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, TABLETS_KS) as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.target (pk text primary key, value text);")
+        status = await replay(manager, server, object_storage, ks, 'target', 'snap', 'prefix')
+        assert 'target_uses_tablets' in refusal_of(status), refusal_of(status)
 
 
 async def test_replay_refuses_a_malformed_t(manager: ScyllaClusterManager, object_storage):
