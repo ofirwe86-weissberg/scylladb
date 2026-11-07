@@ -130,8 +130,12 @@ struct replay_start {
     // T, microseconds since the UNIX epoch, UTC.
     api::timestamp_type t = 0;
     bound_file bound;
-    // The backup's sstables, from its manifest.
+    // The backup's sstables and the table it was taken from, from its
+    // manifest: a shared snapshot tag makes the names the only record of what
+    // was loaded.
     utils::chunked_vector<sstring> toc_names;
+    sstring source_keyspace;
+    sstring source_table;
     // Held until the run ends, so no second replay enters this target.
     replay_in_flight::guard in_flight;
 };

@@ -332,6 +332,7 @@ static std::unexpected<refusal> refuse_damaged_manifest(sstring detail) {
 future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chunked_content&& content, const sstring& expected_snapshot) {
     backup_manifest manifest;
     rjson::value parsed = rjson::null_value();
+    std::optional<sstring> damaged;
     try {
         // Yieldable: the manifest grows with the backup, and this is the only
         // parse on the path that does.
@@ -342,9 +343,14 @@ future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chu
         manifest.keyspace = sstring(rjson::get<std::string>(table, "keyspace_name"));
         manifest.table = sstring(rjson::get<std::string>(table, "table_name"));
     } catch (const rjson::error& e) {
-        co_return refuse_damaged_manifest(e.what());
+        damaged = e.what();
+    }
+    if (damaged) {
+        co_await rjson::destroy_gently(std::move(parsed));
+        co_return refuse_damaged_manifest(*damaged);
     }
     if (manifest.snapshot != expected_snapshot) {
+        co_await rjson::destroy_gently(std::move(parsed));
         co_return refuse(refusal_reason::backup_names_another_table,
                 "The backup under this prefix is not the one the call named, so what would be restored is another table's data. Name the backup the prefix "
                 "holds, or the prefix of the backup you named.",
@@ -354,23 +360,26 @@ future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chu
 
     // A backup of a table that held nothing carries no sstables: that is a
     // backup like any other, and the replay goes on to the history.
-    auto sstables = rjson::find(parsed, "sstables");
-    if (!sstables) {
-        co_return std::move(manifest);
-    }
-    if (!sstables->IsArray()) {
-        co_return refuse_damaged_manifest("'sstables' is not an array");
-    }
-    for (const auto& entry : sstables->GetArray()) {
-        co_await coroutine::maybe_yield();
-        if (!entry.IsObject()) {
-            co_return refuse_damaged_manifest("an entry of 'sstables' is not an object");
+    if (const auto* sstables = rjson::find(parsed, "sstables")) {
+        if (sstables->IsArray()) {
+            for (const auto& entry : sstables->GetArray()) {
+                co_await coroutine::maybe_yield();
+                const auto* toc = entry.IsObject() ? rjson::find(entry, "toc_name") : nullptr;
+                if (!toc || !toc->IsString()) {
+                    damaged = "an entry of 'sstables' is not an object, or carries no toc_name";
+                    break;
+                }
+                manifest.toc_names.push_back(sstring(rjson::to_string_view(*toc)));
+            }
+        } else {
+            damaged = "'sstables' is not an array";
         }
-        const auto* toc = rjson::find(entry, "toc_name");
-        if (!toc || !toc->IsString()) {
-            co_return refuse_damaged_manifest("an entry of 'sstables' carries no toc_name");
-        }
-        manifest.toc_names.push_back(sstring(rjson::to_string_view(*toc)));
+    }
+    // A manifest at the cap builds a DOM of millions of nodes, and freeing it
+    // in one go stalls as long as the parse did.
+    co_await rjson::destroy_gently(std::move(parsed));
+    if (damaged) {
+        co_return refuse_damaged_manifest(*damaged);
     }
     replay_log.info(
             "the backup of {}.{} under snapshot '{}' holds {} sstable(s)", manifest.keyspace, manifest.table, manifest.snapshot, manifest.toc_names.size());
@@ -526,6 +535,8 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                     .phase = replay_phase::started,
                     .snapshot = p.snapshot,
                     .t = p.t,
+                    .source_keyspace = manifest->keyspace,
+                    .source_table = manifest->table,
                     .started_at_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
             });
     replay_log.info("replay of backup '{}' of {}.{} into {}.{} to {} started: {} sstable(s), {} shard(s) in the bound, captured at {}us", p.snapshot,
@@ -535,6 +546,8 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
             .t = *t,
             .bound = std::move(bound),
             .toc_names = std::move(manifest->toc_names),
+            .source_keyspace = std::move(manifest->keyspace),
+            .source_table = std::move(manifest->table),
             .in_flight = std::move(*held),
     };
 }

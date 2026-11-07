@@ -144,17 +144,20 @@ private:
     // arrived on, so one of them is refused rather than writing over the other.
     db::pitr::replay_in_flight _pitr_replays;
 
-    // This shard's share of the compaction hold a running replay keeps on its
-    // target. Per shard, because a reenabler belongs to the shard that took it:
-    // it is released here, or with this service if the node stops first. By
-    // pointer, so that the header does not have to see a compaction reenabler.
-    std::unique_ptr<replica::compaction_reenablers_and_lock_holders> _pitr_compaction_hold;
+    // This shard's share of the compaction holds the running replays keep on
+    // their targets, one entry per target: two replays into two tables run at
+    // once, and each releases only its own. Per shard, because a reenabler
+    // belongs to the shard that took it: released here, or with this service if
+    // the node stops first. By pointer, so the header need not see a reenabler.
+    db::pitr::per_target<std::unique_ptr<replica::compaction_reenablers_and_lock_holders>> _pitr_compaction_holds;
 
-    // Takes, checks and releases the hold on every shard. The check is what
-    // tells a replay that nothing compacted its target while it ran.
+    // Takes, checks and releases one target's hold on every shard. The check is
+    // what tells a replay that nothing compacted its target while it ran. A
+    // hold that fails on any shard is released on all of them before it
+    // throws, so a half-taken hold never outlives the call.
     future<> hold_pitr_compaction(table_id target);
     future<bool> pitr_compaction_still_held(table_id target);
-    future<> release_pitr_compaction() noexcept;
+    future<> release_pitr_compaction(table_id target) noexcept;
 
     // Loads the backup's sstables into the target through the restore path,
     // with compaction held off for the whole of it.
@@ -176,7 +179,7 @@ public:
             db::system_distributed_keyspace& sys_dist_ks,
             seastar::scheduling_group sg);
 
-    // Out of line, because _pitr_compaction_hold points at a type the header
+    // Out of line, because the compaction holds point at a type the header
     // only declares.
     ~sstables_loader();
 

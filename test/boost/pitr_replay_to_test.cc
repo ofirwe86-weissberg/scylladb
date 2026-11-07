@@ -595,34 +595,77 @@ SEASTAR_TEST_CASE(auto_compaction_enabled_under_a_hold_is_reported) {
 
 
 // The hold is what stops a compaction asked for by hand: auto-compaction being
-// off does not. A major asked for while a replay holds the target waits for it
-// rather than running between the backup's sstables and the replayed history.
+// off does not. A major asked for while a replay holds the target is skipped,
+// so the sstables the backup landed are still there when the history is
+// replayed over them. It is the outcome that is asserted, not the timing: a
+// major on a disabled view returns at once without compacting anything.
 SEASTAR_TEST_CASE(a_major_compaction_asked_for_under_a_hold_does_not_run) {
     return do_with_cql_env_thread([](cql_test_env& e) {
         e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
         e.db().invoke_on_all([](replica::database& db) {
                   return db.find_column_family(ks_name, "target").disable_auto_compaction();
               }).get();
-        // Two sstables, so a major has something to do.
-        for (int i = 0; i < 2; ++i) {
-            e.execute_cql(seastar::format("INSERT INTO ks.target (pk, value) VALUES ('{}', {})", i, i)).get();
+        // Two sstables on this shard, so a major has something to do. Enough
+        // keys that some of them land here, whatever the shard count.
+        for (int round = 0; round < 2; ++round) {
+            for (int key = 0; key < 32; ++key) {
+                e.execute_cql(seastar::format("INSERT INTO ks.target (pk, value) VALUES ('{}-{}', {})", round, key, key)).get();
+            }
             e.db().invoke_on_all([](replica::database& db) {
                       return db.flush_all_memtables();
                   }).get();
         }
         auto& t = target_table(e, "target");
+        auto before = t.sstables_count();
+        BOOST_REQUIRE_GE(before, 2u);
         auto hold = t.hold_compaction_off("point-in-time replay test").get();
-        auto major = t.compact_all_sstables(tasks::make_empty_task_info());
-        // A few rounds of the reactor: enough for a major that could
-        // run to have run, and no sleep.
-        for (int i = 0; i < 100; ++i) {
-            seastar::yield().get();
-        }
-        BOOST_REQUIRE(!major.available());
+        t.compact_all_sstables(tasks::make_empty_task_info()).get();
+        // Nothing was compacted: the two sstables the backup would have landed
+        // are still the two the replay will replay over.
+        BOOST_REQUIRE_EQUAL(t.sstables_count(), before);
         BOOST_REQUIRE(t.compaction_still_held(hold));
         hold.cres.clear();
-        major.get();
+        // Released, the same request does compact them.
+        t.compact_all_sstables(tasks::make_empty_task_info()).get();
+        BOOST_REQUIRE_LT(t.sstables_count(), before);
     });
+}
+
+
+// Two replays into two tables run at once, so one hold may not stand for the
+// other: releasing B leaves A held, and A's run still vouches for its target.
+SEASTAR_TEST_CASE(releasing_one_targets_hold_leaves_another_held) {
+    return do_with_cql_env_thread([](cql_test_env& e) {
+        for (const char* table : {"target_a", "target_b"}) {
+            e.execute_cql(seastar::format("CREATE TABLE ks.{} (pk text PRIMARY KEY, value int)", table)).get();
+            e.db().invoke_on_all([table](replica::database& db) {
+                      return db.find_column_family(ks_name, table).disable_auto_compaction();
+                  }).get();
+        }
+        auto& a = target_table(e, "target_a");
+        auto& b = target_table(e, "target_b");
+        auto hold_a = a.hold_compaction_off("point-in-time replay test A").get();
+        auto hold_b = b.hold_compaction_off("point-in-time replay test B").get();
+        hold_b.cres.clear();
+        BOOST_REQUIRE(a.compaction_still_held(hold_a));
+        BOOST_REQUIRE(!b.compaction_still_held(hold_b));
+    });
+}
+
+
+// Two replays into two tables run at once, so one slot per shard would have
+// one replacing the other's hold and the first to finish releasing what the
+// other still needs.
+BOOST_AUTO_TEST_CASE(a_hold_is_kept_and_released_per_target) {
+    const ::table_id other{utils::UUID("77778888-0000-4000-8000-00000000000d")};
+    db::pitr::per_target<int> holds;
+    holds.add(test_target, 1);
+    holds.add(other, 2);
+    BOOST_REQUIRE_EQUAL(holds.size(), 2u);
+    holds.erase(other);
+    BOOST_REQUIRE(!holds.find(other));
+    BOOST_REQUIRE(holds.find(test_target));
+    BOOST_REQUIRE_EQUAL(*holds.find(test_target), 1);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -35,7 +35,7 @@ async def one_server(manager, object_storage, shipping=False):
     if shipping:
         cfg |= {'pitr_endpoint': object_storage.address, 'pitr_bucket': object_storage.bucket_name,
                 'pitr_prefix': 'pitr-log', 'pitr_seal_interval_in_seconds': 1}
-    cmd = ['--logger-log-level', 'pitr_replay_to=debug:sstables_loader=info:api=info']
+    cmd = ['--logger-log-level', 'pitr_replay_to=debug:sstables_loader=info:api=info:compaction_manager=debug']
     return await manager.server_add(config=cfg, cmdline=cmd)
 
 
@@ -179,7 +179,9 @@ async def test_replay_loads_the_backup_into_the_target(manager: ScyllaClusterMan
         status = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
         error = refusal_of(status)
         assert 'not built yet' in error, error
-        assert 'is loaded' in error, error
+        # The result names the table the backup was taken from, not only the snapshot tag, which
+        # can be shared: it is what tells the user which table they just loaded.
+        assert f"loaded backup '{snap_name}' of {ks}.source" in error, error
 
         loaded = {x.pk: x.value for x in await cql.run_async(f"SELECT * FROM {ks}.target;")}
         assert loaded == rows, f'the target does not hold the backup after the load: {loaded}'
@@ -213,5 +215,49 @@ async def test_replay_fails_if_auto_compaction_is_enabled_while_it_runs(manager:
         # A run that failed after the mark was written leaves the target marked, so it reads as
         # incomplete and a second call on it is refused: the user drops it and replays into a new
         # table.
+        second = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
+        assert 'target_already_replayed' in refusal_of(second), refusal_of(second)
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_a_hold_that_fails_on_one_shard_leaves_no_hold_behind(manager: ScyllaClusterManager, object_storage):
+    """Each reenabler holds the compaction state's gate, so a hold left behind on the shards that
+    did take it would hang a later compaction or DROP of the table. A hold that fails anywhere is
+    released everywhere before the run gives up."""
+    server = await one_server(manager, object_storage, shipping=True)
+    async with new_test_keyspace(manager, RF_1) as ks:
+        snap_name, prefix = await backup_with_a_pitr_bound(manager, server, object_storage, ks, {'0': 'zero'})
+        await manager.api.enable_injection(server.ip_addr, 'pitr_hold_compaction_fail', one_shot=True)
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+        status = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
+        assert 'Injected compaction hold failure' in refusal_of(status), refusal_of(status)
+
+        # The shards that did take a hold gave it back, which the compaction manager logs.
+        released = await log.grep('Reenabling compaction for', from_mark=mark)
+        assert released, 'no shard released its compaction hold after the failure'
+        # And nothing holds the table any more, so a major compaction of it runs instead of
+        # waiting for a hold that nobody will release.
+        await asyncio.wait_for(manager.api.keyspace_compaction(server.ip_addr, ks, 'target'), timeout=120)
+
+
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_aborting_a_replay_releases_the_hold_and_keeps_the_mark(manager: ScyllaClusterManager, object_storage):
+    """A user can abort the task. The hold goes with the run, and the mark stays: the target has
+    the backup's sstables in it, so it is incomplete and a second call is refused."""
+    server = await one_server(manager, object_storage, shipping=True)
+    async with new_test_keyspace(manager, RF_1) as ks:
+        snap_name, prefix = await backup_with_a_pitr_bound(manager, server, object_storage, ks, {'0': 'zero'})
+        await manager.api.enable_injection(server.ip_addr, 'pitr_replay_loaded', one_shot=True)
+        log = await manager.server_open_log(server.server_id)
+        mark = await log.mark()
+        tid = await start_replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
+        await log.wait_for(f"backup '{snap_name}' loaded", from_mark=mark)
+        await manager.api.abort_task(server.ip_addr, tid)
+        await manager.api.message_injection(server.ip_addr, 'pitr_replay_loaded')
+        status = await manager.api.wait_task(server.ip_addr, tid)
+        assert status['state'] in ('failed', 'aborted'), status
+
+        await asyncio.wait_for(manager.api.keyspace_compaction(server.ip_addr, ks, 'target'), timeout=120)
         second = await replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
         assert 'target_already_replayed' in refusal_of(second), refusal_of(second)
