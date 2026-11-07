@@ -140,6 +140,11 @@ future<std::expected<checked_chain, refusal>> check_chain(
     checked_chain result;
     uint64_t prev_segment_id = 0;
     int64_t covered_through_us = 0;
+    // The bound's own segment, and the lowest one the chain holds above it: a
+    // chain that reaches past the bound without holding the bound's segment is
+    // missing exactly the writes the backup's sstables do not have (#103).
+    bool holds_bound_segment = false;
+    std::optional<uint64_t> lowest_above_bound;
     for (uint64_t sequence = 0;; ++sequence) {
         as.check();
         const auto key = entry_object_key(chain, sequence);
@@ -174,6 +179,14 @@ future<std::expected<checked_chain, refusal>> check_chain(
                             bound.bound_segment_id, entry.segment_id),
             });
         }
+        if (entry.segment_id == bound.bound_segment_id) {
+            holds_bound_segment = true;
+        } else if (entry.segment_id > bound.bound_segment_id && !lowest_above_bound) {
+            // The entries rise in segment id, which link_against_previous()
+            // has already proved, so the first one above the bound is the
+            // lowest.
+            lowest_above_bound = entry.segment_id;
+        }
         prev_segment_id = entry.segment_id;
         covered_through_us = entry.covered_through_us;
         ++result.entries_read;
@@ -195,6 +208,24 @@ future<std::expected<checked_chain, refusal>> check_chain(
                 .message = "The backup names a chain of protection records that is not in the store, so what it covers cannot be proved. "
                            "Restore from a later backup.",
                 .detail = seastar::format("shard {}: no entries under {}", bound.shard, chain_key_prefix(chain)),
+        });
+    }
+    if (lowest_above_bound && !holds_bound_segment) {
+        // The segment the snapshot was taken in holds the writes the backup's
+        // sstables do not, and a chain that goes on above it without it has a
+        // hole exactly there. Nothing else shows it: the sequence numbers stay
+        // dense, and the ids come from `++_ids`, which skips reserve and
+        // recycled segments, so only the bound's exact id proves it is there
+        // (REF-4, #103). A bound segment that was empty and never shipped is
+        // refused too, which is the accepted trade.
+        check_log.warn("the chain at {} reaches segment {} but not the backup's bound segment {} on shard {}", chain_key_prefix(chain), *lowest_above_bound,
+                bound.bound_segment_id, bound.shard);
+        co_return std::unexpected(refusal{
+                .reason = refusal_reason::protection_records_missing,
+                .message = "The protection records do not hold the commitlog segment the backup was taken in, so the writes made in it cannot be replayed. "
+                           "Restore from a later backup.",
+                .detail = seastar::format("shard {}: segment {} is not in the chain under {}, which holds segment {} above it", bound.shard,
+                        bound.bound_segment_id, chain_key_prefix(chain), *lowest_above_bound),
         });
     }
     result.covered_through_us = covered_through_us;
