@@ -123,7 +123,7 @@ These apply to all implementation and review on this project.
 - **Storage engine**: `replica/` (database, table, memtables, row cache) → `mutation/` → `readers/` → `sstables/` + commitlog (`db/`) + `compaction/`, `repair/`, `streaming/`. Reads are bounded by `reader_concurrency_semaphore`.
 - **Layered features**: `cdc/`, materialized views, `index/`, `vector_search/`, `auth/`, `audit/`, `tracing/`, `tasks/`, `node_ops/`, `lang/` (UDFs), `tools/` (nodetool, `scylla sstable`), `types/`, `utils/`.
 - **PITR** (this fork, `db/pitr/` on `ow/pitr/v1`; design in `docs-work/design-must.md`):
-  - *Ship path:* `pitr_shipper` (config, states, seal timer, upload with retry and release) → `segment_upload` → `ledger_writer` / `ledger_entry` (format frozen; kind 1 entries, kind 2 reserved, kind 3 planned). It hooks into the commitlog's segment hold, close callback and clamp in `db/commitlog/`.
+  - *Ship path:* `pitr_shipper` (config, states, seal timer, upload with retry and release) → `segment_upload` → `ledger_writer` / `ledger_entry` (format frozen; kind 1 entries, kinds 2 and 3 reserved). It hooks into the commitlog's segment hold, close callback and clamp in `db/commitlog/`.
   - *Backup side:* the replay bound is captured together with the snapshot in `replica/table.cc` `snapshot_sstables()`.
   - *Restore path:* `t_parser` (T) → `chain_check` (dense chain of ledger entries, or a refusal) → `replay_reader` (strict replay of the shipped segments, counting split writes) → `t_filter` → `apply_to_target`. `refusal` holds the refusal reasons.
   - Not built yet: shipping wired to a real object-storage client, ledger writes from the shipper, and the `replay_to(T)` REST endpoint.
