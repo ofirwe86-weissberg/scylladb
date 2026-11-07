@@ -71,6 +71,7 @@
 #include "db/commitlog/commitlog_replayer.hh"
 #include "db/pitr/pitr_shipper.hh"
 #include "db/view/view_builder.hh"
+#include "mutation/timestamp.hh"
 #include "utils/error_injection.hh"
 #include "utils/runtime.hh"
 #include "utils/log.hh"
@@ -2772,6 +2773,22 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                             // The timer arms only once shipping is on.
                             shipper.note_cluster_size(node_count);
                             shipper.start_sealing(seal_pitr_segment, count_pitr_nodes);
+                        })
+                        .get();
+                // The store client, after the sealing: from here on a closed
+                // segment is shipped. One boot epoch per node, so that every
+                // shard's chain names this boot.
+                const auto pitr_boot_epoch_us = api::new_timestamp();
+                pitr_shipper
+                        .invoke_on_all([&](db::pitr::pitr_shipper& shipper) {
+                            auto* log = db.local().commitlog();
+                            if (!log) {
+                                // A guard: shipping is active only where it holds.
+                                return;
+                            }
+                            db::pitr::start_shipping_on_shard(shipper, sstm.local(), *log, host_id.id, pitr_boot_epoch_us, [&db] {
+                                return db.local().flush_all_memtables();
+                            });
                         })
                         .get();
             }

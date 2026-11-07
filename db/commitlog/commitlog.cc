@@ -497,6 +497,7 @@ public:
     void on_segment_closed(segment&, bool failed) noexcept;
     void release_held_segment(segment_id_type) noexcept;
     std::vector<segment_id_type> held_segments() const;
+    std::optional<sstring> held_segment_path(segment_id_type) const;
     uint64_t held_bytes() const noexcept {
         return _held_bytes;
     }
@@ -2913,6 +2914,18 @@ std::vector<db::segment_id_type> db::commitlog::segment_manager::held_segments()
     return std::vector<segment_id_type>(_held_segments.begin(), _held_segments.end());
 }
 
+std::optional<sstring> db::commitlog::segment_manager::held_segment_path(segment_id_type id) const {
+    // Only a held segment answers: the file of one that is not held may be
+    // deleted or recycled, and a path to it would be of no use to a shipper.
+    // One pass over the active segments, as release_held_segment() does.
+    for (auto& s : _segments) {
+        if (s->_desc.id == id && s->_shipping_hold) {
+            return filename(s->_desc);
+        }
+    }
+    return std::nullopt;
+}
+
 void db::commitlog::segment_manager::discard_unused_segments() noexcept {
     clogger.trace("Checking for unused segments ({} active)", _segments.size());
 
@@ -4213,6 +4226,10 @@ uint64_t db::commitlog::disk_limit() const {
 
 std::vector<db::segment_id_type> db::commitlog::held_segments() const {
     return _segment_manager->held_segments();
+}
+
+std::optional<sstring> db::commitlog::held_segment_path(segment_id_type id) const {
+    return _segment_manager->held_segment_path(id);
 }
 
 uint64_t db::commitlog::held_bytes() const {

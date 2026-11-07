@@ -49,6 +49,7 @@
 #include "db/config.hh"
 #include "db/pitr/pitr_shipper.hh"
 #include "db/pitr/segment_upload.hh"
+#include "mutation/timestamp.hh"
 #include "service/topology_state_machine.hh"
 #include "sstables/object_storage_client.hh"
 #include "test/lib/test_utils.hh"
@@ -1519,10 +1520,26 @@ std::string segment_object(db::segment_id_type id) {
     return sstables::object_name("pitr-bucket", seastar::format("chains/segments/CommitLog-4-{}.log", id)).str();
 }
 
+// A host id and a boot epoch of the wiring's making, fixed so that a chain key
+// a test asserts on is stable.
+const utils::UUID test_host_id = utils::UUID("b1e3f0d4-1111-4000-8000-000000000001");
+constexpr int64_t test_boot_epoch_us = 1762300000000000LL;
+
+db::pitr::chain_origin test_origin(std::optional<db::segment_id_type> floor = std::nullopt) {
+    return db::pitr::chain_origin{
+            .host_id = test_host_id,
+            .boot_epoch_us = test_boot_epoch_us,
+            .floor = floor,
+    };
+}
+
 // The hooks the shipper ships through, plus what they recorded.
 struct ship_probe {
     seastar::sstring dir;
     fake_store store;
+    // The chain floor the shipper starts with; no floor by default, so that a
+    // test that is not about the floor ships every segment it closes.
+    std::optional<db::segment_id_type> floor;
     std::vector<db::segment_id_type> released;
     std::unordered_map<db::segment_id_type, seastar::sstring> paths;
     // Called before the id is recorded, so that a test can see what the store
@@ -1582,7 +1599,7 @@ void with_shipping(ship_probe& probe, Func&& f) {
         }
     });
     shipper.set_release_hook(probe.release_hook());
-    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
     f(shipper);
 }
 
@@ -1731,7 +1748,7 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_during_an_upload_aborts_it_and_keeps
     shipper.start().get();
     shipper.note_cluster_size(1);
     shipper.set_release_hook(probe.release_hook());
-    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
 
     constexpr size_t used = 4096;
     // Every attempt fails, so the upload is waiting out a backoff when the
@@ -1756,9 +1773,9 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_during_an_upload_aborts_it_and_keeps
 }
 
 // Shutting down with far more closes than can run at once: the ones holding a
-// slot and the ones waiting for one are all aborted, a close that arrives once
-// the shutdown has begun starts nothing, and every hold is kept, since the
-// shutdown deletes the held segments anyway.
+// slot and the ones waiting for one are all aborted, and every one of their
+// holds is kept, since the shutdown deletes the held segments anyway. A close
+// that arrives once the shutdown has begun ships nothing and is released.
 SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_with_many_uploads_keeps_every_hold) {
     ship_probe probe;
     tmpdir dir;
@@ -1768,7 +1785,7 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_with_many_uploads_keeps_every_hold) 
     shipper.start().get();
     shipper.note_cluster_size(1);
     shipper.set_release_hook(probe.release_hook());
-    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
 
     constexpr size_t used = 4096;
     constexpr size_t segments = 32;
@@ -1794,7 +1811,9 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_shutdown_with_many_uploads_keeps_every_hold) 
     probe.store.hold_put.reset();
     stopping.get();
 
-    BOOST_REQUIRE(probe.released.empty());
+    // Only the close that arrived after the stop had begun: the aborted
+    // uploads keep theirs.
+    BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{60 + segments});
     BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
     BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 0u);
     BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 0u);
@@ -2193,8 +2212,8 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_a_break_before_shipping_release
 SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_close_before_shipping_releases_nothing) {
     ship_probe probe;
     with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
-        // A failed close is the commitlog's to drop, and it has (D26): the
-        // shipper has no hold left to release.
+        // A failed close is the commitlog's to drop, and it has: the shipper
+        // has no hold left to release.
         shipper.segment_closed(10, 4096, true);
         BOOST_REQUIRE(probe.released.empty());
     });
@@ -2233,6 +2252,389 @@ SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_once_shipping_started_is_still_upload
             return shipper.segments_shipped() == 1;
         });
         BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{12});
+    });
+}
+
+// The chain a shard ships into: its identity, and the floor that keeps a
+// segment written before it out of it.
+
+// The identity appears when start_shipping() takes effect, and nothing changes
+// it afterwards: a chain belongs to one shard of one boot.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_chain_identity_is_set_when_shipping_starts) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        // A chain here would name coverage nothing is shipping for.
+        BOOST_REQUIRE(!shipper.chain());
+        BOOST_REQUIRE(!shipper.chain_floor());
+
+        const auto before = api::new_timestamp();
+        shipper.note_cluster_size(1);
+        shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(5));
+        BOOST_REQUIRE(shipper.chain());
+        const auto chain = *shipper.chain();
+        BOOST_REQUIRE_EQUAL(chain.prefix, "chains");
+        BOOST_REQUIRE_EQUAL(chain.host_id, test_host_id);
+        BOOST_REQUIRE_EQUAL(chain.shard, seastar::this_shard_id());
+        BOOST_REQUIRE_EQUAL(chain.boot_epoch_us, test_boot_epoch_us);
+        BOOST_REQUIRE_GE(chain.chain_start_us, before);
+        BOOST_REQUIRE(chain.chain != chain_id::create_null_id());
+        BOOST_REQUIRE_EQUAL(shipper.chain_floor().value(), db::segment_id_type(5));
+
+        // A second call is ignored, floor and identity included.
+        shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(9));
+        BOOST_REQUIRE(*shipper.chain() == chain);
+        BOOST_REQUIRE_EQUAL(shipper.chain_floor().value(), db::segment_id_type(5));
+    });
+}
+
+// Two shippers never share a chain id: a restore walks one chain, and two
+// chains under one id would read as a single unbroken run of segments.
+SEASTAR_THREAD_TEST_CASE(test_pitr_two_shippers_get_different_chains) {
+    ship_probe first;
+    ship_probe second;
+    with_shipping(first, [&](pitr_shipper& a) {
+        with_shipping(second, [&](pitr_shipper& b) {
+            BOOST_REQUIRE(a.chain());
+            BOOST_REQUIRE(b.chain());
+            BOOST_REQUIRE(a.chain()->chain != b.chain()->chain);
+        });
+    });
+}
+
+// Below the floor is the time before the chain. Closes are not ordered by id,
+// so such a close arrives after shipping has started; shipping it would put a
+// segment in the chain that the chain's own start does not cover.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_below_the_chain_floor_is_released_and_not_shipped) {
+    ship_probe probe;
+    probe.floor = 30;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[29] = make_segment_file(probe.dir, 29, used);
+        shipper.segment_closed(29, used, false);
+
+        // The release is synchronous, so an upload started here would show.
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{29});
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+        BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+        BOOST_REQUIRE(!probe.has_object(29));
+    });
+}
+
+// The floor itself is in the chain: it is the segment the chain starts at.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_at_the_chain_floor_is_shipped) {
+    ship_probe probe;
+    probe.floor = 30;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        constexpr size_t used = 4096;
+        probe.paths[30] = make_segment_file(probe.dir, 30, used);
+        probe.paths[31] = make_segment_file(probe.dir, 31, used);
+        shipper.segment_closed(30, used, false);
+        shipper.segment_closed(31, used, false);
+        // Nothing has yielded since the closes, so a floor that released the
+        // segment at the floor shows here, rather than only as a wait that
+        // never finishes below.
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(shipper.uploads_in_flight(), 2u);
+
+        wait_until([&] {
+            return shipper.segments_shipped() == 2;
+        });
+
+        BOOST_REQUIRE_EQUAL(probe.object_of(30).size(), used);
+        BOOST_REQUIRE_EQUAL(probe.object_of(31).size(), used);
+    });
+}
+
+// A failed close below the floor has no hold left either: the commitlog has
+// dropped it, so releasing again is not the shipper's to do.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_close_below_the_chain_floor_releases_nothing) {
+    ship_probe probe;
+    probe.floor = 30;
+    with_shipping(probe, [&](pitr_shipper& shipper) {
+        shipper.segment_closed(29, 4096, true);
+
+        BOOST_REQUIRE(probe.released.empty());
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+        // Not a hole in the chain: the segment was written before the chain
+        // began, so it was never going to be in it.
+        BOOST_REQUIRE_EQUAL(shipper.segments_unshipped(), 0u);
+    });
+}
+
+// A close that arrives once stop() has begun: the chain ends at the last
+// segment shipped before it, and the hold goes rather than being left pinned.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_stop_began_is_released_and_not_shipped) {
+    ship_probe probe;
+    tmpdir dir;
+    probe.dir = dir.path().string();
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    shipper.set_release_hook(probe.release_hook());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin());
+
+    // Nothing is in flight, so the stop is done; the release hook outlives it.
+    shipper.stop().get();
+    constexpr size_t used = 4096;
+    probe.paths[40] = make_segment_file(probe.dir, 40, used);
+    shipper.segment_closed(40, used, false);
+
+    BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{40});
+    BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+    BOOST_REQUIRE_EQUAL(shipper.segments_shipped(), 0u);
+}
+
+// The keys a shipped segment is stored under, which a restore has to find.
+
+namespace {
+
+// Stops a shipper exactly once: stop() may not be called twice, and a test
+// that stops it itself must still be unwound if an assertion throws first.
+class stop_once {
+    pitr_shipper& _shipper;
+    bool _stopped = false;
+
+public:
+    explicit stop_once(pitr_shipper& shipper)
+        : _shipper(shipper) {
+    }
+    void stop() {
+        if (!std::exchange(_stopped, true)) {
+            _shipper.stop().get();
+        }
+    }
+    // For a test that called stop() itself.
+    void took_effect() noexcept {
+        _stopped = true;
+    }
+    ~stop_once() {
+        try {
+            stop();
+        } catch (...) {
+            BOOST_ERROR(seastar::format("stopping the shipper failed: {}", std::current_exception()));
+        }
+    }
+};
+
+// An active shipper with a chain and no upload of its own, for the hooks and
+// the flush. The body gets the guard, so that it can stop the shipper itself.
+template <typename Func>
+void with_an_active_shipper(ship_probe& probe, Func&& f) {
+    auto cfg = make_config(hand_driven_config());
+    pitr_shipper shipper(*cfg);
+    shipper.start().get();
+    shipper.note_cluster_size(1);
+    stop_once stopping(shipper);
+    shipper.set_release_hook(probe.release_hook());
+    shipper.start_shipping(seastar::make_shared<fake_client>(probe.store), probe.hooks(), test_origin(probe.floor));
+    f(shipper, stopping);
+}
+
+} // namespace
+
+// A segment is stored under its own chain's key, keeping its file name, which
+// is what carries its id to a restore.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_store_a_segment_under_its_chain) {
+    ship_probe probe;
+    tmpdir dir;
+    probe.dir = dir.path().string();
+    with_an_active_shipper(probe, [&](pitr_shipper& shipper, stop_once&) {
+        const auto path = make_segment_file(probe.dir, 42, 4096);
+        auto hooks = make_segment_hooks(shipper, [&](db::segment_id_type id) -> std::optional<seastar::sstring> {
+            if (id != 42) {
+                return std::nullopt;
+            }
+            return path;
+        });
+
+        const auto name = hooks.object_name_of(42);
+        BOOST_REQUIRE_EQUAL(std::string(name.bucket()), std::string("pitr-bucket"));
+        BOOST_REQUIRE_EQUAL(std::string(name.object()), std::string(segment_object_key(*shipper.chain(), "CommitLog-4-42.log")));
+        // The key is under this chain's own directory, not just somewhere in
+        // the bucket: another chain's restore must not read it.
+        BOOST_REQUIRE(name.object().starts_with(chain_key_prefix(*shipper.chain())));
+
+        // The handle is a fresh one on that file, not the commitlog's.
+        auto f = hooks.open_segment(42).get();
+        auto close_f = seastar::defer([&f]() noexcept {
+            f.close().get();
+        });
+        BOOST_REQUIRE_EQUAL(f.size().get(), 4096u);
+
+        // A segment the commitlog no longer holds cannot be shipped, and both
+        // hooks say so rather than making up a name or a path.
+        BOOST_REQUIRE_THROW(hooks.object_name_of(43), std::runtime_error);
+        BOOST_REQUIRE_THROW(hooks.open_segment(43).get(), std::runtime_error);
+    });
+}
+
+// The hooks are installed before the chain exists in the wiring, so they must
+// refuse to name an object rather than store one outside any chain.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_hooks_refuse_to_name_an_object_without_a_chain) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        auto hooks = make_segment_hooks(shipper, [](db::segment_id_type) {
+            return std::optional<seastar::sstring>("/tmp/CommitLog-4-1.log");
+        });
+        BOOST_REQUIRE(!shipper.chain());
+        BOOST_REQUIRE_THROW(hooks.object_name_of(1), std::runtime_error);
+    });
+}
+
+// The one flush the wiring owes once shipping has started, so that a table
+// nothing writes to again cannot keep a later backup's bound below the chain.
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_flush_after_start_runs_and_stop_waits_for_it) {
+    ship_probe probe;
+    with_an_active_shipper(probe, [&](pitr_shipper& shipper, stop_once& stopping) {
+        int flushes = 0;
+        seastar::shared_promise<> hold;
+        shipper.flush_after_start([&]() {
+            ++flushes;
+            return hold.get_shared_future();
+        });
+        wait_until([&] {
+            return flushes == 1;
+        });
+
+        auto stopped = shipper.stop();
+        settle();
+        // The flush runs inside the gate stop() waits for, so it cannot be
+        // left running after the shipper it belongs to is gone.
+        BOOST_REQUIRE(!stopped.available());
+        hold.set_value();
+        stopped.get();
+        stopping.took_effect();
+        BOOST_REQUIRE_EQUAL(flushes, 1);
+    });
+}
+
+// A flush is an optimisation for a later backup's bound, not part of the
+// chain: a failure is logged and shipping goes on.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_failed_flush_after_start_breaks_nothing) {
+    ship_probe probe;
+    with_an_active_shipper(probe, [&](pitr_shipper& shipper, stop_once&) {
+        bool ran = false;
+        shipper.flush_after_start([&]() -> future<> {
+            ran = true;
+            co_await seastar::yield();
+            throw std::runtime_error("flushing failed");
+        });
+        wait_until([&] {
+            return ran;
+        });
+        settle();
+
+        BOOST_REQUIRE(shipper.active());
+        BOOST_REQUIRE(!shipper.break_reason());
+    });
+}
+
+// Nothing to keep a bound for: a shipper that is not shipping must not run the
+// node's startup flush behind the operator's back.
+SEASTAR_THREAD_TEST_CASE(test_pitr_the_flush_after_start_is_dropped_while_shipping_is_off) {
+    ship_probe probe;
+    int flushes = 0;
+    auto flush = [&flushes]() {
+        ++flushes;
+        return make_ready_future<>();
+    };
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        // Waiting for the cluster size, then refused for its node count.
+        shipper.flush_after_start(flush);
+        shipper.note_cluster_size(2);
+        shipper.flush_after_start(flush);
+        settle();
+        BOOST_REQUIRE_EQUAL(flushes, 0);
+    });
+
+    // And once the shipper has stopped, where the gate would reject it anyway.
+    with_an_active_shipper(probe, [&](pitr_shipper& shipper, stop_once& stopping) {
+        stopping.stop();
+        shipper.flush_after_start(flush);
+        settle();
+        BOOST_REQUIRE_EQUAL(flushes, 0);
+    });
+}
+
+// pitr_endpoint naming an endpoint the node was not configured with: there is
+// nowhere to ship, so shipping is refused with a reason naming the option.
+
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_unknown_endpoint_refuses_shipping) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        with_probe(shipper, [&] {
+            note_cluster_size_on_all_shards(shipper, 1);
+            start_sealing_on_all_shards(shipper);
+            require_state_on_all_shards(shipper, shipping_state::active);
+
+            shipper.invoke_on_all(&pitr_shipper::note_endpoint_unknown).get();
+            require_state_on_all_shards(shipper, shipping_state::off_unknown_endpoint);
+            shipper.invoke_on_all([](pitr_shipper& s) {
+                       tests::require(s.break_reason().has_value());
+                       tests::require(s.break_reason()->find("pitr_endpoint") != seastar::sstring::npos);
+                       tests::require(s.break_reason()->find("restart") != seastar::sstring::npos);
+                       // Nothing to seal for, and the refusal is latched.
+                       tests::require(!s.sealing_scheduled());
+                       s.note_cluster_size(1);
+                       tests::require_equal(s.state(), shipping_state::off_unknown_endpoint);
+                   })
+                    .get();
+            tick_and_wait_on_all_shards(shipper);
+            shipper.invoke_on_all([](pitr_shipper&) {
+                       tests::require_equal(the_probe.seals_started, 0);
+                   })
+                    .get();
+        });
+    });
+}
+
+// A configured endpoint whose client cannot be built: shipping is off with the
+// cause in the reason, and the node is left to carry on.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_store_client_that_cannot_be_built_refuses_shipping) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.note_cluster_size(1);
+        shipper.note_store_client_failed("endpoint http://localhost:9000 not found");
+
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_store_client_failed);
+        BOOST_REQUIRE(shipper.break_reason().has_value());
+        BOOST_REQUIRE(shipper.break_reason()->find("not found") != seastar::sstring::npos);
+        BOOST_REQUIRE(shipper.break_reason()->find("restart") != seastar::sstring::npos);
+        // Latched, and a close after it releases its hold at once.
+        shipper.note_cluster_size(1);
+        BOOST_REQUIRE_EQUAL(shipper.state(), shipping_state::off_store_client_failed);
+        shipper.segment_closed(45, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{45});
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
+    });
+}
+
+// A refusal that came first stands: the reason the operator is shown must be
+// the one that stopped shipping.
+SEASTAR_THREAD_TEST_CASE(test_pitr_an_unknown_endpoint_does_not_overwrite_an_earlier_refusal) {
+    auto cfg = make_config(hand_driven_config());
+
+    with_shipper(*cfg, [](seastar::sharded<pitr_shipper>& shipper) {
+        note_cluster_size_on_all_shards(shipper, 2);
+        require_state_on_all_shards(shipper, shipping_state::off_multi_node);
+        shipper.invoke_on_all(&pitr_shipper::note_endpoint_unknown).get();
+        require_state_on_all_shards(shipper, shipping_state::off_multi_node);
+    });
+}
+
+// A close after the refusal is released at once, as after any other break:
+// there is no chain left to pin a segment for.
+SEASTAR_THREAD_TEST_CASE(test_pitr_a_close_after_an_unknown_endpoint_releases_the_hold) {
+    ship_probe probe;
+    with_a_shipper_not_shipping_yet(probe, [&](pitr_shipper& shipper) {
+        shipper.note_cluster_size(1);
+        shipper.note_endpoint_unknown();
+        shipper.segment_closed(44, 4096, false);
+        BOOST_REQUIRE(probe.released == std::vector<db::segment_id_type>{44});
+        BOOST_REQUIRE_EQUAL(probe.store.sinks_created, 0u);
     });
 }
 
