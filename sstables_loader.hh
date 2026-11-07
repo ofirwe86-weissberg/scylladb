@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <vector>
 #include <seastar/core/sharded.hh>
+#include "db/pitr/replay_to.hh"
 #include "dht/i_partitioner_fwd.hh"
 #include "dht/token.hh"
 #include "schema/schema_fwd.hh"
@@ -133,6 +134,15 @@ private:
     future<> do_restore_tablets(tablet_restore_progress& progress, table_id, const sstring& snap_name, size_t tablet_count,
             std::optional<size_t> original_min_tablet_count, std::optional<size_t> original_max_tablet_count);
 
+    // The body of one point-in-time replay task: the checks, the durable mark
+    // and, after them, the load of the backup. Runs on shard 0, which owns the
+    // task and the in-flight set; the task holds the parameters it refers to.
+    future<> do_pitr_replay_to(const db::pitr::replay_to_params& params, abort_source& as);
+
+    // Shard 0's only. Two calls on one target meet here whichever shards they
+    // arrived on, so one of them is refused rather than writing over the other.
+    db::pitr::replay_in_flight _pitr_replays;
+
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
     future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
     future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
@@ -175,6 +185,15 @@ public:
     future<tasks::task_id> download_new_sstables(sstring ks_name, sstring cf_name,
             sstring prefix, std::vector<sstring> sstables,
             sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica);
+
+    /**
+     * Start a point-in-time recovery of one table: check the target and the
+     * backup, mark the target as being replayed into, and load the backup's
+     * sstables into it. The backup is named, not listed: its sstables come
+     * from its own manifest. Refuses, with a reason the task carries, before
+     * anything is loaded. May be called on any shard; the task runs on shard 0.
+     */
+    future<tasks::task_id> pitr_replay_to(db::pitr::replay_to_params params);
 
     // Takes one backup location per datacenter the keyspace replicates to.
     future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, std::vector<tablet_restore_location> locations);

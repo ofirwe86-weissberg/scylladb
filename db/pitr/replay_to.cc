@@ -14,7 +14,9 @@
 #include <exception>
 #include <utility>
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/coroutine.hh>
+#include <seastar/core/iostream.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/format.hh>
@@ -22,6 +24,14 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/util/file.hh>
 
+#include "cql3/description.hh"
+#include "db/pitr/t_parser.hh"
+#include "replica/database.hh"
+#include "replica/memtable.hh"
+#include "replica/schema_describe_helper.hh"
+#include "schema/schema.hh"
+#include "sstables/object_storage_client.hh"
+#include "sstables/sstables_manager.hh"
 #include "utils/log.hh"
 
 namespace db::pitr {
@@ -215,6 +225,198 @@ future<std::optional<refusal>> check_schema_match(std::string_view target_cql, s
             .message = "The target table's schema differs from the backup's in more than its name, its id and its compaction options. Create the target from "
                        "the backup's schema.cql, with compaction disabled.",
             .detail = seastar::format("the statements differ at line {} of the comparison", line),
+    };
+}
+
+// Reads one whole file of the backup, or nothing when the store does not hold
+// it. A read error is told from an absent object by asking the store, so a
+// failing read never reads as a backup taken without the file.
+//
+// The key parts come by value: this suspends, and a reference parameter would
+// outlive nothing a caller passing a literal built.
+static future<std::optional<sstring>> read_backup_file(
+        sstables::object_storage_client& client, sstring bucket, sstring prefix, sstring name, size_t cap, abort_source& as) {
+    auto object = sstables::object_name(bucket, prefix, name);
+    std::exception_ptr read_error;
+    sstring body;
+    try {
+        auto is = input_stream<char>(client.make_download_source(object, &as));
+        std::exception_ptr ex;
+        try {
+            // One byte over the cap tells an oversized object from a read this
+            // code truncated itself; either way the parse refuses it.
+            while (body.size() <= cap) {
+                auto buf = co_await is.read();
+                if (buf.empty()) {
+                    break;
+                }
+                body.append(buf.get(), buf.size());
+            }
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        co_await is.close();
+        if (ex) {
+            std::rethrow_exception(std::move(ex));
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    if (read_error) {
+        if (co_await client.object_exists(object, &as)) {
+            std::rethrow_exception(std::move(read_error));
+        }
+        replay_log.info("the backup holds no {}", object);
+        co_return std::nullopt;
+    }
+    if (body.size() > cap) {
+        throw std::runtime_error(seastar::format("{} is larger than the {} bytes a replay reads", object, cap));
+    }
+    co_return std::move(body);
+}
+
+static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, sstring detail) {
+    replay_log.warn("refusing the replay: {} ({})", message, detail);
+    return std::unexpected(refusal{.reason = reason, .message = std::move(message), .detail = std::move(detail)});
+}
+
+replay_in_flight::guard::~guard() {
+    if (_owner) {
+        _owner->_targets.erase(_target);
+    }
+}
+
+std::optional<replay_in_flight::guard> replay_in_flight::try_take(::table_id target) {
+    if (!_targets.insert(target).second) {
+        return std::nullopt;
+    }
+    return guard(*this, target);
+}
+
+future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
+        std::filesystem::path state_dir, const replay_to_params& p, abort_source& as) {
+    auto t = parse_t(p.t);
+    if (!t) {
+        co_return std::unexpected(t.error());
+    }
+    if (p.endpoint.empty() || p.bucket.empty() || !sm.is_known_endpoint(p.endpoint)) {
+        co_return refuse(refusal_reason::store_location_missing,
+                "The replay was given no object-storage location this node knows, so the backup cannot be read. Name a configured endpoint and its bucket.",
+                seastar::format("endpoint='{}' bucket='{}'", p.endpoint, p.bucket));
+    }
+
+    auto& local = db.local();
+    if (!local.has_schema(p.keyspace, p.table)) {
+        co_return refuse(refusal_reason::target_missing,
+                "The target table does not exist. Create it from the backup's schema.cql with compaction disabled, then call the replay again.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+    auto target_schema = local.find_schema(p.keyspace, p.table);
+    auto target = target_schema->id();
+
+    // Before the first suspension point, so that two calls cannot both pass
+    // this and both go on to write a mark.
+    auto held = in_flight.try_take(target);
+    if (!held) {
+        co_return refuse(refusal_reason::replay_already_running,
+                "A replay is already running into the target table. Wait for it to end, or replay into a table created for it.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+
+    // Every shard, because the target is one table on all of them: compaction
+    // left on on one shard purges that shard's tombstones.
+    auto compacting_shards = co_await db.map_reduce0(
+            [target](replica::database& db) {
+                return size_t(!db.find_column_family(target).is_auto_compaction_disabled_by_user());
+            },
+            size_t(0), std::plus<size_t>());
+    if (compacting_shards) {
+        co_return refuse(refusal_reason::target_auto_compaction_enabled,
+                "Auto-compaction is enabled on the target table, so a compaction could purge a tombstone before the writes it covers are replayed. Disable it "
+                "on the table and call the replay again.",
+                seastar::format("{}.{}, on {} shard(s)", p.keyspace, p.table, compacting_shards));
+    }
+
+    // Sstables and the memtables that hold writes this node took: a replay
+    // writes the backup and then the history over the target, and could not
+    // tell its own writes from whatever was there before.
+    auto occupied_shards = co_await db.map_reduce0(
+            [target](replica::database& db) {
+                auto& t = db.find_column_family(target);
+                size_t occupied = t.sstables_count();
+                t.for_each_active_memtable([&occupied](replica::memtable& m) {
+                    occupied += m.empty() ? 0 : 1;
+                });
+                return occupied;
+            },
+            size_t(0), std::plus<size_t>());
+    if (occupied_shards) {
+        co_return refuse(refusal_reason::target_not_empty,
+                "The target table is not empty. A replay writes over it, so it must be a table nothing has been written to.",
+                seastar::format("{}.{}", p.keyspace, p.table));
+    }
+
+    auto mark_path = replay_state_path(state_dir, target);
+    std::optional<replay_state> existing;
+    try {
+        existing = co_await read_replay_state(state_dir, target);
+    } catch (...) {
+        // A mark that cannot be read is not a table no replay ever touched.
+        co_return refuse(refusal_reason::target_already_replayed,
+                "A replay already ran into the target table and its mark cannot be read. Replay into a table created for it.",
+                seastar::format("{}: {}", mark_path.native(), std::current_exception()));
+    }
+    if (existing) {
+        co_return refuse(refusal_reason::target_already_replayed, "A replay already ran into the target table. Replay into a table created for it.",
+                seastar::format("{} says {}, from backup '{}' to {}", mark_path.native(), phase_name(existing->phase), existing->snapshot, existing->t));
+    }
+
+    auto client = sm.get_endpoint_client(p.endpoint);
+    auto bound_body = co_await read_backup_file(*client, p.bucket, p.prefix, bound_file_name, max_bound_file_size, as);
+    if (!bound_body) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup carries no point-in-time recovery bound, so where its sstables end and the replay starts is unknown. It was taken with shipping "
+                "off, or the prefix names another backup.",
+                seastar::format("{}/{}", p.prefix, bound_file_name));
+    }
+    bound_file bound;
+    try {
+        bound = decode_bound_file(*bound_body);
+    } catch (const bound_file_format_error&) {
+        co_return refuse(refusal_reason::bound_file_damaged,
+                "The backup's point-in-time recovery bound is damaged, so where the replay starts cannot be proved. Restore from another backup.",
+                seastar::format("{}/{}: {}", p.prefix, bound_file_name, std::current_exception()));
+    }
+
+    auto backup_cql = co_await read_backup_file(*client, p.bucket, p.prefix, schema_cql_file_name, max_schema_cql_size, as);
+    if (!backup_cql) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup carries no schema, so the target cannot be checked against it. The prefix names another backup.",
+                seastar::format("{}/{}", p.prefix, schema_cql_file_name));
+    }
+    auto describe_helper = replica::make_schema_describe_helper(target_schema, local.as_data_dictionary());
+    auto target_cql = target_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
+    if (auto mismatch = co_await check_schema_match(target_cql, *backup_cql)) {
+        replay_log.warn("refusing the replay: {}", *mismatch);
+        co_return std::unexpected(std::move(*mismatch));
+    }
+
+    // Last, so that every refusal above leaves the node as it was. From here on
+    // the target reads as `incomplete` until a replay writes `done` over it.
+    co_await write_replay_state(state_dir, target,
+            replay_state{
+                    .phase = replay_phase::started,
+                    .snapshot = p.snapshot,
+                    .t = p.t,
+                    .started_at_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count(),
+            });
+    replay_log.info("replay of backup '{}' into {}.{} to {} started: {} shard(s) in the bound, captured at {}us", p.snapshot, p.keyspace, p.table, p.t,
+            bound.shards.size(), bound.capture_time_us);
+    co_return replay_start{
+            .target = target,
+            .t = *t,
+            .bound = std::move(bound),
+            .in_flight = std::move(*held),
     };
 }
 

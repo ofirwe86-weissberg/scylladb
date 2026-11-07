@@ -444,6 +444,17 @@ class ScyllaRESTAPIClient:
                 params[key] = value
         return await self.client.post_json(f"/storage_service/backup", host=node_ip, params=params)
 
+    async def pitr_replay_to(self, node_ip: str, ks: str, cf: str, endpoint: str, bucket: str, prefix: str, snapshot: str, t: str) -> str:
+        """Start a point-in-time recovery of keyspace:table from a backup, to time t"""
+        params = {"keyspace": ks,
+                  "table": cf,
+                  "endpoint": endpoint,
+                  "bucket": bucket,
+                  "prefix": prefix,
+                  "snapshot": snapshot,
+                  "t": t}
+        return await self.client.post_json("/storage_service/pitr/replay_to", host=node_ip, params=params)
+
     async def restore(self, node_ip: str, ks: str, cf: str, dest: str, bucket: str, prefix: str, sstables: list[str], scope: str = None, primary_replica_only=False) -> str:
         """Restore keyspace:table from backup"""
         params = {"keyspace": ks,

@@ -22,11 +22,14 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <seastar/core/abort_source.hh>
 #include <seastar/core/fstream.hh>
 #include <seastar/core/seastar.hh>
 #include <seastar/util/file.hh>
 
 #include "cql3/description.hh"
+#include "db/config.hh"
+#include "sstables/sstables_manager.hh"
 #include "db/pitr/replay_to.hh"
 #include "replica/database.hh"
 #include "replica/schema_describe_helper.hh"
@@ -40,6 +43,7 @@ BOOST_AUTO_TEST_SUITE(pitr_replay_to_test)
 
 namespace {
 
+constexpr const char* test_endpoint = "https://pitr-replay.test";
 constexpr const char* ks_name = "ks";
 
 const ::table_id test_target{utils::UUID("55556666-0000-4000-8000-00000000000c")};
@@ -61,11 +65,51 @@ void write_raw(const std::filesystem::path& path, std::string_view body) {
     out.close().get();
 }
 
+refusal refusal_of(cql_test_env& e, const tmpdir& state_dir, const replay_to_params& params, replay_in_flight& in_flight) {
+    abort_source as;
+    auto result = start_replay_to(e.db(), e.get_sstorage_manager().local(), in_flight, state_dir.path(), params, as).get();
+    BOOST_REQUIRE_MESSAGE(!result, "the replay was not refused");
+    return result.error();
+}
+
 // The statement a snapshot writes to schema.cql, from this node's own describe.
 sstring schema_cql_of(cql_test_env& e, const sstring& table) {
     auto s = e.local_db().find_schema(ks_name, table);
     auto helper = replica::make_schema_describe_helper(s, e.local_db().as_data_dictionary());
     return s->describe(helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
+}
+
+// Nothing talks to the endpoint: every check these tests reach runs before the
+// first read, and building a client does no I/O.
+cql_test_config replay_config() {
+    auto cfg = cql_test_config();
+    ::setenv("AWS_ACCESS_KEY_ID", "pitr-test-key", 0);
+    ::setenv("AWS_SECRET_ACCESS_KEY", "pitr-test-secret", 0);
+    ::setenv("AWS_DEFAULT_REGION", "local", 0);
+    cfg.db_config->object_storage_endpoints({db::object_storage_endpoint_param(db::object_storage_endpoint_param::s3_storage{
+            .endpoint = test_endpoint,
+            .region = "local",
+            .iam_role_arn = "",
+            .legacy_format = false,
+    })});
+    return cfg;
+}
+
+replay_to_params params_for(const sstring& table, const sstring& t = "2026-11-04T14:05:00.000000Z") {
+    return replay_to_params{
+            .endpoint = test_endpoint,
+            .bucket = "pitr-bucket",
+            .prefix = "cf1/backup-1",
+            .keyspace = ks_name,
+            .table = table,
+            .snapshot = "backup-1",
+            .t = t,
+    };
+}
+
+refusal refusal_of(cql_test_env& e, const tmpdir& state_dir, const replay_to_params& params) {
+    replay_in_flight in_flight;
+    return refusal_of(e, state_dir, params, in_flight);
 }
 
 } // namespace
@@ -171,6 +215,152 @@ SEASTAR_TEST_CASE(a_target_missing_the_backups_dropped_column_is_refused) {
         BOOST_REQUIRE(refused);
         BOOST_REQUIRE(refused->code() == "target_schema_differs");
     });
+}
+
+
+// Two calls on one target would write over each other's work, and the second
+// one cannot tell its own writes from the first one's (P62).
+BOOST_AUTO_TEST_CASE(one_target_takes_one_replay_at_a_time) {
+    replay_in_flight in_flight;
+    auto first = in_flight.try_take(test_target);
+    BOOST_REQUIRE(first);
+    BOOST_REQUIRE(in_flight.holds(test_target));
+    BOOST_REQUIRE(!in_flight.try_take(test_target));
+}
+
+BOOST_AUTO_TEST_CASE(another_target_is_not_blocked_by_a_running_replay) {
+    replay_in_flight in_flight;
+    auto first = in_flight.try_take(test_target);
+    BOOST_REQUIRE(in_flight.try_take(::table_id(utils::UUID("77778888-0000-4000-8000-00000000000d"))));
+}
+
+// The target is free again when the run ends, however it ended.
+BOOST_AUTO_TEST_CASE(a_target_is_released_when_its_replay_ends) {
+    replay_in_flight in_flight;
+    {
+        auto held = in_flight.try_take(test_target);
+        BOOST_REQUIRE(held);
+    }
+    BOOST_REQUIRE(!in_flight.holds(test_target));
+    BOOST_REQUIRE(in_flight.try_take(test_target));
+}
+
+SEASTAR_TEST_CASE(a_malformed_t_is_refused_before_anything_else) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                // No target and no store location either: T is answered first, so a
+                // user fixing one thing at a time is told about T.
+                auto params = params_for("nothing", "2026-11-04 14:05:00");
+                params.endpoint = "";
+                BOOST_REQUIRE(refusal_of(e, state_dir, params).code() == "t_invalid");
+            },
+            replay_config());
+}
+
+SEASTAR_TEST_CASE(a_store_location_this_node_does_not_know_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                auto params = params_for("nothing");
+                params.endpoint = "https://not-configured.test";
+                BOOST_REQUIRE(refusal_of(e, state_dir, params).code() == "store_location_missing");
+            },
+            replay_config());
+}
+
+SEASTAR_TEST_CASE(a_target_that_does_not_exist_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("nothing")).code() == "target_missing");
+            },
+            replay_config());
+}
+
+// A compaction during the replay purges a tombstone before the writes it
+// covers are replayed, so a target with auto-compaction on is refused before
+// anything is loaded.
+SEASTAR_TEST_CASE(a_target_with_auto_compaction_enabled_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target")).code() == "target_auto_compaction_enabled");
+            },
+            replay_config());
+}
+
+SEASTAR_TEST_CASE(a_target_holding_data_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+                e.db().invoke_on_all([](replica::database& db) {
+                          return db.find_column_family(ks_name, "target").disable_auto_compaction();
+                      }).get();
+                e.execute_cql("INSERT INTO ks.target (pk, value) VALUES ('a', 1)").get();
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target")).code() == "target_not_empty");
+            },
+            replay_config());
+}
+
+// A second call on a table a replay already ran into is refused, not answered
+// from the first run's result (P62).
+SEASTAR_TEST_CASE(a_target_already_replayed_into_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+                e.db().invoke_on_all([](replica::database& db) {
+                          return db.find_column_family(ks_name, "target").disable_auto_compaction();
+                      }).get();
+                auto target = e.local_db().find_schema(ks_name, "target")->id();
+                write_replay_state(state_dir.path(), target, make_state()).get();
+                auto refused = refusal_of(e, state_dir, params_for("target"));
+                BOOST_REQUIRE(refused.code() == "target_already_replayed");
+                // The reason names the mark, so an operator can read what ran before.
+                BOOST_REQUIRE(refused.detail.find("backup-1") != sstring::npos);
+            },
+            replay_config());
+}
+
+// A mark that cannot be read means a replay ran and left damage behind, which
+// is not the same as a target no replay ever touched.
+SEASTAR_TEST_CASE(a_target_whose_mark_is_unreadable_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+                e.db().invoke_on_all([](replica::database& db) {
+                          return db.find_column_family(ks_name, "target").disable_auto_compaction();
+                      }).get();
+                auto target = e.local_db().find_schema(ks_name, "target")->id();
+                write_raw(replay_state_path(state_dir.path(), target), "not a mark\n");
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target")).code() == "target_already_replayed");
+            },
+            replay_config());
+}
+
+
+// A second call while the first run holds the target is refused, rather than
+// writing the backup over the first run's work (P62).
+SEASTAR_TEST_CASE(a_second_call_on_a_target_a_replay_is_running_into_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int)").get();
+                e.db().invoke_on_all([](replica::database& db) {
+                          return db.find_column_family(ks_name, "target").disable_auto_compaction();
+                      }).get();
+                // What the first run holds while it is loading, taken by hand:
+                // the first call's own guard lives inside its result.
+                replay_in_flight in_flight;
+                auto first = in_flight.try_take(e.local_db().find_schema(ks_name, "target")->id());
+                BOOST_REQUIRE(first);
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target"), in_flight).code() == "replay_already_running");
+            },
+            replay_config());
 }
 
 BOOST_AUTO_TEST_SUITE_END()

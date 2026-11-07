@@ -975,6 +975,78 @@
           ]
       },
       {
+          "path":"/storage_service/pitr/replay_to",
+          "operations":[
+              {
+                  "method":"POST",
+                  "summary":"Starts a point-in-time recovery of one table to time T: loads a backup into an empty target table and, after it, replays the shipped commitlog history up to T. Refuses, with a reason, before anything is loaded, if the target or the backup is not fit for it",
+                  "type":"string",
+                  "nickname":"pitr_replay_to",
+                  "produces":[
+                      "application/json"
+                  ],
+                  "parameters":[
+                      {
+                          "name":"endpoint",
+                          "description":"ID of the configured object storage endpoint the backup was written to",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"bucket",
+                          "description":"Name of the bucket holding the backup",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"prefix",
+                          "description":"The prefix of the object keys of the backup, the same one the backup was written with. The backup's own manifest under it names the SSTables to load",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"keyspace",
+                          "description":"Name of the keyspace of the target table, which must exist and be empty",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"table",
+                          "description":"Name of the target table, which must exist, be empty and have auto-compaction disabled",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"snapshot",
+                          "description":"Name of the snapshot the backup was taken from, recorded with the target so that its state names the backup it came from",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      },
+                      {
+                          "name":"t",
+                          "description":"The time to recover to, as YYYY-MM-DDThh:mm:ss[.ffffff]Z, UTC only",
+                          "required":true,
+                          "allowMultiple":false,
+                          "type":"string",
+                          "paramType":"query"
+                      }
+                  ]
+              }
+          ]
+      },
+      {
          "path":"/storage_service/tablets/restore",
          "operations":[
             {
