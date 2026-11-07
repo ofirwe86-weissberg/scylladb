@@ -14,7 +14,6 @@
 #include <filesystem>
 #include <optional>
 #include <string_view>
-#include <unordered_set>
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sharded.hh>
@@ -22,6 +21,7 @@
 
 #include "db/pitr/bound_file.hh"
 #include "db/pitr/refusal.hh"
+#include "db/pitr/replay_target.hh"
 #include "mutation/timestamp.hh"
 #include "schema/schema_fwd.hh"
 #include "seastarx.hh"
@@ -41,62 +41,9 @@ class object_storage_client;
 
 namespace db::pitr {
 
-// The endpoint's parameters as they arrived. T stays text: a malformed one is
-// ordinary user input and comes back as a refusal, not as a bad request. There
-// is no list of sstables: a replay takes them from the backup itself.
-struct replay_to_params {
-    // The same three the restore endpoint takes.
-    sstring endpoint;
-    sstring bucket;
-    sstring prefix;
-    // The target the backup is replayed into, which the user created.
-    sstring keyspace;
-    sstring table;
-    // The backup, as its snapshot was named; recorded in the mark.
-    sstring snapshot;
-    sstring t;
-};
-
 // A larger schema.cql is damage or a wrong prefix, and is refused unread.
 constexpr size_t max_schema_cql_size = 1024 * 1024;
-
 constexpr const char* schema_cql_file_name = "schema.cql";
-
-// The targets a replay is running into on this node, so that a second call on
-// one target is refused rather than writing over the first one's work (P62).
-// One instance, on shard 0, which is where every replay's checks and mark run.
-class replay_in_flight {
-    std::unordered_set<::table_id> _targets;
-
-public:
-    // Holds one target for as long as the run lasts. Not copied, and released
-    // on every path out of the run, a failure and a shutdown included.
-    class guard {
-        replay_in_flight* _owner = nullptr;
-        ::table_id _target;
-
-    public:
-        guard() = default;
-        guard(replay_in_flight& owner, ::table_id target) noexcept
-            : _owner(&owner)
-            , _target(target) {
-        }
-        guard(const guard&) = delete;
-        guard& operator=(const guard&) = delete;
-        guard(guard&& o) noexcept
-            : _owner(std::exchange(o._owner, nullptr))
-            , _target(o._target) {
-        }
-        guard& operator=(guard&&) = delete;
-        ~guard();
-    };
-
-    // `nullopt` when a replay is already running into this target.
-    std::optional<guard> try_take(::table_id target);
-    bool holds(::table_id target) const {
-        return _targets.contains(target);
-    }
-};
 
 // `incomplete` until `done` replaces `started` (requirement 12).
 enum class replay_phase {
@@ -166,9 +113,8 @@ struct replay_start {
 // a plainly wrong call never reaches the store, and the mark is written last,
 // so a refusal leaves the node as it was.
 //
-// Runs on shard 0: `in_flight` is that shard's, and two calls on one target
-// meet there whichever shards they arrived on.
-//
+// Runs on shard 0: `in_flight` is that shard's, so two calls on one target meet
+// there whichever shards they arrived on.
 // A refusal is the answer to a question about the call; a store or disk error is
 // an exception, since it says nothing about the backup. Reads two small
 // objects, yields per read, and needs every reference to outlive the call.

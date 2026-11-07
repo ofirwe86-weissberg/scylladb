@@ -1028,7 +1028,7 @@
                       },
                       {
                           "name":"snapshot",
-                          "description":"Name of the snapshot the backup was taken from, recorded with the target so that its state names the backup it came from",
+                          "description":"Name of the snapshot the backup was taken from. Checked against the backup's own manifest under the prefix, and recorded with the target so that its state names the backup it came from",
                           "required":true,
                           "allowMultiple":false,
                           "type":"string",

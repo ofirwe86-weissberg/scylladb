@@ -11,7 +11,7 @@
 #include <algorithm>
 #include <vector>
 #include <seastar/core/sharded.hh>
-#include "db/pitr/replay_to.hh"
+#include "db/pitr/replay_target.hh"
 #include "dht/i_partitioner_fwd.hh"
 #include "dht/token.hh"
 #include "schema/schema_fwd.hh"

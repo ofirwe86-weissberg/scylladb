@@ -69,10 +69,13 @@ enum class refusal_reason {
     // A replay is running into this target right now, so a second one would
     // write over it (P62).
     replay_already_running,
+    // The target's keyspace uses tablets. A replay restores one table of one
+    // node, which vnodes give and tablets do not (REF-1).
+    target_uses_tablets,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 15> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 16> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
@@ -88,6 +91,7 @@ inline constexpr std::array<refusal_reason, 15> all_refusal_reasons{
         refusal_reason::bound_file_damaged,
         refusal_reason::backup_names_another_table,
         refusal_reason::replay_already_running,
+        refusal_reason::target_uses_tablets,
 };
 
 std::string_view reason_code(refusal_reason) noexcept;

@@ -43,7 +43,9 @@ BOOST_AUTO_TEST_SUITE(pitr_replay_to_test)
 
 namespace {
 
-constexpr const char* test_endpoint = "https://pitr-replay.test";
+// A loopback address and not a name: a check that is skipped by mistake must
+// fail on the refusal-code assertion, not 50 s later on a DNS lookup.
+constexpr const char* test_endpoint = "https://127.0.0.1:1";
 constexpr const char* ks_name = "ks";
 
 const ::table_id test_target{utils::UUID("55556666-0000-4000-8000-00000000000c")};
@@ -419,6 +421,43 @@ SEASTAR_TEST_CASE(a_second_call_on_a_target_a_replay_is_running_into_is_refused)
                 auto first = in_flight.try_take(e.local_db().find_schema(ks_name, "target")->id());
                 BOOST_REQUIRE(first);
                 BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target"), in_flight).code() == "replay_already_running");
+            },
+            replay_config());
+}
+
+
+// A replay restores one table of one node from that node's own commitlog, which
+// vnodes give and tablets do not (REF-1). Refused before anything touches the
+// table, which also keeps the run's compaction hold away from tablet splits.
+SEASTAR_TEST_CASE(a_target_in_a_tablets_keyspace_is_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE KEYSPACE tks WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = "
+                              "{'enabled': true}")
+                        .get();
+                e.execute_cql("CREATE TABLE tks.target (pk text PRIMARY KEY, value int)").get();
+                auto params = params_for("target");
+                params.keyspace = "tks";
+                BOOST_REQUIRE(refusal_of(e, state_dir, params).code() == "target_uses_tablets");
+            },
+            replay_config());
+}
+
+// The refusal asks the user to create the target with compaction disabled, so
+// a target created that way must pass the check that raises it.
+SEASTAR_TEST_CASE(a_target_created_with_compaction_disabled_passes_the_check) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                tmpdir state_dir;
+                e.execute_cql("CREATE TABLE ks.target (pk text PRIMARY KEY, value int) WITH compaction = {'class': 'SizeTieredCompactionStrategy', "
+                              "'enabled': 'false'}")
+                        .get();
+                // Nothing disabled it by hand, so only the schema says so. One
+                // row makes the next check refuse, which is how this one proves
+                // it passed without a store to read.
+                e.execute_cql("INSERT INTO ks.target (pk, value) VALUES ('a', 1)").get();
+                BOOST_REQUIRE(refusal_of(e, state_dir, params_for("target")).code() == "target_not_empty");
             },
             replay_config());
 }
