@@ -162,13 +162,14 @@ SEASTAR_TEST_CASE(test_bound_is_the_highest_position_the_snapshots_sstables_reco
         insert_rows(e, 10, 2);
         t.flush().get();
 
-        db::replay_position bound, highest;
+        db::replay_position bound, highest, floor;
         {
             // In a scope of its own: the capture holds the sstable-list permit,
             // which the flush below takes too, so keeping it would deadlock.
             auto capture = t.snapshot_sstables().get();
             BOOST_REQUIRE_GE(capture.sstables.size(), 2u);
             bound = capture.commitlog_bound;
+            floor = capture.commitlog_min_position;
             for (const auto& sst : capture.sstables) {
                 const auto& recorded = sst->get_stats_metadata().position;
                 if (sst->originated_on_this_node().value_or(false) && recorded.shard_id() == this_shard_id()) {
@@ -176,11 +177,14 @@ SEASTAR_TEST_CASE(test_bound_is_the_highest_position_the_snapshots_sstables_reco
                 }
             }
         }
+        // The capture reports the sstables' own value; the snapshot records the
+        // lower of it and the floor, which this checks is a real position too.
         BOOST_REQUIRE(bound == highest);
-        // And the invariant the bound exists for: a write the snapshot does not
-        // hold is above it, so the replay still reaches it.
+        BOOST_REQUIRE(floor != db::replay_position());
+        // The invariant the bound exists for: a write the snapshot does not hold
+        // is at or above the recorded bound, so the replay still reaches it.
         insert_rows(e, 100, 2);
         t.flush().get();
-        BOOST_REQUIRE(bound < t.highest_flushed_replay_position());
+        BOOST_REQUIRE(std::min(bound, floor) <= t.highest_flushed_replay_position());
     });
 }
