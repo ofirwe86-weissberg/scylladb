@@ -107,6 +107,9 @@ enum class shipping_state {
     off_ledger_failed,
     // A segment the chain holds, or was about to, will not be in the store.
     off_chain_broken,
+    // The segments waiting to be shipped have filled the commitlog's hold
+    // limit, so the latch broke the coverage to keep the node writing (P56).
+    off_outage,
     // Waiting for the node's cluster membership to be counted.
     waiting_for_cluster_size,
     active,
@@ -149,11 +152,18 @@ struct segment_hooks {
     // finish_and_get_new()), which is the only way to tell "no lower segment
     // exists" from "its close has not arrived".
     std::function<std::vector<db::segment_id_type>()> held_segments;
+    // commitlog::held_bytes(), the disk the closed held segments take, and
+    // commitlog::segment_hold_limit(), the bytes they may reach before a write
+    // waits for one. The latch watches both; a limit of 0 turns it off.
+    std::function<uint64_t()> held_bytes;
+    std::function<uint64_t()> segment_hold_limit;
 };
 
 // A held segment's id to its path, or nothing: held_segment_path()'s shape.
 using segment_path_function = std::function<std::optional<sstring>(db::segment_id_type)>;
 using held_segments_function = std::function<std::vector<db::segment_id_type>()>;
+using held_bytes_function = std::function<uint64_t()>;
+using hold_limit_function = std::function<uint64_t()>;
 
 // What only the wiring knows about the chain this shard is about to start.
 struct chain_origin {
@@ -291,6 +301,9 @@ private:
     void capture_coverage();
     // The newest capture this segment may carry, else the previous entry's.
     int64_t coverage_for(db::segment_id_type id);
+    // Breaks shipping, releasing every hold, once the segments waiting to be
+    // shipped have reached the commitlog's limit. True when it broke here.
+    bool outage_latch_tripped();
     // A segment held below `id` and at or above the floor whose close has not
     // been reported: `id` cannot be recorded before it.
     std::optional<db::segment_id_type> unreported_held_below(db::segment_id_type id) const;
@@ -375,9 +388,12 @@ public:
     // - below the last entry recorded it breaks the chain too: it cannot be
     //   appended in order, and skipping it would leave the entries above it
     //   covering writes it holds;
-    // - `used_size` 0 is released at once; any other hold goes once the bytes
-    //   and the ledger entry are both in the store, which is what puts the
-    //   segment in the chain.
+    // - `used_size` 0 is released at once;
+    // - a hold that would be kept while the holds have already reached the
+    //   commitlog's limit trips the outage latch instead: shipping breaks and
+    //   every hold goes, this one with them (P56, P63);
+    // - any other hold goes once the bytes and the ledger entry are both in
+    //   the store, which is what puts the segment in the chain.
     void segment_closed(db::segment_id_type id, uint64_t used_size, bool failed);
 
     // Arms the seal timer and does nothing else, so it must follow
@@ -489,7 +505,8 @@ public:
 // key a segment is stored under is under test. The path and name hooks throw
 // for an id the log no longer holds, which is a permanent upload failure (D25).
 // `shipper` must be the one they are installed on, and must outlive them.
-segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments);
+segment_hooks make_segment_hooks(const pitr_shipper& shipper, segment_path_function segment_path, held_segments_function held_segments,
+        held_bytes_function held_bytes, hold_limit_function hold_limit);
 
 // What a snapshot's bound file asks this shard for (`db/pitr/bound_file.hh`).
 // It reads the shipper on every call, so `shipper` must outlive it, which is
