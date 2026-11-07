@@ -44,9 +44,8 @@ class object_storage_client;
 
 namespace db::pitr {
 
-// A larger schema.cql is damage or a wrong prefix, and is refused unread. The
-// manifest's cap is the one that grows with the backup, at about 300 bytes per
-// sstable.
+// A larger object is damage or a wrong prefix, and is refused unread; the
+// manifest's cap is the one that grows with the backup.
 constexpr size_t max_schema_cql_size = 1024 * 1024;
 constexpr size_t max_manifest_size = 32 * 1024 * 1024;
 constexpr const char* schema_cql_file_name = "schema.cql";
@@ -59,20 +58,16 @@ struct backup_manifest {
     sstring snapshot;
     sstring keyspace;
     sstring table;
-    // The TOC object key of every sstable of the backup, relative to the
-    // prefix, as the restore path takes them. Empty for a backup of a table
-    // that held nothing.
+    // The TOC object key of every sstable, relative to the prefix, as the
+    // restore path takes them. Empty for a backup of an empty table.
     utils::chunked_vector<sstring> toc_names;
 };
 
 // Reads the manifest's fields a replay needs and refuses one that names a
 // snapshot other than the call's: one prefix is one backup, so a prefix
-// pointing at another backup is a user error and not a restore.
-//
-// The keyspace and the table are read but not checked: the target of a replay
-// is allowed to be a table of another name, so only its schema is compared.
-//
-// Yields while parsing and once per sstable entry; the caller caps the bytes.
+// pointing at another is a user error and not a restore. The keyspace and the
+// table are read but not checked, since a replay into a table of another name
+// is the point. Yields while parsing and per entry; the caller caps the bytes.
 future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chunked_content&& content, const sstring& expected_snapshot);
 
 // `incomplete` until `done` replaces `started` (requirement 12).
@@ -88,8 +83,7 @@ struct replay_state {
     sstring snapshot;
     sstring t;
     // The table the backup was taken from, as its manifest records it: the
-    // target may be named differently, so this is the only record of what was
-    // loaded. Empty when no manifest was read.
+    // only record of what was loaded. Empty when no manifest was read.
     sstring source_keyspace;
     sstring source_table;
     // When the mark was written, microseconds since the UNIX epoch, UTC.
@@ -145,7 +139,7 @@ future<std::expected<std::filesystem::path, refusal>> fetch_segment(sstables::ob
 // Drops from a snapshot's `schema.cql` what a replay into another table is
 // allowed to differ in: the table's name wherever a statement names it, its
 // `ID` option and its `compaction` option (P52). Both sides come from the same
-// describe code, one option per line, so this works line by line. Yields.
+// describe code, one option per line, so this works by line. Yields.
 future<sstring> normalize_schema_cql(std::string_view);
 
 // Compares the two statements, ignoring the three above.
@@ -160,9 +154,8 @@ struct replay_start {
     // Every shard's chain, checked and proved to cover T, with the segments the
     // replay reads in ledger order.
     checked_history history;
-    // The backup's sstables and the table it was taken from, from its
-    // manifest: a shared snapshot tag makes the names the only record of what
-    // was loaded.
+    // The backup's sstables and the table it came from: a shared snapshot tag
+    // makes the names the only record of what was loaded.
     utils::chunked_vector<sstring> toc_names;
     sstring source_keyspace;
     sstring source_table;

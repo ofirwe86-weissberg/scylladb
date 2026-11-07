@@ -21,7 +21,9 @@
 #include <seastar/core/fstream.hh>
 #include <seastar/core/format.hh>
 #include <seastar/core/seastar.hh>
+#include <seastar/core/thread.hh>
 #include <seastar/coroutine/maybe_yield.hh>
+#include <seastar/util/defer.hh>
 #include <seastar/util/file.hh>
 
 #include "cql3/description.hh"
@@ -376,10 +378,30 @@ future<std::optional<refusal>> check_schema_match(std::string_view target_cql, s
     };
 }
 
+static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, sstring detail) {
+    replay_log.warn("refusing the replay: {} ({})", message, detail);
+    return std::unexpected(refusal{.reason = reason, .message = std::move(message), .detail = std::move(detail)});
+}
+
+static std::unexpected<refusal> refuse_too_large(const sstables::object_name& object, size_t cap) {
+    return refuse(refusal_reason::backup_file_too_large,
+            "A file of the backup is larger than a replay reads, so it is damage or a prefix holding something else. Check the prefix, or restore from "
+            "another backup.",
+            seastar::format("{} is larger than {} bytes", object, cap));
+}
+
+static std::unexpected<refusal> refuse_damaged_manifest(sstring detail) {
+    return refuse(refusal_reason::backup_manifest_damaged,
+            "The backup's manifest is not one a replay can read, so its sstables cannot be found. Check the prefix, or restore from another backup.",
+            std::move(detail));
+}
+
 // Reads one whole file of the backup, or nothing when the store does not hold
 // it: a read error is told from an absent object by asking the store. The key
 // parts come by value, since this suspends.
-static future<std::optional<sstring>> read_backup_file(
+// `nullopt` when the store does not hold the file, a refusal when it holds one
+// too large to read, the bytes otherwise.
+static future<std::expected<std::optional<sstring>, refusal>> read_backup_file(
         sstables::object_storage_client& client, sstring bucket, sstring prefix, sstring name, size_t cap, abort_source& as) {
     auto object = sstables::object_name(bucket, prefix, name);
     std::exception_ptr read_error;
@@ -415,14 +437,14 @@ static future<std::optional<sstring>> read_backup_file(
         co_return std::nullopt;
     }
     if (body.size() > cap) {
-        throw std::runtime_error(seastar::format("{} is larger than the {} bytes a replay reads", object, cap));
+        co_return refuse_too_large(object, cap);
     }
     co_return std::move(body);
 }
 
 // The manifest alone grows with the backup, so it is read in chunks and never
 // linearized: `parse_backup_manifest` takes it as it comes off the wire.
-static future<std::optional<rjson::chunked_content>> read_backup_manifest_bytes(
+static future<std::expected<std::optional<rjson::chunked_content>, refusal>> read_backup_manifest_bytes(
         sstables::object_storage_client& client, sstring bucket, sstring prefix, size_t cap, abort_source& as) {
     auto object = sstables::object_name(bucket, prefix, manifest_file_name);
     std::exception_ptr read_error;
@@ -458,77 +480,78 @@ static future<std::optional<rjson::chunked_content>> read_backup_manifest_bytes(
         co_return std::nullopt;
     }
     if (size > cap) {
-        throw std::runtime_error(seastar::format("{} is larger than the {} bytes a replay reads", object, cap));
+        co_return refuse_too_large(object, cap);
     }
     co_return std::move(content);
 }
 
-static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, sstring detail) {
-    replay_log.warn("refusing the replay: {} ({})", message, detail);
-    return std::unexpected(refusal{.reason = reason, .message = std::move(message), .detail = std::move(detail)});
-}
-
-static std::unexpected<refusal> refuse_damaged_manifest(sstring detail) {
-    return refuse(refusal_reason::backup_manifest_damaged,
-            "The backup's manifest is not one a replay can read, so its sstables cannot be found. Check the prefix, or restore from another backup.",
-            std::move(detail));
-}
-
 future<std::expected<backup_manifest, refusal>> parse_backup_manifest(rjson::chunked_content&& content, const sstring& expected_snapshot) {
-    backup_manifest manifest;
-    rjson::value parsed = rjson::null_value();
-    std::optional<sstring> damaged;
-    try {
-        // Yieldable: the manifest grows with the backup, and this is the only
-        // parse on the path that does.
-        parsed = rjson::parse_yieldable(std::move(content));
-        const auto& snapshot = rjson::get(parsed, "snapshot");
-        manifest.snapshot = sstring(rjson::get<std::string>(snapshot, "name"));
-        const auto& table = rjson::get(parsed, "table");
-        manifest.keyspace = sstring(rjson::get<std::string>(table, "keyspace_name"));
-        manifest.table = sstring(rjson::get<std::string>(table, "table_name"));
-    } catch (const rjson::error& e) {
-        damaged = e.what();
-    }
-    if (damaged) {
-        co_await rjson::destroy_gently(std::move(parsed));
-        co_return refuse_damaged_manifest(*damaged);
-    }
-    if (manifest.snapshot != expected_snapshot) {
-        co_await rjson::destroy_gently(std::move(parsed));
-        co_return refuse(refusal_reason::backup_names_another_table,
-                "The backup under this prefix is not the one the call named, so what would be restored is another table's data. Name the backup the prefix "
-                "holds, or the prefix of the backup you named.",
-                seastar::format("the manifest records snapshot '{}' of {}.{}, the call named '{}'", manifest.snapshot, manifest.keyspace, manifest.table,
-                        expected_snapshot));
-    }
-
-    // A backup of a table that held nothing carries no sstables: that is a
-    // backup like any other, and the replay goes on to the history.
-    if (const auto* sstables = rjson::find(parsed, "sstables")) {
-        if (sstables->IsArray()) {
-            for (const auto& entry : sstables->GetArray()) {
-                co_await coroutine::maybe_yield();
-                const auto* toc = entry.IsObject() ? rjson::find(entry, "toc_name") : nullptr;
-                if (!toc || !toc->IsString()) {
-                    damaged = "an entry of 'sstables' is not an object, or carries no toc_name";
-                    break;
-                }
-                manifest.toc_names.push_back(sstring(rjson::to_string_view(*toc)));
+    // In a thread, not a coroutine: `rjson::parse_yieldable` yields through
+    // `seastar::thread::maybe_yield()` on every token, so from a plain
+    // coroutine the first preemption has no thread to switch to and the node
+    // crashes. Alternator's only other caller is in a thread for the same
+    // reason. Everything the parse holds - the chunks, the DOM, the names -
+    // lives in this thread's stack, and the thread yields, so a manifest at
+    // the cap neither stalls the shard nor is read contiguously.
+    return seastar::async([content = std::move(content), expected_snapshot]() mutable -> std::expected<backup_manifest, refusal> {
+        backup_manifest manifest;
+        rjson::value parsed = rjson::null_value();
+        std::optional<sstring> damaged;
+        // A manifest at the cap builds a DOM of millions of nodes, and freeing
+        // it in one go stalls as long as the parse did; every path out frees it
+        // gently, so the defer covers them all.
+        auto free_parsed = seastar::defer([&parsed]() noexcept {
+            try {
+                rjson::destroy_gently(std::move(parsed)).get();
+            } catch (...) {
+                replay_log.warn("could not free the manifest: {}", std::current_exception());
             }
-        } else {
-            damaged = "'sstables' is not an array";
+        });
+        try {
+            parsed = rjson::parse_yieldable(std::move(content));
+            const auto& snapshot = rjson::get(parsed, "snapshot");
+            manifest.snapshot = sstring(rjson::get<std::string>(snapshot, "name"));
+            const auto& table = rjson::get(parsed, "table");
+            manifest.keyspace = sstring(rjson::get<std::string>(table, "keyspace_name"));
+            manifest.table = sstring(rjson::get<std::string>(table, "table_name"));
+        } catch (const rjson::error& e) {
+            damaged = e.what();
         }
-    }
-    // A manifest at the cap builds a DOM of millions of nodes, and freeing it
-    // in one go stalls as long as the parse did.
-    co_await rjson::destroy_gently(std::move(parsed));
-    if (damaged) {
-        co_return refuse_damaged_manifest(*damaged);
-    }
-    replay_log.info(
-            "the backup of {}.{} under snapshot '{}' holds {} sstable(s)", manifest.keyspace, manifest.table, manifest.snapshot, manifest.toc_names.size());
-    co_return std::move(manifest);
+        if (damaged) {
+            return refuse_damaged_manifest(*damaged);
+        }
+        if (manifest.snapshot != expected_snapshot) {
+            return refuse(refusal_reason::backup_names_another_table,
+                    "The backup under this prefix is not the one the call named, so what would be restored is another table's data. Name the backup the "
+                    "prefix holds, or the prefix of the backup you named.",
+                    seastar::format("the manifest records snapshot '{}' of {}.{}, the call named '{}'", manifest.snapshot, manifest.keyspace, manifest.table,
+                            expected_snapshot));
+        }
+
+        // A backup of a table that held nothing carries no sstables: that is a
+        // backup like any other, and the replay goes on to the history.
+        if (const auto* sstables = rjson::find(parsed, "sstables")) {
+            if (sstables->IsArray()) {
+                for (const auto& entry : sstables->GetArray()) {
+                    seastar::thread::maybe_yield();
+                    const auto* toc = entry.IsObject() ? rjson::find(entry, "toc_name") : nullptr;
+                    if (!toc || !toc->IsString()) {
+                        damaged = "an entry of 'sstables' is not an object, or carries no toc_name";
+                        break;
+                    }
+                    manifest.toc_names.push_back(sstring(rjson::to_string_view(*toc)));
+                }
+            } else {
+                damaged = "'sstables' is not an array";
+            }
+        }
+        if (damaged) {
+            return refuse_damaged_manifest(*damaged);
+        }
+        replay_log.info(
+                "the backup of {}.{} under snapshot '{}' holds {} sstable(s)", manifest.keyspace, manifest.table, manifest.snapshot, manifest.toc_names.size());
+        return std::move(manifest);
+    });
 }
 
 replay_in_flight::guard::~guard() {
@@ -635,17 +658,23 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     auto client = sm.get_endpoint_client(p.endpoint);
     auto manifest_bytes = co_await read_backup_manifest_bytes(*client, p.bucket, p.prefix, max_manifest_size, as);
     if (!manifest_bytes) {
+        co_return std::unexpected(std::move(manifest_bytes.error()));
+    }
+    if (!*manifest_bytes) {
         co_return refuse(refusal_reason::backup_file_missing,
                 "There is no backup under this prefix: it carries no manifest. Name the prefix the backup was written with.",
                 seastar::format("{}/{}", p.prefix, manifest_file_name));
     }
-    auto manifest = co_await parse_backup_manifest(std::move(*manifest_bytes), p.snapshot);
+    auto manifest = co_await parse_backup_manifest(std::move(**manifest_bytes), p.snapshot);
     if (!manifest) {
         co_return std::unexpected(std::move(manifest.error()));
     }
 
     auto bound_body = co_await read_backup_file(*client, p.bucket, p.prefix, bound_file_name, max_bound_file_size, as);
     if (!bound_body) {
+        co_return std::unexpected(std::move(bound_body.error()));
+    }
+    if (!*bound_body) {
         co_return refuse(refusal_reason::backup_file_missing,
                 "The backup carries no point-in-time recovery bound, so where its sstables end and the replay starts is unknown. It was taken with shipping "
                 "off, or the prefix names another backup.",
@@ -653,7 +682,7 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
     }
     bound_file bound;
     try {
-        bound = decode_bound_file(*bound_body);
+        bound = decode_bound_file(**bound_body);
     } catch (const bound_file_format_error&) {
         co_return refuse(refusal_reason::bound_file_damaged,
                 "The backup's point-in-time recovery bound is damaged, so where the replay starts cannot be proved. Restore from another backup.",
@@ -662,13 +691,16 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
 
     auto backup_cql = co_await read_backup_file(*client, p.bucket, p.prefix, schema_cql_file_name, max_schema_cql_size, as);
     if (!backup_cql) {
+        co_return std::unexpected(std::move(backup_cql.error()));
+    }
+    if (!*backup_cql) {
         co_return refuse(refusal_reason::backup_file_missing,
                 "The backup carries no schema, so the target cannot be checked against it. The prefix names another backup.",
                 seastar::format("{}/{}", p.prefix, schema_cql_file_name));
     }
     auto describe_helper = replica::make_schema_describe_helper(target_schema, local.as_data_dictionary());
     auto target_cql = target_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
-    if (auto mismatch = co_await check_schema_match(target_cql, *backup_cql)) {
+    if (auto mismatch = co_await check_schema_match(target_cql, **backup_cql)) {
         replay_log.warn("refusing the replay: {}", *mismatch);
         co_return std::unexpected(std::move(*mismatch));
     }
