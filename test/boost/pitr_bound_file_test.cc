@@ -25,6 +25,7 @@
 #include <seastar/core/smp.hh>
 #include <seastar/util/file.hh>
 
+#include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
 #include "db/pitr/bound_file.hh"
 #include "replica/database.hh"
@@ -343,10 +344,10 @@ namespace {
 
 // Every shard's bound, taken the way the snapshot takes it.
 // What the snapshot would record for each shard, by the rule the bound file
-// holds (lowest_safe_bound(), table.cc): the lower of what the sstables
-// recorded and the commitlog's floor, or - with nothing flushed and no chain -
-// base segment 1 of the shard. Restated here on purpose: it is the contract
-// under test, so a change to it must change this too.
+// holds (lowest_safe_bound(), table.cc): what the sstables recorded, raised to
+// the chain's floor and then capped by the commitlog's floor, or - with nothing
+// flushed and no chain - base segment 1 of the shard. Restated here on purpose:
+// it is the contract under test, so a change to it must change this too.
 std::vector<db::replay_position> expected_bounds(cql_test_env& e, std::optional<uint64_t> chain_floor = std::nullopt) {
     std::vector<db::replay_position> bounds(this_smp_shard_count());
     e.db().invoke_on_all([&bounds, chain_floor](replica::database& db) -> future<> {
@@ -356,15 +357,51 @@ std::vector<db::replay_position> expected_bounds(cql_test_env& e, std::optional<
               auto with_floor = [floor](db::replay_position rp) {
                   return floor == db::replay_position() ? rp : std::min(rp, floor);
               };
+              const auto chain_rp = chain_floor ? std::optional(db::replay_position(*chain_floor, 0)) : std::nullopt;
               if (capture.commitlog_bound != db::replay_position()) {
-                  bounds[this_shard_id()] = with_floor(capture.commitlog_bound);
-              } else if (chain_floor) {
-                  bounds[this_shard_id()] = with_floor(db::replay_position(*chain_floor, 0));
+                  bounds[this_shard_id()] = with_floor(chain_rp ? std::max(capture.commitlog_bound, *chain_rp) : capture.commitlog_bound);
+              } else if (chain_rp) {
+                  bounds[this_shard_id()] = with_floor(*chain_rp);
               } else {
                   bounds[this_shard_id()] = db::replay_position(this_shard_id(), db::segment_id_type(1), 0);
               }
           }).get();
     return bounds;
+}
+
+// Each shard's oldest live commitlog position, the cap the rule applies.
+std::vector<db::replay_position> commitlog_floors(cql_test_env& e) {
+    std::vector<db::replay_position> floors(this_smp_shard_count());
+    e.db().invoke_on_all([&floors](replica::database& db) {
+              floors[this_shard_id()] = db.find_column_family(ks_name, cf_name).commitlog()->min_position();
+          }).get();
+    return floors;
+}
+
+// Each shard's highest position its own sstables record: the value the rule
+// raises to the chain's floor.
+std::vector<db::replay_position> captured_bounds(cql_test_env& e) {
+    std::vector<db::replay_position> bounds(this_smp_shard_count());
+    e.db().invoke_on_all([&bounds](replica::database& db) -> future<> {
+              bounds[this_shard_id()] = (co_await db.find_column_family(ks_name, cf_name).snapshot_sstables()).commitlog_bound;
+          }).get();
+    return bounds;
+}
+
+// Installs one chain per shard, whose floor segment id `floor_of` gives. It runs
+// on the shard the chain is for, so a floor read off that shard's commitlog
+// stays on it.
+void install_chain_provider(cql_test_env& e, std::function<uint64_t(replica::database&)> floor_of) {
+    e.db().invoke_on_all([floor_of](replica::database& db) {
+              const auto floor = floor_of(db);
+              db.set_pitr_chain_provider([floor]() -> std::optional<shard_chain> {
+                  return shard_chain{.host_id = utils::UUID_gen::get_time_UUID(),
+                          .boot_epoch_us = 1,
+                          .chain_start_us = 2,
+                          .chain = chain_id(utils::UUID_gen::get_time_UUID()),
+                          .floor_segment_id = floor};
+              });
+          }).get();
 }
 
 std::filesystem::path snapshot_dir(cql_test_env& e) {
@@ -451,22 +488,16 @@ SEASTAR_TEST_CASE(test_a_snapshot_with_pitr_configured_records_every_shard_bound
 }
 
 // Nothing flushed, so no sstable records a position: the row falls back to the
-// chain's floor, capped by the commitlog's floor. A bound above an unflushed
-// write would drop it, which is what the cap is for.
+// chain's floor. The floor is below the commitlog's own, so the cap does not
+// move it and the row is the floor itself.
 SEASTAR_TEST_CASE(test_a_shard_with_nothing_flushed_records_the_chain_floor) {
     return do_with_cql_env_thread(
             [](cql_test_env& e) {
                 constexpr uint64_t floor_base = 7;
                 create_and_fill(e);
-                e.db().invoke_on_all([](replica::database& db) {
-                          db.set_pitr_chain_provider([]() -> std::optional<shard_chain> {
-                              return shard_chain{.host_id = utils::UUID_gen::get_time_UUID(),
-                                      .boot_epoch_us = 1,
-                                      .chain_start_us = 2,
-                                      .chain = chain_id(utils::UUID_gen::get_time_UUID()),
-                                      .floor_segment_id = db::replay_position(this_shard_id(), floor_base, 0).id};
-                          });
-                      }).get();
+                install_chain_provider(e, [](replica::database&) {
+                    return db::replay_position(this_shard_id(), floor_base, 0).id;
+                });
 
                 // skip_flush, so no sstable of this table exists anywhere.
                 take_snapshot(e);
@@ -485,6 +516,93 @@ SEASTAR_TEST_CASE(test_a_shard_with_nothing_flushed_records_the_chain_floor) {
                         BOOST_REQUIRE(row.chain);
                     }
                 }
+            },
+            pitr_config());
+}
+
+// The cap on the fallback, which the test above cannot see because its floor is
+// already the lower value. The rows written here are unflushed, so their
+// segment stays live and the commitlog's floor sits below a chain floor set
+// above it: the row must be the commitlog's floor, or the replay would start
+// past those writes and lose them.
+SEASTAR_TEST_CASE(test_a_shard_with_nothing_flushed_caps_the_chain_floor_with_the_commitlog) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+                // Above every live segment, so the cap is the only thing that
+                // can bring the row back down to the unflushed writes.
+                install_chain_provider(e, [](replica::database& db) {
+                    return db::replay_position(this_shard_id(), db.find_column_family(ks_name, cf_name).commitlog()->min_position().base_id() + 100, 0).id;
+                });
+                // The unflushed rows hold their segment, so the floor read here
+                // is still the floor the snapshot sees.
+                const auto floors = commitlog_floors(e);
+
+                take_snapshot(e);
+
+                auto content = seastar::util::read_entire_file_contiguous(snapshot_dir(e) / bound_file_name).get();
+                auto f = decode_bound_file(content);
+                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                    BOOST_TEST_CONTEXT("shard " << shard) {
+                        BOOST_REQUIRE(floors[shard] != db::replay_position());
+                        BOOST_REQUIRE(f.shards[shard].bound == floors[shard]);
+                    }
+                }
+            },
+            pitr_config());
+}
+
+// A shard whose rows were all flushed before the chain began must not be
+// refused. Its sstables record positions below the chain's floor, and a bound
+// below the floor reads as a backup taken before shipping started
+// (chain_check), although the sstables hold everything and the chain covers
+// everything after them. So the sstable value is raised to the floor, which the
+// commitlog's floor - above it here, since nothing of this table is unflushed -
+// does not cap.
+SEASTAR_TEST_CASE(test_a_shard_flushed_before_the_chain_is_not_refused) {
+    return do_with_cql_env_thread(
+            [](cql_test_env& e) {
+                create_and_fill(e);
+                // Flush, then seal the segments those sstables name, so that
+                // every live segment is above every recorded position: that is
+                // what "flushed before the chain began" looks like.
+                e.db().invoke_on_all([](replica::database& db) -> future<> {
+                          co_await db.flush_all_memtables();
+                          co_await db.find_column_family(ks_name, cf_name).commitlog()->force_new_active_segment();
+                      }).get();
+
+                // The chain begins at the oldest live segment, so the cap is a
+                // no-op and the raise is what the rows show. Read on the shard
+                // at snapshot time, not here, so a segment released in between
+                // cannot put the floor above the cap.
+                install_chain_provider(e, [](replica::database& db) {
+                    return db.find_column_family(ks_name, cf_name).commitlog()->min_position().id;
+                });
+
+                take_snapshot(e);
+
+                // Nothing flushes between the snapshot and here, so these are
+                // the values the snapshot raised.
+                const auto captured = captured_bounds(e);
+                auto content = seastar::util::read_entire_file_contiguous(snapshot_dir(e) / bound_file_name).get();
+                auto f = decode_bound_file(content);
+                unsigned shards_raised_to_the_floor = 0;
+                for (unsigned shard = 0; shard < this_smp_shard_count(); ++shard) {
+                    BOOST_TEST_CONTEXT("shard " << shard) {
+                        const auto& row = f.shards[shard];
+                        BOOST_REQUIRE(row.chain);
+                        const auto floor = db::replay_position(*row.chain->floor_segment_id, 0);
+                        // Not below the floor, so chain_check does not refuse it.
+                        BOOST_REQUIRE(row.bound >= floor);
+                        if (captured[shard] != db::replay_position() && captured[shard] < floor) {
+                            ++shards_raised_to_the_floor;
+                            BOOST_REQUIRE(row.bound == floor);
+                        }
+                    }
+                }
+                // Without a shard whose sstables sit below the floor, the raise
+                // is not exercised and the test proves nothing.
+                BOOST_REQUIRE_GT(shards_raised_to_the_floor, 0u);
             },
             pitr_config());
 }

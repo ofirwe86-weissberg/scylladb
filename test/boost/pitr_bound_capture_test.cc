@@ -181,10 +181,14 @@ SEASTAR_TEST_CASE(test_bound_is_the_highest_position_the_snapshots_sstables_reco
         // lower of it and the floor, which this checks is a real position too.
         BOOST_REQUIRE(bound == highest);
         BOOST_REQUIRE(floor != db::replay_position());
-        // The invariant the bound exists for: a write the snapshot does not hold
-        // is at or above the recorded bound, so the replay still reaches it.
+        // The invariant the bound exists for: a write the snapshot does not
+        // hold is strictly above the bound, so the replay still reaches it.
+        // Strictly, because the write is later than every position the
+        // snapshot's sstables recorded: a bound taken off the commitlog's
+        // segment bookkeeping instead could name a newer, empty segment and
+        // sit above this write (#103).
         insert_rows(e, 100, 2);
         t.flush().get();
-        BOOST_REQUIRE(std::min(bound, floor) <= t.highest_flushed_replay_position());
+        BOOST_REQUIRE(bound < t.highest_flushed_replay_position());
     });
 }
