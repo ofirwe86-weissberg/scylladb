@@ -104,7 +104,7 @@ These apply to all implementation and review on this project.
 - While writing code, ask of every loop, parse, serialization, checksum and allocation: how big can its input get, and does it yield? Bound the work or yield with `coroutine::maybe_yield()`, and avoid large contiguous allocations. Never make a blocking call.
 - Reviewers check for stalls explicitly, on the worst-case input and not the typical one.
 - Passing tests don't show the absence of stalls: `test/pylib/cpp/base.py:47` sets `--blocked-reactor-notify-ms=2000000` for C++ tests, so stalls aren't reported there.
-- **If you're not sure whether something can stall, don't decide alone.** Discuss it with `code-reviewer` first, then raise a flag to the human with what you concluded and what's still unknown.
+- **If you're not sure whether something can stall, don't decide alone.** Discuss it with `code-reviewer`, and the team lead decides; it reaches the human only if it changes an interface or conflicts with a requirement.
 
 **Tests are written with the code, not after it.**
 - Work in small steps: write a test, see it fail for the right reason, write the code, see it pass, continue. Don't write the tests at the end to fit finished code.
@@ -216,7 +216,7 @@ When in doubt, use full.
 The evidence behind this split, with what each step caught on the PITR work, is in `docs-work/catch-log.md`; its "New catches" table gets a row whenever a review, test run or post-merge cycle finds something.
 
 Flow at the full level: intake (with `product-manager` and `architect-check` if needed) → spec on the issue → implement → code-reviewer → PR → pr-reviewer. Rules that hold at both levels, together with all of "Development rules":
-- **`product-manager` and `architect-check` work only while a task is set up,** before its spec is on the issue: requirements, design, structural review of the plan. Once the task is set, they are not involved, at either level and for R&D-internal tasks too. Questions that come up during implementation are settled by the team lead from the developer's and tester's own work (tests, breaks, measurements), checked by `code-reviewer` and `pr-reviewer`. A question that changes what the user sees, or one the team lead can't settle, goes to the human directly.
+- **`product-manager` and `architect-check` work only while a task is set up,** before its spec is on the issue: requirements, design, structural review of the plan. Once the task is set, they are not involved, at either level and for R&D-internal tasks too. Questions that come up during implementation are settled by the team lead from the developer's and tester's own work (tests, breaks, measurements), checked by `code-reviewer` and `pr-reviewer`. The team lead raises a question to the human only when an interface changes (a public API, a format, user-visible behaviour) or requirements conflict; everything else the team lead decides and records.
 - **Nothing is merged automatically, and agents never merge.** The PR still gets human review.
 - **One commit and one PR per task,** on its own branch, with the PR title starting with the task ID. Dependent PRs stack on the previous task's branch.
 - **Review fixes go on the same branch,** as new commits pushed to the open PR (a normal push, not a force push), and the human squashes on merge. Don't open a replacement `-vN` PR for a review round: on PITR that cost 9 replacement PRs, each with its own description, re-review and retargeting.
