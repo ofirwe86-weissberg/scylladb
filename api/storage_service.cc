@@ -449,6 +449,25 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
+    ss::pitr_replay_to.set(r, [&sst_loader](std::unique_ptr<http::request> req) -> future<json::json_return_type> {
+        db::pitr::replay_to_params params{
+                .endpoint = req->get_query_param("endpoint"),
+                .bucket = req->get_query_param("bucket"),
+                .prefix = req->get_query_param("prefix"),
+                .keyspace = req->get_query_param("keyspace"),
+                .table = req->get_query_param("table"),
+                .snapshot = req->get_query_param("snapshot"),
+                .t = req->get_query_param("t"),
+        };
+
+        apilog.info("Point-in-time replay invoked with following parameters: keyspace={}, table={}, snapshot={}, t={}, endpoint={}, bucket={}, prefix={}",
+                params.keyspace, params.table, params.snapshot, params.t, params.endpoint, params.bucket, params.prefix);
+        // Everything the call can be refused for is the task's answer and not a
+        // bad request: the user reads it in the task's status, with its reason.
+        auto task_id = co_await sst_loader.local().pitr_replay_to(std::move(params));
+        co_return json::json_return_type(fmt::to_string(task_id));
+    });
+
     ss::tablet_aware_restore.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) -> future<json_return_type> {
         std::string keyspace = req->get_query_param("keyspace");
         std::string table = req->get_query_param("table");
@@ -515,6 +534,7 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
 void unset_sstables_loader(http_context& ctx, routes& r) {
     ss::load_new_ss_tables.unset(r);
     ss::start_restore.unset(r);
+    ss::pitr_replay_to.unset(r);
     ss::tablet_aware_restore.unset(r);
 }
 

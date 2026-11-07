@@ -20,6 +20,7 @@
 #include <seastar/util/short_streams.hh> 
 #include "sstables_loader.hh"
 #include "db/config.hh"
+#include "db/pitr/replay_to.hh"
 #include "dht/auto_refreshing_sharder.hh"
 #include "replica/distributed_loader.hh"
 #include "replica/database.hh"
@@ -47,6 +48,7 @@
 
 #include <cfloat>
 #include <algorithm>
+#include <filesystem>
 #include <set>
 #include "utils/assert.hh"
 
@@ -940,6 +942,51 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
         return download_and_stream(*progress, endpoint, bucket, ks_name, cf_name, prefix, sstables, scope, primary_replica_only(primary_replica), self.get_abort_source());
     });
     co_return task->id();
+}
+
+static constexpr auto pitr_replay_to_task_type = "pitr_replay_to";
+
+// One directory per node, beside the data: the mark is this node's record of
+// what it did to a target table, and is read before any data is loaded.
+static std::filesystem::path pitr_replay_state_dir(const db::config& cfg) {
+    return std::filesystem::path(cfg.work_directory()) / "pitr" / "replay";
+}
+
+future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& params, abort_source& as) {
+    auto start = co_await db::pitr::start_replay_to(_db, _storage_manager, _pitr_replays, pitr_replay_state_dir(_db.local().get_config()), params, as);
+    if (!start) {
+        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} refused: {}", params.keyspace, params.table, start.error()));
+    }
+
+    // The load of the backup is ep.2 and the replay of the shipped history
+    // ep.3. Until they land the task ends in failure and never in `done`: the
+    // target carries the `started` mark, so it reads as incomplete, and a
+    // recovery that did not replay anything may not read as a finished one.
+    throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} to {} is not built yet: the target was checked and marked, backup '{}' is not loaded, "
+                                         "and the target stays incomplete",
+            params.keyspace, params.table, params.t, params.snapshot));
+}
+
+future<tasks::task_id> sstables_loader::pitr_replay_to(db::pitr::replay_to_params params) {
+    // Shard 0 runs every replay: the in-flight set that keeps two calls on one
+    // target apart is its own, and the HTTP server answers on any shard.
+    return container().invoke_on(0, [params = std::move(params)](sstables_loader& loader) -> future<tasks::task_id> {
+        llog.info("Point-in-time replay of backup '{}' from {}({}) into {}.{} to t={}", params.snapshot, params.endpoint, params.prefix, params.keyspace,
+                params.table, params.t);
+
+        tasks::task_manager::task_builder task_builder{loader._task_manager_module, pitr_replay_to_task_type};
+        task_builder.set_scope("node")
+                .set_keyspace(params.keyspace)
+                .set_table(params.table)
+                .set_is_abortable(tasks::is_abortable::yes)
+                .set_is_internal(tasks::is_internal::no)
+                .set_is_user_task(tasks::is_user_task::yes);
+        // The task owns the parameters, and outlives the body that refers to them.
+        auto task = co_await std::move(task_builder).build([&loader, params = std::move(params)](tasks::task_manager::task::impl& self) {
+            return loader.do_pitr_replay_to(params, self.get_abort_source());
+        });
+        co_return task->id();
+    });
 }
 
 future<sstables::shared_sstable> sstables_loader::attach_sstable(table_id tid, const minimal_sst_info& min_info) const {

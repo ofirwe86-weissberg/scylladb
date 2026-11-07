@@ -8,19 +8,42 @@
 
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <optional>
 #include <string_view>
 
 #include <seastar/core/future.hh>
+#include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 
+#include "db/pitr/bound_file.hh"
 #include "db/pitr/refusal.hh"
+#include "db/pitr/replay_target.hh"
+#include "mutation/timestamp.hh"
 #include "schema/schema_fwd.hh"
 #include "seastarx.hh"
 
+namespace seastar {
+class abort_source;
+} // namespace seastar
+
+namespace replica {
+class database;
+} // namespace replica
+
+namespace sstables {
+class storage_manager;
+class object_storage_client;
+} // namespace sstables
+
 namespace db::pitr {
+
+// A larger schema.cql is damage or a wrong prefix, and is refused unread.
+constexpr size_t max_schema_cql_size = 1024 * 1024;
+constexpr const char* schema_cql_file_name = "schema.cql";
 
 // `incomplete` until `done` replaces `started` (requirement 12).
 enum class replay_phase {
@@ -71,5 +94,31 @@ future<sstring> normalize_schema_cql(std::string_view);
 
 // Compares the two statements, ignoring the three above.
 future<std::optional<refusal>> check_schema_match(std::string_view target_cql, std::string_view backup_cql);
+
+// What a checked and marked replay hands to the load and, after it, to ep.3.
+struct replay_start {
+    ::table_id target;
+    // T, microseconds since the UNIX epoch, UTC.
+    api::timestamp_type t = 0;
+    bound_file bound;
+    // Held until the run ends, so no second replay enters this target.
+    replay_in_flight::guard in_flight;
+};
+
+// Runs every check a replay makes before it loads anything, in this order, and
+// then writes the `started` mark: T parses, a store location was given and is
+// known, the target exists, no replay is running into it, its auto-compaction
+// is off, it is empty, no mark exists for it, the backup carries a bound file
+// the strict reader accepts, and the target's schema matches the backup's. The cheap local checks come first, so
+// a plainly wrong call never reaches the store, and the mark is written last,
+// so a refusal leaves the node as it was.
+//
+// Runs on shard 0: `in_flight` is that shard's, so two calls on one target meet
+// there whichever shards they arrived on.
+// A refusal is the answer to a question about the call; a store or disk error is
+// an exception, since it says nothing about the backup. Reads two small
+// objects, yields per read, and needs every reference to outlive the call.
+future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
+        std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
 
 } // namespace db::pitr
