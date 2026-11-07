@@ -39,6 +39,7 @@
 #include <seastar/core/condition-variable.hh>
 #include "db/commitlog/replay_position.hh"
 #include "db/commitlog/commitlog_types.hh"
+#include "db/pitr/chain_provider.hh"
 #include "schema/schema_fwd.hh"
 #include "mutation/frozen_mutation.hh"
 #include "db/snapshot-ctl.hh"
@@ -1860,6 +1861,10 @@ private:
     // recovery, and declared ahead of it, so a close reported while the
     // commitlog is destroyed still finds the slot (issue #8).
     std::unique_ptr<db::pitr::segment_closed_slot> _pitr_segment_closed;
+    // What a snapshot asks this shard for its row of the bound file (#12).
+    // Empty until the shipper's wiring installs it, which reads as "this shard
+    // was shipping no chain".
+    db::pitr::chain_provider _pitr_chain_provider;
     std::unique_ptr<db::commitlog> _commitlog;
     std::unique_ptr<db::commitlog> _schema_commitlog;
     utils::updateable_value_source<table_schema_version> _version;
@@ -2034,6 +2039,13 @@ public:
     db::pitr::segment_closed_slot* pitr_segment_closed_slot() const {
         return _pitr_segment_closed.get();
     }
+    // Installed on each shard by the shipper's wiring. See db/pitr/bound_file.hh.
+    void set_pitr_chain_provider(db::pitr::chain_provider provider) {
+        _pitr_chain_provider = std::move(provider);
+    }
+    // The chain this shard is shipping, or nothing when it has none or no
+    // provider is installed. Must not block: a snapshot calls it on each shard.
+    std::optional<db::pitr::shard_chain> pitr_chain() const;
     replica::cf_stats* cf_stats() {
         return &_cf_stats;
     }

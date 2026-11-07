@@ -62,6 +62,8 @@
 #include "cdc/log.hh"
 #include "db/config.hh"
 #include "db/commitlog/commitlog.hh"
+#include "db/pitr/bound_file.hh"
+#include "db/pitr/pitr_shipper.hh"
 #include "utils/lister.hh"
 #include "dht/token.hh"
 #include "dht/i_partitioner.hh"
@@ -4385,6 +4387,41 @@ static future<> write_schema_as_cql(snapshot_writer& writer, cql3::description s
     }
 }
 
+/*!
+ * \brief write the snapshot's point-in-time-recovery bound file.
+ *
+ * Restore takes the set of shards, their replay bounds and their chain ids from
+ * this file and never from a bucket listing, so a shard whose chain is gone
+ * reads as a missing recorded chain rather than as a shard that never shipped
+ * (#12). A backup uploads it with the snapshot's other non-sstable files.
+ */
+static future<> write_bound_file(snapshot_writer& writer, const schema& s, const std::vector<db::replay_position>& bounds,
+        const std::vector<std::optional<db::pitr::shard_chain>>& chains) {
+    db::pitr::bound_file bf;
+    bf.capture_time_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
+    bf.schema_version = s.version();
+    for (unsigned shard = 0; shard < bounds.size(); ++shard) {
+        bf.shards.push_back(db::pitr::shard_bound{.shard = shard, .bound = bounds[shard], .chain = chains[shard]});
+    }
+    // Encoded whole before anything is opened, so a row this node cannot
+    // represent fails the snapshot instead of leaving a partial file behind.
+    auto content = db::pitr::encode(bf);
+
+    auto out = co_await writer.stream_for(db::pitr::bound_file_name);
+    std::exception_ptr ex;
+    try {
+        co_await out.write(content.data(), content.size());
+        co_await out.flush();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await out.close();
+
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+}
+
 class local_snapshot_writer : public snapshot_writer {
     std::filesystem::path _dir;
     db::snapshot_options _opts;
@@ -4436,12 +4473,22 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         // Per-shard commitlog bound, each taken together with that shard's sstable
         // list. Point-in-time recovery records these with the snapshot (#12).
         std::vector<db::replay_position> commitlog_bounds(this_smp_shard_count());
+        // The chain each shard was shipping, for the bound file below. Only
+        // collected when PITR can run, so that a snapshot taken on a node
+        // without it stays byte for byte what it was.
+        std::vector<std::optional<db::pitr::shard_chain>> pitr_chains(this_smp_shard_count());
+        const bool write_pitr_bound = db::pitr::should_hold_segments(sharded_db.local().get_config());
 
         co_await writer->init();
         co_await smp::invoke_on_all([&] -> future<> {
             auto& t = *table_shards;
             auto [tables, bound, permit] = co_await t.snapshot_sstables();
             commitlog_bounds[this_shard_id()] = bound;
+            if (write_pitr_bound) {
+                // A chain belongs to the shard's boot, not to the sstable list,
+                // so it needs no ordering against the capture.
+                pitr_chains[this_shard_id()] = sharded_db.local().pitr_chain();
+            }
             auto sstables_metadata = co_await t.get_sstables_manager().take_snapshot(std::move(tables), name);
             sstable_sets[this_shard_id()] = make_foreign(std::make_unique<utils::chunked_vector<sstables::sstable_snapshot_metadata>>(std::move(sstables_metadata)));
         });
@@ -4458,6 +4505,20 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
             tlogger.error("Failed writing schema file in snapshot in {} with exception {}", name, ptr);
             ex = std::move(ptr);
         });
+        if (write_pitr_bound) {
+            tlogger.debug("snapshot {}: writing {}", name, db::pitr::bound_file_name);
+            co_await write_bound_file(*writer, *s, commitlog_bounds, pitr_chains).handle_exception([&name, &ex](std::exception_ptr ptr) {
+                tlogger.error("Failed writing {} in snapshot {}: {}", db::pitr::bound_file_name, name, ptr);
+                ex = std::move(ptr);
+            });
+            // The manifest is the last file a snapshot writes, so nothing may
+            // fail after it: a manifest beside a missing or partial bound file
+            // would look like a snapshot a restore can replay from.
+            if (ex) {
+                co_await coroutine::return_exception_ptr(std::move(ex));
+            }
+        }
+
         tlogger.debug("snapshot {}: seal_snapshot", name);
         const auto& topology = sharded_db.local().get_token_metadata().get_topology();
         auto me = topology.my_host_id();
@@ -4536,7 +4597,10 @@ future<table::snapshot_sstable_list> table::snapshot_sstables() {
     // Both reads happen under the sstable-list permit, which flush and compaction
     // take too, so they are one observation. A flush completing between them would
     // add an sstable this list misses and let the commitlog release that sstable's
-    // segments, lifting the bound above writes the snapshot does not hold. Not
+    // segments, lifting the bound above writes the snapshot does not hold. That
+    // ordering is what the permit buys: a flush releases its segments
+    // (discard_completed_segments, below) only after adding the sstable to the
+    // list under the permit. Not
     // yielding between the reads is belt and braces, not the guarantee. Read the
     // member, not commitlog(), which refuses a readonly table. #12
     auto bound = _commitlog ? _commitlog->min_position() : db::replay_position();
@@ -4626,11 +4690,12 @@ future<table::snapshot_details> table::get_snapshot_details(fs::path snapshot_di
                 throw std::runtime_error("Injected exception in per-snapshot-get_snapshot_details");
             });
 
-            // The manifest and schema.cql files are the only files expected to be in this directory not belonging to the SSTable.
+            // The manifest, schema.cql and the point-in-time-recovery bound file are the only files expected
+            // to be in this directory not belonging to the SSTable.
             //
             // All the others should just generate an exception: there is something wrong, so don't blindly
             // add it to the size.
-            if (name != "manifest.json" && name != "schema.cql") {
+            if (name != "manifest.json" && name != "schema.cql" && name != db::pitr::bound_file_name) {
                 details.total += size;
                 if (sd.number_of_links == 1) {
                     // File exists only in the snapshot directory.

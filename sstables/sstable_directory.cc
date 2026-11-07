@@ -27,6 +27,7 @@
 #include "utils/overloaded_functor.hh"
 #include "utils/directories.hh"
 #include "utils/s3/client.hh"
+#include "db/pitr/bound_file.hh"
 #include "replica/database.hh"
 #include "dht/auto_refreshing_sharder.hh"
 
@@ -36,7 +37,10 @@ namespace sstables {
 
 bool manifest_json_filter(const fs::path&, const directory_entry& entry) {
     // Filter out directories. If type of the entry is unknown - check its name.
-    if (entry.type.value_or(directory_entry_type::regular) != directory_entry_type::directory && (entry.name == "manifest.json" || entry.name == "schema.cql")) {
+    // The point-in-time-recovery bound file joins them: it is not an sstable component, and the
+    // lister refuses a name it cannot parse rather than ignoring it (#12).
+    if (entry.type.value_or(directory_entry_type::regular) != directory_entry_type::directory &&
+            (entry.name == "manifest.json" || entry.name == "schema.cql" || entry.name == db::pitr::bound_file_name)) {
         return false;
     }
 

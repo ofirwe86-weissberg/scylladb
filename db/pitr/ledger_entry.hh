@@ -14,15 +14,11 @@
 #include <seastar/core/sstring.hh>
 
 #include "bytes.hh"
+#include "db/pitr/chain_provider.hh"
 #include "seastarx.hh"
 #include "utils/UUID.hh"
 
 namespace db::pitr {
-
-// A chain is one unbroken run of shipped segments from one shard of one boot.
-// A restart or an outage ends a chain and the next one gets a fresh id, so an
-// id never spans a break in coverage.
-using chain_id = utils::tagged_uuid<struct chain_id_tag>;
 
 // The ledger is a persisted format, read by a later version on restore, so a
 // reader that does not understand an entry must say so rather than guess.

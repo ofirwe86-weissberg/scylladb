@@ -217,6 +217,8 @@ add_scylla_test(pitr_apply_to_target_test
   KIND SEASTAR)
 add_scylla_test(pitr_bound_capture_test
   KIND SEASTAR)
+add_scylla_test(pitr_bound_file_test
+  KIND SEASTAR)
 add_scylla_test(pitr_chain_check_test
   KIND SEASTAR)
 add_scylla_test(pitr_ledger_entry_test
