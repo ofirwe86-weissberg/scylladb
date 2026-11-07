@@ -32,13 +32,21 @@
 #include <boost/test/unit_test.hpp>
 
 #include <seastar/core/abort_source.hh>
+#include <seastar/core/fstream.hh>
 #include <seastar/core/iostream.hh>
+#include <seastar/core/seastar.hh>
 #include <seastar/util/later.hh>
 
+#include <seastar/util/file.hh>
+
+#include "db/config.hh"
 #include "db/pitr/bound_file.hh"
 #include "db/pitr/chain_check.hh"
 #include "db/pitr/ledger_entry.hh"
+#include "db/pitr/replay_to.hh"
 #include "sstables/object_storage_client.hh"
+#include "test/lib/tmpdir.hh"
+#include "utils/crc.hh"
 #include "utils/memory_data_sink.hh"
 #include "utils/upload_progress.hh"
 
@@ -292,6 +300,9 @@ const checked_chain& accepted(const std::expected<checked_chain, refusal>& resul
 // The whole bound file, one shard at a time. Each shard ships a chain of its
 // own, as a real node does: the shard is part of every key, so a check that
 // read shard 0's chain twice would show up as the wrong keys.
+
+// The target a replay fetches for; the restore directory is named after it.
+const ::table_id test_target{utils::UUID("55556666-0000-4000-8000-00000000000c")};
 
 constexpr int64_t test_capture_time_us = test_chain_start_us + 10000;
 
@@ -759,4 +770,142 @@ SEASTAR_TEST_CASE(test_a_shard_the_bound_records_without_a_chain_is_refused) {
     const auto result = co_await check_all(store, bound, low);
     const auto& r = refused_history(result, refusal_reason::protection_records_missing);
     BOOST_REQUIRE(r.detail.find("shard 1") != sstring::npos);
+}
+
+// The fetch of a checked chain's segments (issue #18, ep.3). It lives here
+// because the fake store above is what it needs: a test file of its own waits
+// for the next change to configure.py.
+
+// One object in the store, and the entry that describes it.
+struct fetchable {
+    shipped_segment segment;
+    uint32_t crc32 = 0;
+    std::string body;
+};
+
+fetchable store_segment(fake_store& store, uint32_t shard, std::string body) {
+    const auto name = fmt::format("CommitLog-2-{}.log", segment_id_of(0));
+    fetchable f{
+            .segment = shipped_segment{.path = segment_object_key(shard_chain_key(shard), name), .used_size = body.size()},
+            .body = std::move(body),
+    };
+    utils::crc32 crc;
+    crc.process(reinterpret_cast<const uint8_t*>(f.body.data()), f.body.size());
+    f.crc32 = crc.get();
+    store.put(std::string(f.segment.path), f.body);
+    return f;
+}
+
+// A file where a run would have left one, written as it is.
+future<> write_file(const std::filesystem::path& path, std::string_view body) {
+    auto f = co_await seastar::open_file_dma(path.native(), seastar::open_flags::wo | seastar::open_flags::create | seastar::open_flags::truncate);
+    auto out = co_await seastar::make_file_output_stream(std::move(f));
+    co_await out.write(body.data(), body.size());
+    co_await out.flush();
+    co_await out.close();
+}
+
+future<std::expected<std::filesystem::path, refusal>> fetch(fake_store& store, const fetchable& f, const std::filesystem::path& dir, uint32_t crc32) {
+    fake_client client(store);
+    abort_source as;
+    co_return co_await fetch_segment(client, bucket, f.segment, crc32, dir, as);
+}
+
+SEASTAR_TEST_CASE(test_a_fetched_segment_holds_the_object_s_bytes) {
+    fake_store store;
+    const auto f = store_segment(store, 0, std::string(100000, 'x') + "tail");
+    tmpdir work;
+    const auto dir = co_await make_restore_dir(work.path(), test_target);
+    const auto fetched = co_await fetch(store, f, dir, f.crc32);
+    BOOST_REQUIRE_MESSAGE(fetched.has_value(), fmt::format("the fetch refused a healthy segment: {}", fetched.error()));
+    // The source's own file name: replay reads the segment's id and base
+    // position out of it.
+    BOOST_REQUIRE_EQUAL(fetched->filename().native(), fmt::format("CommitLog-2-{}.log", segment_id_of(0)));
+    BOOST_REQUIRE_EQUAL(fetched->parent_path().native(), dir.native());
+    const auto landed = co_await seastar::util::read_entire_file_contiguous(*fetched);
+    BOOST_REQUIRE_EQUAL(landed.size(), f.body.size());
+    BOOST_REQUIRE(landed == f.body);
+}
+
+SEASTAR_TEST_CASE(test_a_segment_of_another_size_is_refused_and_removed) {
+    fake_store store;
+    auto f = store_segment(store, 0, "the bytes the store holds");
+    // The record says the segment is longer than what the store holds, which is
+    // what a truncated upload leaves behind.
+    f.segment.used_size += 1;
+    tmpdir work;
+    const auto dir = co_await make_restore_dir(work.path(), test_target);
+    const auto fetched = co_await fetch(store, f, dir, f.crc32);
+    BOOST_REQUIRE_MESSAGE(!fetched.has_value(), "a segment of another size was accepted");
+    BOOST_REQUIRE_EQUAL(fetched.error().code(), reason_code(refusal_reason::shipped_object_damaged));
+    BOOST_REQUIRE_MESSAGE(
+            !co_await seastar::file_exists((dir / fmt::format("CommitLog-2-{}.log", segment_id_of(0))).native()), "the refused segment was left on disk");
+}
+
+SEASTAR_TEST_CASE(test_a_segment_with_another_checksum_is_refused_and_removed) {
+    fake_store store;
+    const auto f = store_segment(store, 0, "the bytes the store holds");
+    tmpdir work;
+    const auto dir = co_await make_restore_dir(work.path(), test_target);
+    const auto fetched = co_await fetch(store, f, dir, f.crc32 ^ 1);
+    BOOST_REQUIRE_MESSAGE(!fetched.has_value(), "a segment with another checksum was accepted");
+    BOOST_REQUIRE_EQUAL(fetched.error().code(), reason_code(refusal_reason::shipped_object_damaged));
+    BOOST_REQUIRE_MESSAGE(
+            !co_await seastar::file_exists((dir / fmt::format("CommitLog-2-{}.log", segment_id_of(0))).native()), "the refused segment was left on disk");
+}
+
+SEASTAR_TEST_CASE(test_a_segment_the_store_does_not_hold_is_refused) {
+    fake_store store;
+    auto f = store_segment(store, 0, "the bytes the store holds");
+    store.objects.clear();
+    tmpdir work;
+    const auto dir = co_await make_restore_dir(work.path(), test_target);
+    const auto fetched = co_await fetch(store, f, dir, f.crc32);
+    BOOST_REQUIRE_MESSAGE(!fetched.has_value(), "a segment the store does not hold was accepted");
+    BOOST_REQUIRE_EQUAL(fetched.error().code(), reason_code(refusal_reason::shipped_object_missing));
+    BOOST_REQUIRE_MESSAGE(!co_await seastar::file_exists((dir / fmt::format("CommitLog-2-{}.log", segment_id_of(0))).native()),
+            "a file was left behind for a segment that was never fetched");
+}
+
+// Startup replays whatever it finds in the commitlog directory, so a fetched
+// segment there would be replayed into the source table.
+SEASTAR_TEST_CASE(test_the_restore_directory_is_not_under_the_commitlog_directory) {
+    db::config cfg;
+    cfg.work_directory("/var/lib/scylla-pitr-test");
+    // Both commitlog options are unset here, as they are on most nodes, and the
+    // node fills them from the work directory: the comparison has to be with
+    // what it ends up using, not with the empty default.
+    cfg.setup_directories();
+    const auto work_dir = std::filesystem::path(cfg.work_directory());
+    const auto root = restore_root(work_dir).lexically_normal();
+    for (const auto& directory : {cfg.commitlog_directory(), cfg.schema_commitlog_directory()}) {
+        const auto commitlog = std::filesystem::path(directory).lexically_normal();
+        BOOST_REQUIRE(!commitlog.empty());
+        BOOST_REQUIRE_MESSAGE(!root.native().starts_with(commitlog.native()), fmt::format("{} is under the commitlog directory {}", root, commitlog));
+        BOOST_REQUIRE_MESSAGE(!commitlog.native().starts_with(root.native()), fmt::format("the commitlog directory {} is under {}", commitlog, root));
+    }
+    BOOST_REQUIRE(restore_dir_path(work_dir, test_target).native().starts_with(root.native()));
+    co_return;
+}
+
+SEASTAR_TEST_CASE(test_the_restore_directory_is_made_empty_and_removed_and_swept) {
+    tmpdir work;
+    const auto dir = co_await make_restore_dir(work.path(), test_target);
+    const auto leftover = dir / "CommitLog-2-1.log";
+    co_await write_file(leftover, "a segment an interrupted run fetched");
+    // A second run on the same target starts from nothing: what the first one
+    // left is of no use to it.
+    BOOST_REQUIRE_EQUAL((co_await make_restore_dir(work.path(), test_target)).native(), dir.native());
+    BOOST_REQUIRE(!co_await seastar::file_exists(leftover.native()));
+
+    co_await remove_restore_dir(work.path(), test_target);
+    BOOST_REQUIRE(!co_await seastar::file_exists(dir.native()));
+    // Removing it twice is what every path out of a run does.
+    co_await remove_restore_dir(work.path(), test_target);
+
+    co_await make_restore_dir(work.path(), test_target);
+    co_await sweep_restore_dirs(work.path());
+    BOOST_REQUIRE(!co_await seastar::file_exists(restore_root(work.path()).native()));
+    // A node that never replayed has no root to sweep.
+    co_await sweep_restore_dirs(work.path());
 }

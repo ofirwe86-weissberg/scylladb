@@ -116,6 +116,32 @@ future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id t
 // a target that was never replayed into.
 future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target);
 
+// Where a run's fetched segments live: under the work directory, one directory
+// per target, and never under the commitlog directory - startup replays
+// whatever it finds there (`commitlog.cc`, list_existing_descriptors).
+std::filesystem::path restore_root(const std::filesystem::path& work_dir);
+std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::table_id target);
+
+// Empty: what a crashed run of the same target left is of no use to this one.
+future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target);
+
+// Called on every path out of a run, a failure and an abort too, so neither
+// throws: a leftover costs disk and nothing else. The sweep runs at node start,
+// where no run is in flight, so it drops the whole root.
+future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept;
+future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept;
+
+// Streams one shipped segment into `dir`, under the file name the source wrote
+// it with, since replay reads the segment's id and base position out of it, and
+// proves what landed is what the ledger recorded: the entry's size and its
+// `utils::crc32`. Refuses what says something about the history - an object the
+// store does not hold, one whose size or checksum is not the entry's - and
+// throws on a read, disk or abort error; either way no file is left behind.
+// Nothing is buffered whole, and the read stops one byte past the recorded
+// size, so an object that grew cannot fill the disk. Yields per chunk.
+future<std::expected<std::filesystem::path, refusal>> fetch_segment(sstables::object_storage_client& client, sstring bucket, const shipped_segment& segment,
+        uint32_t expected_crc32, std::filesystem::path dir, seastar::abort_source& as);
+
 // Drops from a snapshot's `schema.cql` what a replay into another table is
 // allowed to differ in: the table's name wherever a statement names it, its
 // `ID` option and its `compaction` option (P52). Both sides come from the same
@@ -151,19 +177,17 @@ struct replay_start {
 // call's snapshot, it carries a bound file the strict reader accepts, the
 // target's schema matches the backup's, this node has a shipping location to
 // read the history from, and every chain the bound names holds together and
-// covers T. The chain checks come last and still before the mark, so a T above
-// coverage can be retried on the same target. The mark comes before the
-// state of the table, because a marked target is answered with "drop it"
-// whatever state a run left it in. The cheap local checks come first, so
-// a plainly wrong call never reaches the store, and the mark is written last,
-// so a refusal leaves the node as it was.
+// covers T. The cheap local checks come first, so a plainly wrong call never
+// reaches the store; the chain checks come last and still before the mark, so a
+// T above coverage can be retried on the same target. A marked target is
+// answered with "drop it" whatever state a run left it in, so a refusal must
+// leave no mark.
 //
 // Runs on shard 0: `in_flight` is that shard's, so two calls on one target meet
-// there whichever shards they arrived on.
-// A refusal is the answer to a question about the call; a store or disk error is
-// an exception, since it says nothing about the backup. Reads the backup's three
-// files and every ledger entry of every chain it names, yields per read, per
-// manifest entry and per entry, and needs every reference to outlive the call.
+// there whichever shards they arrived on. A refusal answers a question about the
+// call; a store or disk error is an exception, saying nothing about the backup.
+// Reads the backup's three files and every ledger entry of every chain it names,
+// yields per read and per entry, and needs every reference to outlive the call.
 future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
         std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
 

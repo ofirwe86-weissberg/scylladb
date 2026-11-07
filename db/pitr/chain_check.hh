@@ -90,22 +90,17 @@ struct checked_history {
 
 // Runs `check_chain()` for every shard of the bound file and returns what a
 // restore to `target_time_us` may replay, or the one refusal that answers the
-// call. Nothing is fetched and nothing is written here, so a refusal leaves the
-// node untouched and the user can retry with a corrected T.
+// call. Nothing is fetched and nothing is written, so a refusal leaves the node
+// untouched and the user can retry with a corrected T.
 //
-// Which refusal, when shards disagree: a shard whose records are missing or
-// damaged, or whose backup predates its shipping, is refused at once, because
-// no T makes it readable. When shards only lag, the one covering least is the
-// one reported, since it is what bounds T, and its interval runs from the
-// backup's capture time rather than the chain's start.
+// Which refusal, when shards disagree: records missing or damaged, or a backup
+// predating its shipping, is refused at once, no T making it readable. When
+// shards only lag, the one covering least is reported, since it is what bounds
+// T, and its interval runs from the backup's capture time. A shard the bound
+// records without a chain is refused as records missing (PM-50).
 //
-// A shard the bound file records without a chain is refused as records missing:
-// the bound names it, so it was writing when the backup was taken, and nothing
-// says it shipped (PM-50).
-//
-// Yields through `check_chain()`, once per ledger entry of every shard. Holds
-// every chain's segment list, which grows with the chain, so a long chain costs
-// what the restore is about to fetch (#18).
+// Yields through `check_chain()`, per ledger entry of every shard. Holds every
+// chain's segment list, which grows with the chain (#18).
 future<std::expected<checked_history, refusal>> check_bound_chains(sstables::object_storage_client& client, sstring bucket, sstring key_prefix,
         const bound_file& bound, int64_t target_time_us, seastar::abort_source& as);
 

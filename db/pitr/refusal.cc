@@ -46,6 +46,10 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "target_uses_tablets";
     case refusal_reason::backup_manifest_damaged:
         return "backup_manifest_damaged";
+    case refusal_reason::shipped_object_missing:
+        return "shipped_object_missing";
+    case refusal_reason::shipped_object_damaged:
+        return "shipped_object_damaged";
     }
     return "unknown";
 }
