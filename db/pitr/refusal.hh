@@ -78,10 +78,16 @@ enum class refusal_reason {
     // A file of the backup is larger than a replay reads: damage, or a prefix
     // holding something else entirely.
     backup_file_too_large,
+    // A segment the ledger records is not in the store, so the history between
+    // the backup and T has a hole the replay cannot read over.
+    shipped_object_missing,
+    // It is there, but what was fetched is not what its ledger entry recorded:
+    // another size, or another checksum.
+    shipped_object_damaged,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 18> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 20> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
@@ -100,6 +106,8 @@ inline constexpr std::array<refusal_reason, 18> all_refusal_reasons{
         refusal_reason::target_uses_tablets,
         refusal_reason::backup_manifest_damaged,
         refusal_reason::backup_file_too_large,
+        refusal_reason::shipped_object_missing,
+        refusal_reason::shipped_object_damaged,
 };
 
 std::string_view reason_code(refusal_reason) noexcept;

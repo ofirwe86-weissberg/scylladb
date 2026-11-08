@@ -48,6 +48,10 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "backup_manifest_damaged";
     case refusal_reason::backup_file_too_large:
         return "backup_file_too_large";
+    case refusal_reason::shipped_object_missing:
+        return "shipped_object_missing";
+    case refusal_reason::shipped_object_damaged:
+        return "shipped_object_damaged";
     }
     return "unknown";
 }

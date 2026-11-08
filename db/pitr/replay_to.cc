@@ -35,6 +35,7 @@
 #include "schema/schema.hh"
 #include "sstables/object_storage_client.hh"
 #include "sstables/sstables_manager.hh"
+#include "utils/crc.hh"
 #include "utils/log.hh"
 
 namespace db::pitr {
@@ -153,6 +154,149 @@ future<std::optional<replay_state>> read_replay_state(const std::filesystem::pat
     }
     auto body = co_await seastar::util::read_entire_file_contiguous(path);
     co_return decode_replay_state(body);
+}
+
+std::filesystem::path restore_root(const std::filesystem::path& work_dir) {
+    return work_dir / "pitr" / "restore";
+}
+
+std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::table_id target) {
+    return restore_root(work_dir) / fmt::format("{}", target.uuid());
+}
+
+future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target) {
+    auto dir = restore_dir_path(work_dir, target);
+    if (co_await file_exists(dir.native())) {
+        replay_log.info("dropping what an earlier replay of {} left in {}", target, dir.native());
+        co_await recursive_remove_directory(dir);
+    }
+    co_await recursive_touch_directory(dir.native());
+    co_return dir;
+}
+
+future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept {
+    auto dir = restore_dir_path(work_dir, target);
+    try {
+        if (co_await file_exists(dir.native())) {
+            co_await recursive_remove_directory(dir);
+        }
+    } catch (...) {
+        replay_log.warn("could not remove the replay's restore directory {}: {}", dir.native(), std::current_exception());
+    }
+}
+
+future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept {
+    auto root = restore_root(work_dir);
+    try {
+        if (co_await file_exists(root.native())) {
+            replay_log.info("dropping the segments an interrupted replay left in {}", root.native());
+            co_await recursive_remove_directory(root);
+        }
+    } catch (...) {
+        replay_log.warn("could not sweep {}: {}", root.native(), std::current_exception());
+    }
+}
+
+static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, sstring detail);
+
+// A file no step may read again. Removing it must not hide the failure that led
+// here, nor fail a run that is otherwise fine.
+static future<> remove_quietly(const std::filesystem::path& path) noexcept {
+    try {
+        if (co_await file_exists(path.native())) {
+            co_await remove_file(path.native());
+        }
+    } catch (...) {
+        replay_log.warn("could not remove {}: {}", path.native(), std::current_exception());
+    }
+}
+
+// The bytes the fetch read, so the caller can tell a short object from a long
+// one without reading the file again.
+struct fetched_bytes {
+    uint64_t size = 0;
+    uint32_t crc32 = 0;
+};
+
+// Streams the object into the open file, stopping one byte past the size the
+// ledger recorded: an object that grew is refused by the size check, and never
+// written whole.
+static future<fetched_bytes> stream_object_to_file(
+        sstables::object_storage_client& client, const sstables::object_name& object, output_stream<char>& out, uint64_t used_size, abort_source& as) {
+    fetched_bytes fetched;
+    utils::crc32 crc;
+    auto is = input_stream<char>(client.make_download_source(object, &as));
+    std::exception_ptr ex;
+    try {
+        while (fetched.size <= used_size) {
+            as.check();
+            auto buf = co_await is.read();
+            if (buf.empty()) {
+                break;
+            }
+            fetched.size += buf.size();
+            crc.process(reinterpret_cast<const uint8_t*>(buf.get()), buf.size());
+            co_await out.write(buf.get(), buf.size());
+            co_await coroutine::maybe_yield();
+        }
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    co_await is.close();
+    if (ex) {
+        std::rethrow_exception(std::move(ex));
+    }
+    fetched.crc32 = crc.get();
+    co_return fetched;
+}
+
+future<std::expected<std::filesystem::path, refusal>> fetch_segment(sstables::object_storage_client& client, sstring bucket, const shipped_segment& segment,
+        uint32_t expected_crc32, std::filesystem::path dir, abort_source& as) {
+    // The ledger refuses a file name holding a path separator, so this cannot
+    // reach out of the directory.
+    const auto local = dir / std::filesystem::path(std::string_view(segment.path)).filename();
+    const auto object = sstables::object_name(bucket, segment.path);
+    std::exception_ptr read_error;
+    fetched_bytes fetched;
+    try {
+        auto f = co_await open_file_dma(local.native(), open_flags::wo | open_flags::create | open_flags::truncate);
+        auto out = co_await make_file_output_stream(std::move(f));
+        std::exception_ptr ex;
+        try {
+            fetched = co_await stream_object_to_file(client, object, out, segment.used_size, as);
+            co_await out.flush();
+        } catch (...) {
+            ex = std::current_exception();
+        }
+        co_await out.close();
+        if (ex) {
+            std::rethrow_exception(std::move(ex));
+        }
+    } catch (...) {
+        read_error = std::current_exception();
+    }
+    if (read_error) {
+        // Nothing reads a partial file, and the next run would meet it under
+        // the same name.
+        co_await remove_quietly(local);
+        if (co_await client.object_exists(object, &as)) {
+            std::rethrow_exception(std::move(read_error));
+        }
+        co_return refuse(refusal_reason::shipped_object_missing,
+                "A commitlog segment the protection records name is not in the store, so the history between the backup and T has a hole. Restore from a "
+                "later backup.",
+                seastar::format("{}: {}", object, read_error));
+    }
+    if (fetched.size != segment.used_size || fetched.crc32 != expected_crc32) {
+        co_await remove_quietly(local);
+        co_return refuse(refusal_reason::shipped_object_damaged,
+                "A commitlog segment in the store is not the one its protection record describes, so what it holds cannot be trusted. Restore from a later "
+                "backup.",
+                seastar::format("{}: {} bytes with checksum {:#x}, where the record says {} bytes with checksum {:#x}", object, fetched.size, fetched.crc32,
+                        segment.used_size, expected_crc32));
+    }
+    replay_log.debug("fetched {} to {}, {} bytes", object, local.native(), fetched.size);
+    co_return local;
 }
 
 static constexpr std::string_view table_name_placeholder = "<table>";

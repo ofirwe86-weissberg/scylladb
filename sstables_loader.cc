@@ -1059,6 +1059,12 @@ future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& pa
     // ep.3. Until they land the task ends in failure and never in `done`: the
     // target carries the `started` mark, so it reads as incomplete, and a
     // recovery that did not replay anything may not read as a finished one.
+    const auto work_dir = std::filesystem::path(_db.local().get_config().work_directory());
+    // Where the replay fetches the history to, from here to the end of the run.
+    // Taken before the load, so that a failure of the load has the same single
+    // way out as a failure of the replay.
+    const auto restore_dir = co_await db::pitr::make_restore_dir(work_dir, start->target);
+    llog.info("Point-in-time replay of {}.{}: fetching the history into {}", params.keyspace, params.table, restore_dir.native());
     auto progress = make_lw_shared<download_progress>();
     std::exception_ptr load_error;
     try {
@@ -1067,6 +1073,9 @@ future<> sstables_loader::do_pitr_replay_to(const db::pitr::replay_to_params& pa
         load_error = std::current_exception();
     }
     co_await progress->stop();
+    // Every path out of the run, a failure and an abort too: what was fetched is
+    // a copy of what the store holds, and nothing reads it after the run.
+    co_await db::pitr::remove_restore_dir(work_dir, start->target);
     if (load_error) {
         // A load that failed leaves the target marked, so it reads as
         // incomplete and a second call is refused: the user drops it and
