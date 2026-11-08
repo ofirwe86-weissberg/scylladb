@@ -18,7 +18,7 @@ import time
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_exact, backup_prefix, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, keys_on_every_shard,
+    assert_exact, backup_prefix, iso, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, keys_on_every_shard,
     keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, put_object,
     read_exact, Reason, report_stalls, RESULT_LOGGED_WORDS, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W, write_several_sstables
 )
@@ -240,8 +240,8 @@ async def test_backup_with_unfinished_upload_is_refused(manager: ScyllaClusterMa
 
 @needs_phase('ep.3')
 async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(manager: ScyllaClusterManager, s3_storage):
-    """R16-P2: REF-13. A second replay into a target that is already `done` is refused, the message says where the first run's
-    result was logged, and the target keeps its rows. Control: the first call was `done` and the target is not empty."""
+    """R16-P2: REF-13. A second replay into a target that is already `done` is refused, the message names the earlier run's backup
+    and T, and the target keeps its rows. Control: the first call was `done` and the target is not empty."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
         await p.write(simple_rows(pks, old_ts(), 'seed'))
@@ -254,6 +254,6 @@ async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(man
         assert rows, 'the first replay must have loaded the backup'
         second, _ = await p.replay(t, target)
         assert second.state == 'failed' and second.reason == Reason.TARGET_ALREADY_REPLAYED, f'a done target must be refused: {second}'
-        for word in RESULT_LOGGED_WORDS:
-            assert word in second.message.lower(), f'the refusal must name the earlier run: {second}'
+        assert p.snap in second.message, f'the refusal must name the earlier run\'s backup {p.snap}: {second}'
+        assert iso(t) in second.message, f'the refusal must name the earlier run\'s T {iso(t)}: {second}'
         assert await read_exact(p.cql, p.ks, target) == rows, 'the refused replay changed the target'
