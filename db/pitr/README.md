@@ -281,6 +281,7 @@ more.
 | RPO after `kill -9` at a random point, S = 60 s (release) | 15.7 s, 28.7 s and 60.1 s: the kill's point in the seal cycle plus 1.7 to 2.4 s. No acknowledged write older than L was missing |
 | RTO, release build | 7.6 to 7.8 s: checks 0.2 s, loading the backup 0.5 s, fetching and replaying 360 MB in 18 segments 6.8 to 7.1 s, flush 0.1 s |
 | RTO, dev build | 12.0 to 12.5 s |
+| Larger run, release | 1 GB backup and 900 s of writes (234k rows): lag highest sample 59.98 s; RPO over 5 kills 14.4 to 60.1 s; RTO 55 to 58 s, of which loading the backup 9 to 10 s and fetching and replaying 1.63 GB in 56 to 58 segments 45 to 47 s |
 
 ## Limits
 
@@ -405,35 +406,50 @@ more.
     node tests, which run with fsync bypassed.
 37. Buckets with object lock (write once, read many) aren't supported: a
     retried upload can write an object again with the same bytes.
+38. A restore fetches every shipped segment of the chain the backup names,
+    including those holding only writes from before the backup. The
+    backup's bound is conservative, so many of those writes are replayed
+    again on top of the loaded backup. That is harmless, since a write
+    replayed with its own timestamp changes nothing, but it costs time. RTO
+    therefore grows with everything the node wrote in that chain, the
+    backup's own data included. In the 1 GB measured run, all 1.28 million
+    writes were replayed, about 80% of them already in the backup (#117).
 
-## Implementation status (2026-11-07)
+## Implementation status (2026-11-08)
 
 **Merged on `ow/pitr/v1`:**
 - shipping of sealed segments to the configured store, with a per-shard
-  chain and its floor (#81);
-- the snapshot's `pitr-bound.txt`, with a strict reader (#80);
-- ledger entries written in segment-id order, holds released after them
-  (#85);
-- the earlier restore pieces: the T parser, the chain check, the strict
-  replay reader, the T filter, and apply to target.
+  chain and its floor (#81), ledger entries in segment-id order (#85), and
+  the outage latch (#87);
+- the snapshot's `pitr-bound.txt`, with a strict reader (#80), and the bound
+  taken from the sstables, raised to the chain floor (#106);
+- the `replay_to` endpoint, its checks, the `started` mark and the load of
+  the backup with compaction held off (#94-#96);
+- the chain check of every shard before the mark (#107), the fetch of each
+  segment with size and CRC checks (#113), and the replay into the target,
+  the flush and the durable `done` (#114);
+- the measured-run harness (#115) and its numbers above (#118).
 
-**In review:** the `replay_to` endpoint, its checks, the `started` mark and
-the load of the backup with compaction held off (#18).
+A restore of one table to T runs end to end, and the node tests for exact
+data at T and for deleted rows pass on the merged code. A full-level
+re-review of the restore path is still open (#92) before a restore is called
+usable in production.
 
 **Not built yet:**
-- #18's fetch and replay: fetch, replay and apply the shipped history,
-  flush, and the durable `done`;
-- the target check accepts the schema option once #18's fix round lands;
 - the table-kind, `durable_writes` and one-node/RF refusals (#15);
-- the status GET;
 - the TRUNCATE and schema-change refusals, and the encryption and idle-shard
   refusals;
+- the status GET (#14);
 - the marker that shows a backup's upload finished, so an interrupted
-  backup is refused;
-- the outage latch (in progress).
+  backup is refused (#12).
 
-Until these land, a restore isn't usable: the endpoint loads the backup and
-then fails on purpose, leaving the target `incomplete`.
+**Future work, found by the measured run (#21):**
+- make RTO follow the history since the backup: skip the chain segments
+  wholly below the backup's bound, and find out why the bound sits lower
+  than the backup needs, so writes already in the backup aren't replayed
+  again (#117; an optimization, restores are correct without it);
+- log the seal instant, so U is measured directly rather than derived
+  (#116).
 
 ## Testing
 
