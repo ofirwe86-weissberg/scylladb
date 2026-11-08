@@ -804,6 +804,10 @@ async def test_gate_holds_a_response_and_recover_frees_it():
         reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
         writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
         assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400
+        # The gate sets holding after it has written the first bytes, so the client can read them before it is set.
+        async def holding():
+            return gate.holding.is_set() or None
+        await wait_for(holding, time.time() + 5)
         assert gate.holding.is_set()
         gate.recover()
         assert not gate.holding.is_set(), 'recover() must clear holding'
