@@ -246,9 +246,8 @@ future<std::expected<replay_run_stats, refusal>> replay_history_into_target(shar
 // as written after T, and what could not be verified (PM-66).
 sstring format_replay_result(const replay_to_params&, const replay_start&, const replay_run_stats&);
 
-// Why a run that lost its hold of the target's compaction fails rather than
-// reaching `done` (#111). `stage` completes "while the ...", naming what ran
-// when the hold was found lost.
+// The refusal a run fails with when it lost its hold of the target's
+// compaction (#111). `stage` completes "while the ...".
 refusal compaction_during_replay_refusal(const replay_to_params&, std::string_view stage);
 
 } // namespace db::pitr
