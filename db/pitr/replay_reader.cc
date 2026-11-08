@@ -224,19 +224,28 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
     rlogger.info("strict replay of {} segment(s) for shard {} of table {}, bound {}, truncation floor {}", params.segments.size(), params.shard,
             params.source_table, params.bound, params.truncate_floor);
 
-    for (const auto& seg : params.segments) {
-        const auto d = parse_name(params, seg);
-        const auto entry_fmt = entry_format(seg, d);
+    for (const auto& listed : params.segments) {
+        // Off the listed name, before anything opens a file: the list's order
+        // and shard are the caller's promise, and a fetch of a segment the list
+        // may not hold is work wasted.
+        const auto d = parse_name(params, listed);
+        const auto entry_fmt = entry_format(listed, d);
         if (replay_position(d).shard_id() != params.shard) {
-            refuse(seg, fmt::format("belongs to shard {}, not {}", replay_position(d).shard_id(), params.shard));
+            refuse(listed, fmt::format("belongs to shard {}, not {}", replay_position(d).shard_id(), params.shard));
         }
         if (previous_id && d.id <= *previous_id) {
-            refuse(seg, fmt::format("has id {}, which does not follow {}: the list must be in ascending id order", d.id, *previous_id));
+            refuse(listed, fmt::format("has id {}, which does not follow {}: the list must be in ascending id order", d.id, *previous_id));
         }
         previous_id = d.id;
-        co_await check_file(params, seg, d);
 
+        // What is read, which is the local copy when the caller brings one in.
+        auto seg = listed;
+        if (params.open_segment) {
+            seg.path = co_await params.open_segment(listed);
+        }
+        std::exception_ptr ex;
         try {
+            co_await check_file(params, seg, d);
             co_await commitlog::read_log_file(
                     state, seg.path, params.filename_prefix,
                     [&](commitlog::buffer_and_replay_position buf_rp) {
@@ -244,10 +253,18 @@ future<replay_reader_stats> replay_shard_segments(const shard_replay_params& par
                     },
                     0, params.extensions);
         } catch (...) {
+            ex = std::current_exception();
+        }
+        // On a failure too: the caller holds one segment of local disk at a
+        // time, and a run that is ending still has to give it back.
+        if (params.close_segment) {
+            co_await params.close_segment(seg.path);
+        }
+        if (ex) {
             // Normal replay counts damage and carries on. Restore cannot: the
             // entries behind it are the ones the user asked for.
-            rlogger.error("strict replay of {} failed after {} entries: {:t}", seg.path, stats.entries_read, std::current_exception());
-            throw;
+            rlogger.error("strict replay of {} failed after {} entries: {:t}", seg.path, stats.entries_read, ex);
+            std::rethrow_exception(std::move(ex));
         }
         ++stats.segments_read;
         co_await coroutine::maybe_yield();

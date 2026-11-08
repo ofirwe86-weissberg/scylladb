@@ -27,7 +27,9 @@
 #include <seastar/util/file.hh>
 
 #include "cql3/description.hh"
+#include "db/commitlog/commitlog.hh"
 #include "db/config.hh"
+#include "marshal_exception.hh"
 #include "db/pitr/t_parser.hh"
 #include "replica/database.hh"
 #include "replica/memtable.hh"
@@ -36,7 +38,9 @@
 #include "sstables/object_storage_client.hh"
 #include "sstables/sstables_manager.hh"
 #include "utils/crc.hh"
+#include "utils/error_injection.hh"
 #include "utils/log.hh"
+#include "utils/on_internal_error.hh"
 
 namespace db::pitr {
 
@@ -120,7 +124,7 @@ std::filesystem::path replay_state_path(const std::filesystem::path& state_dir, 
     return state_dir / fmt::format("{}.replay", target.uuid());
 }
 
-future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id target, const replay_state& state) {
+future<> write_replay_state(std::filesystem::path state_dir, ::table_id target, replay_state state) {
     auto body = encode(state);
     auto path = replay_state_path(state_dir, target);
     auto tmp = path;
@@ -147,7 +151,7 @@ future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id t
     replay_log.info("wrote the {} mark of {} to {}", phase_name(state.phase), target, path.native());
 }
 
-future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target) {
+future<std::optional<replay_state>> read_replay_state(std::filesystem::path state_dir, ::table_id target) {
     auto path = replay_state_path(state_dir, target);
     if (!co_await file_exists(path.native())) {
         co_return std::nullopt;
@@ -164,7 +168,7 @@ std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::
     return restore_root(work_dir) / fmt::format("{}", target.uuid());
 }
 
-future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target) {
+future<std::filesystem::path> make_restore_dir(std::filesystem::path work_dir, ::table_id target) {
     auto dir = restore_dir_path(work_dir, target);
     if (co_await file_exists(dir.native())) {
         replay_log.info("dropping what an earlier replay of {} left in {}", target, dir.native());
@@ -174,7 +178,7 @@ future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work
     co_return dir;
 }
 
-future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept {
+future<> remove_restore_dir(std::filesystem::path work_dir, ::table_id target) noexcept {
     auto dir = restore_dir_path(work_dir, target);
     try {
         if (co_await file_exists(dir.native())) {
@@ -185,7 +189,7 @@ future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id ta
     }
 }
 
-future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept {
+future<> sweep_restore_dirs(std::filesystem::path work_dir) noexcept {
     auto root = restore_root(work_dir);
     try {
         if (co_await file_exists(root.native())) {
@@ -201,7 +205,9 @@ static std::unexpected<refusal> refuse(refusal_reason reason, sstring message, s
 
 // A file no step may read again. Removing it must not hide the failure that led
 // here, nor fail a run that is otherwise fine.
-static future<> remove_quietly(const std::filesystem::path& path) noexcept {
+// By value: this suspends, and a caller with a temporary path would otherwise
+// leave a dangling reference across the suspension.
+static future<> remove_quietly(std::filesystem::path path) noexcept {
     try {
         if (co_await file_exists(path.native())) {
             co_await remove_file(path.native());
@@ -357,6 +363,30 @@ future<sstring> normalize_schema_cql(std::string_view text) {
         out += "\n";
     }
     co_return out;
+}
+
+std::optional<::table_id> parse_source_table_id(std::string_view schema_cql) {
+    // Describe writes the id as the first WITH option, on the line that closes
+    // the column list; anywhere else those words are part of a value.
+    static constexpr std::string_view opener = ") WITH ID = ";
+    while (!schema_cql.empty()) {
+        const auto end = schema_cql.find('\n');
+        const auto line = trim(end == std::string_view::npos ? schema_cql : schema_cql.substr(0, end));
+        schema_cql.remove_prefix(end == std::string_view::npos ? schema_cql.size() : end + 1);
+        if (!line.starts_with(opener)) {
+            continue;
+        }
+        const auto value = trim(line.substr(opener.size()));
+        try {
+            auto id = ::table_id(utils::UUID(value));
+            if (id.uuid()) {
+                return id;
+            }
+        } catch (const marshal_exception&) {
+        }
+        return std::nullopt;
+    }
+    return std::nullopt;
 }
 
 future<std::optional<refusal>> check_schema_match(std::string_view target_cql, std::string_view backup_cql) {
@@ -698,6 +728,17 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
                 "The backup carries no schema, so the target cannot be checked against it. The prefix names another backup.",
                 seastar::format("{}/{}", p.prefix, schema_cql_file_name));
     }
+    // The replay applies the entries of this one table and no other, so without
+    // its id nothing can be replayed: a schema.cql with no `ID` option is not
+    // one a snapshot of a supported version wrote.
+    const auto source_table_id = parse_source_table_id(**backup_cql);
+    if (!source_table_id) {
+        co_return refuse(refusal_reason::backup_file_missing,
+                "The backup's schema does not record the table's id, so the shipped commitlog cannot be matched to it. The backup was written by an "
+                "unsupported version.",
+                seastar::format("{}/{} carries no ID option", p.prefix, schema_cql_file_name));
+    }
+
     auto describe_helper = replica::make_schema_describe_helper(target_schema, local.as_data_dictionary());
     auto target_cql = target_schema->describe(describe_helper, cql3::describe_option::STMTS_AND_INTERNALS).create_statement->linearize();
     if (auto mismatch = co_await check_schema_match(target_cql, **backup_cql)) {
@@ -750,8 +791,123 @@ future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::da
             .toc_names = std::move(manifest->toc_names),
             .source_keyspace = std::move(manifest->keyspace),
             .source_table = std::move(manifest->table),
+            .source_table_id = *source_table_id,
             .in_flight = std::move(*held),
     };
+}
+
+// A refusal raised from inside the reader's fetch hook. The reader answers with
+// stats or an exception and has no refusal of its own, so this carries one out
+// of the hook to the one caller that installed it.
+class fetch_refused : public std::runtime_error {
+public:
+    refusal reason;
+    explicit fetch_refused(refusal r)
+        : std::runtime_error(fmt::format("{}", r))
+        , reason(std::move(r)) {
+    }
+};
+
+future<std::expected<replay_run_stats, refusal>> replay_history_into_target(sharded<replica::database>& db, sstables::object_storage_client& client,
+        sstring bucket, const replay_start& start, std::filesystem::path restore_dir, abort_source& as) {
+    if (start.history.chains.size() != start.bound.shards.size()) {
+        on_internal_error(replay_log,
+                seastar::format("the checked history holds {} chain(s) for a bound of {} shard(s)", start.history.chains.size(), start.bound.shards.size()));
+    }
+    // The source wrote its segments with this node's prefix: both run the same
+    // Scylla, and the reader reads the segment's id out of the file name.
+    const sstring filename_prefix = db::commitlog::descriptor::FILENAME_PREFIX;
+    const auto& extensions = db.local().get_config().extensions();
+    // One instance for the whole replay: a source schema version is rebuilt on
+    // a shard once and not once per entry.
+    sharded<shard_mapping_cache> mappings;
+    co_await mappings.start();
+    replay_run_stats stats;
+    std::optional<refusal> refused;
+    std::exception_ptr ex;
+    try {
+        target_applier applier(db, mappings, start.target, start.t);
+        for (size_t shard_index = 0; shard_index < start.history.chains.size() && !refused; ++shard_index) {
+            const auto& chain = start.history.chains[shard_index];
+            const auto& shard = start.bound.shards[shard_index];
+            shard_replay_params params;
+            params.segments = chain.segments;
+            params.filename_prefix = filename_prefix;
+            params.shard = shard.shard;
+            params.source_table = start.source_table_id;
+            params.bound = shard.bound;
+            params.extensions = &extensions;
+            // One call for the whole chain, so a write split over a segment
+            // boundary is reassembled, while the hooks keep one segment of local
+            // disk at a time. The reader opens them in list order, which is what
+            // pairs a segment with its recorded checksum.
+            size_t next = 0;
+            params.open_segment = [&](const shipped_segment& segment) -> future<sstring> {
+                as.check();
+                if (next >= chain.segments.size() || segment.path != chain.segments[next].path) {
+                    on_internal_error(replay_log, seastar::format("the reader asked for {} where the chain's segment {} was expected", segment.path, next));
+                }
+                auto fetched = co_await fetch_segment(client, bucket, segment, chain.segment_crc32s[next], restore_dir, as);
+                ++next;
+                if (!fetched) {
+                    // The reader has no refusal of its own, so this leaves
+                    // through the exception the caller unwraps below.
+                    co_await coroutine::return_exception(fetch_refused{std::move(fetched.error())});
+                }
+                ++stats.objects_read;
+                stats.bytes_read += segment.used_size;
+                co_return sstring(fetched->native());
+            };
+            params.close_segment = [](const sstring& local_path) -> future<> {
+                // The local copy is of no use to anything once the reader is
+                // done with it, and the next fetch needs the disk.
+                co_await remove_quietly(std::filesystem::path(std::string_view(local_path)));
+                // One segment of the history is read and the next is not, so a
+                // test can fail a run in the middle of the replay rather than
+                // before it or after it.
+                utils::get_local_injector().inject("pitr_replay_segment_replayed", [] {
+                    throw std::runtime_error("Injected replay failure");
+                });
+            };
+            replay_reader_stats reader;
+            try {
+                reader = co_await replay_shard_segments(params, [&applier](const replay_entry& entry) {
+                    return applier(entry);
+                });
+            } catch (const fetch_refused& e) {
+                refused = e.reason;
+                break;
+            }
+            stats.entries_replayed += reader.entries_replayed;
+            stats.incomplete_split_writes += reader.incomplete_split_writes;
+            stats.dropped_below_bound += reader.dropped_below_bound;
+            replay_log.debug("replayed {} segment(s) of shard {}: {} entry/entries applied of {} read, {} split write(s) left incomplete", reader.segments_read,
+                    shard.shard, reader.entries_replayed, reader.entries_read, reader.incomplete_split_writes);
+        }
+        stats.applier = applier.stats();
+    } catch (...) {
+        ex = std::current_exception();
+    }
+    // Every path out: the cache holds a copy of every source schema version the
+    // replay met, on every shard that applied one.
+    co_await mappings.stop();
+    if (ex) {
+        co_await coroutine::return_exception_ptr(std::move(ex));
+    }
+    if (refused) {
+        co_return std::unexpected(std::move(*refused));
+    }
+    co_return stats;
+}
+
+sstring format_replay_result(const replay_to_params& p, const replay_start& start, const replay_run_stats& stats) {
+    return seastar::format(
+            "Point-in-time replay of {}.{} to t={} ({}us) is done: restored from backup '{}' of {}.{}; read {} shipped segment(s), {} byte(s); applied {} "
+            "cell(s) in {} write(s); dropped {} cell(s) written after t; {} entry/entries below the backup's bound; {} cell(s) could not be verified; up "
+            "to {} split write(s) were not replayed; one table of one node was restored (limit 27)",
+            p.keyspace, p.table, p.t, start.t, p.snapshot, start.source_keyspace, start.source_table, stats.objects_read, stats.bytes_read,
+            stats.applier.cells_applied, stats.applier.entries_applied, stats.applier.cells_dropped_after_t, stats.dropped_below_bound,
+            stats.applier.cells_not_verified, stats.incomplete_split_writes);
 }
 
 } // namespace db::pitr
