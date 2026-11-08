@@ -454,7 +454,7 @@ async def test_replay_fails_if_auto_compaction_is_enabled_while_it_runs(manager:
         await manager.api.message_injection(server.ip_addr, 'pitr_replay_loaded')
         status = await manager.api.wait_task(server.ip_addr, tid)
         error = refusal_of(status)
-        assert 'cannot be trusted' in error, error
+        assert 'target_compaction_during_replay' in error, error
 
         # A run that failed after the mark was written leaves the target marked, so it reads as
         # incomplete and a second call on it is refused: the user drops it and replays into a new
