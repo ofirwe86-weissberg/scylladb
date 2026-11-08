@@ -12,6 +12,7 @@ import asyncio
 import logging
 import random
 import re
+import time
 
 from datetime import datetime, timezone
 
@@ -20,9 +21,9 @@ import pytest
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     assert_acked_writes_present, assert_every_shard, assert_exact, backup_prefix, change_statements, CLOCK_MARGIN_US, collection_edge_statements,
     create_target, deadline, DEADLINE_SECONDS, DONE, expected_at, FAILED, first_history_read_after_load, gated_store, iso, keys_on_every_shard,
-    later_than, latest_restorable, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
-    result_line, RESULT_MARK, run_nodetool, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, UNCOMPRESSED_SCHEMA,
-    W, wait_log, write_and_purge, write_several_sstables, Writer, WRONG_WAY_BACK
+    keys_on_shard, later_than, latest_restorable, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason,
+    report_stalls, result_line, RESULT_MARK, run_nodetool, RUN_SKIPPED, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, STEP_US,
+    TABLE_SCHEMA, UNCOMPRESSED_SCHEMA, W, wait_log, write_and_purge, write_several_sstables, Writer, WRONG_WAY_BACK
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -756,3 +757,72 @@ async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(mana
         _, target = await p.replay_done(x[-1].ts)
         rows = await read_exact(p.cql, p.ks, target)
         assert rows and rows == await read_exact(p.cql, p.ks, 't'), 'the restore must hold every row of the source'
+
+
+BELOW_BOUND_RE = re.compile(r"(\d+) entry/entries below the backup's bound")
+
+
+# PITR_RUN_SKIPPED=1 runs it, to show the bug is still there.
+@(lambda test: test) if RUN_SKIPPED else pytest.mark.skip_bug(
+    link='https://github.com/ofirwe86-weissberg/scylladb/issues/126',
+    reason='a tombstone purged on default tombstone_gc (repair, one replica) lets an older write in the chain bring the row back')
+@needs_phase('ep.3')
+async def test_a_delete_purged_on_default_tombstone_gc_keeps_the_row_deleted(manager: ScyllaClusterManager, s3_storage):
+    """#126, limit 38 on default settings. The keyspace has one replica, so the default tombstone_gc `repair` lets compaction
+    purge a tombstone as soon as no live commitlog segment holds an earlier write of the table. Row R is deleted at ts2; the
+    delete's segment is shipped and every table flushed, so it leaves the commitlog. A second later R is written again at an
+    older ts1 < ts2 (`USING TIMESTAMP`), after an unflushed write to table u on R's shard, which keeps the commitlog's floor,
+    and so the backup's bound, at or below that write. The source is compacted until neither R nor its tombstone is in its
+    data, and backed up. The delete is then below the bound and the older write above it: a replay that drops the one and
+    applies the other brings R back. Controls: the result line counts the dropped delete, and rows K, written with the older
+    write, are in the target."""
+    r = keys_on_shard(0, 1, 5000)[0]
+    kept = keys_on_every_shard(1, 6000)
+    async with pitr_node(manager, s3_storage) as p:
+        desc = await p.cql.run_async(f"SELECT extensions FROM system_schema.tables WHERE keyspace_name = '{p.ks}' AND table_name = 't'")
+        logger.info(f'Table t schema extensions (tombstone_gc left at its default): {desc}')
+        await p.cql.run_async(f'CREATE TABLE {p.ks}.u (pk int PRIMARY KEY, v int)')
+
+        before_delete = await shipped_segments(s3_storage)
+        ts2 = now_us()
+        deleted_at = time.time()
+        await p.write([W(ts2, f'DELETE FROM {{t}} USING TIMESTAMP {{ts}} WHERE pk = {r}')])
+        # Before the backup there is no coverage to wait for: a segment sealed after the delete shows its own was shipped.
+        await segments_shipped_after_the_writes(p, before_delete)
+        await manager.api.flush_all_keyspaces(p.server.ip_addr)
+
+        # The tombstone is purgeable only once the table's earliest write in a live segment is in a later second than it.
+        async def a_later_second():
+            return True if time.time() >= int(deleted_at) + 2 else None
+        await wait_for(a_later_second, deadline(), period=0.2)
+        await p.cql.run_async(f'INSERT INTO {p.ks}.u (pk, v) VALUES ({r}, 1)')
+        ts1 = ts2 - 1000
+        older = [W(ts1, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({r}, 0, 'older') USING TIMESTAMP {{ts}}")]
+        rows_k = simple_rows(kept, ts1)
+        await p.write(older + rows_k)
+        await manager.api.keyspace_flush(p.server.ip_addr, p.ks, p.cf)
+
+        async def purged():
+            await manager.api.keyspace_compaction(p.server.ip_addr, p.ks, p.cf)
+            await manager.api.drop_sstable_caches(p.server.ip_addr)
+            fragments = await p.cql.run_async(f'SELECT pk, mutation_fragment_kind FROM MUTATION_FRAGMENTS({p.ks}.{p.cf})')
+            return fragments if r not in {f.pk for f in fragments} else None
+        fragments = await wait_for(purged, deadline(), label=f'row {r} and its tombstone purged from the source')
+        logger.info(f'Source data after compaction: {sorted((f.pk, f.mutation_fragment_kind) for f in fragments)}')
+        assert r not in await pks_of(p.cql, p.ks, p.cf), f'row {r} must read deleted in the source'
+
+        await p.backup()
+        t = await p.covered()
+        target = await p.new_target()
+        logger.info(f'Target before the replay: {await read_exact(p.cql, p.ks, target)}')
+        outcome, _ = await p.replay(t, target)
+        line = await result_line(p)
+        logger.info(f'Result line: {line}')
+        seen = await read_exact(p.cql, p.ks, target)
+        logger.info(f'Target after the replay: {seen}')
+        assert outcome.state == DONE, f'the replay must end done: {outcome}'
+        below = BELOW_BOUND_RE.search(line or '')
+        assert below and int(below.group(1)) >= 1, f'the delete must be dropped below the bound, or the case is not reached: {line}'
+        pks = await pks_of(p.cql, p.ks, target)
+        assert set(kept) <= pks, f'rows {kept} written with the older write must be in the target: {sorted(pks)}'
+        assert r not in pks, f'row {r}, deleted at {ts2}, came back from the write at {ts1} < {ts2}: {line}'
