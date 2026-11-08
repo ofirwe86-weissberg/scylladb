@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <regex>
+#include <fmt/ranges.h>
 #include <boost/test/unit_test.hpp>
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
@@ -1626,4 +1627,75 @@ SEASTAR_THREAD_TEST_CASE(test_throttling_controller_metrics_change_on_upload_pro
     BOOST_REQUIRE_MESSAGE(refused.has_value(), "s3_refused_request_ratio{operation=request} metric not registered");
     BOOST_REQUIRE_GE(*refused, 0.0);
     BOOST_REQUIRE_LE(*refused, 1.0);
+}
+
+// ---------------------------------------------------------------------------
+// Per-client metric labels (#112). Constructing a client registers its metrics
+// and connects nowhere, so these tests need no S3 server.
+// ---------------------------------------------------------------------------
+
+static shared_ptr<s3::client> make_unconnected_client(unsigned port, bool use_https = false) {
+    s3::endpoint_config cfg = {
+            .port = port,
+            .use_https = use_https,
+            .region = "local",
+    };
+    return s3::client::make("127.0.0.1", make_lw_shared<s3::endpoint_config>(std::move(cfg)), make_unretrying_test_retry_strategy(),
+            std::make_unique<s3::noop_throttling_controller>());
+}
+
+// Fails unless the enabled series of the per-client refused_request_ratio gauge carry
+// exactly these endpoint labels.
+static void require_client_metric_endpoints(std::vector<sstring> expected) {
+    std::vector<sstring> endpoints;
+    const auto& value_map = seastar::metrics::impl::get_value_map();
+    if (auto fam_it = value_map.find("s3_refused_request_ratio"); fam_it != value_map.end()) {
+        for (const auto& [holder, reg] : fam_it->second) {
+            if (reg && reg->is_enabled()) {
+                endpoints.push_back(reg->get_id().labels().at("endpoint").value());
+            }
+        }
+    }
+    std::ranges::sort(endpoints);
+    std::ranges::sort(expected);
+    BOOST_REQUIRE_MESSAGE(endpoints == expected, fmt::format("endpoint labels {}, expected {}", endpoints, expected));
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_metrics_two_ports_one_host) {
+    auto a = make_unconnected_client(10001);
+    auto close_a = deferred_close(*a);
+    // Before #112 this threw seastar::metrics::double_registration.
+    auto b = make_unconnected_client(10002);
+    auto close_b = deferred_close(*b);
+
+    require_client_metric_endpoints({"127.0.0.1:10001", "127.0.0.1:10002"});
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_metrics_same_endpoint_twice) {
+    auto a = make_unconnected_client(10001);
+    auto close_a = deferred_close(*a);
+    // The second client goes without metrics, but must not fail whatever creates it.
+    auto b = make_unconnected_client(10001);
+    auto close_b = deferred_close(*b);
+
+    require_client_metric_endpoints({"127.0.0.1:10001"});
+}
+
+SEASTAR_THREAD_TEST_CASE(test_client_metrics_default_port_is_bare_host) {
+    {
+        auto c = make_unconnected_client(80);
+        auto close_c = deferred_close(*c);
+        require_client_metric_endpoints({"127.0.0.1"});
+    }
+    {
+        auto c = make_unconnected_client(443, true);
+        auto close_c = deferred_close(*c);
+        require_client_metric_endpoints({"127.0.0.1"});
+    }
+    {
+        // A port only the other scheme implies is not left out.
+        auto c = make_unconnected_client(80, true);
+        auto close_c = deferred_close(*c);
+        require_client_metric_endpoints({"127.0.0.1:80"});
+    }
 }
