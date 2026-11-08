@@ -366,40 +366,35 @@ async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaCl
 @needs_phase('ep.3')
 async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(manager: ScyllaClusterManager, gated_store):
     """R05-S1: SHP-5, L15's safe path. A backup cut part-way fails. The same snapshot, backed up again to a fresh prefix, is
-    done, and a replay from it at the last write of X gives the source's rows. Control: the first task failed with some but not
-    all of the snapshot's bytes uploaded."""
+    done, and a replay from it at the last write of X gives the source's rows. Controls: the first task failed with some of its
+    objects uploaded and no manifest, and fewer than the complete backup has."""
     async with pitr_node(manager, gated_store, schema=UNCOMPRESSED_SCHEMA) as p:
         await write_several_sstables(manager, p.server, p.cql, p.ks)
-        size = await manager.api.get_table_disk_space_used(p.server.ip_addr, p.ks, 't')
         p.snap, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
         cut_prefix = backup_prefix(p.ks, 't', p.snap) + '-cut'
-        # The cut is made by holding the sixth upload of the backup and failing the store there. A byte budget would be spent by
-        # the node's own segment uploads, which go through the same endpoint, and the long outage would switch shipping off.
-        uploads = []
-
-        def sixth_backup_upload(method, path):
-            if method in ('PUT', 'POST') and f'/{cut_prefix}/' in path:
-                uploads.append(path)
-                return len(uploads) == 6
-            return False
-        gated_store.hold_when(sixth_backup_upload)
+        # The cut holds the upload of the backup's manifest and aborts the task there, so the other objects are in and the manifest
+        # is not. The store is never failed: its outage would last long enough to switch the node's shipping off (OUT-3), as
+        # shipping goes through the same endpoint.
+        def manifest_upload(method, path):
+            return method in ('PUT', 'POST') and f'/{cut_prefix}/' in path and path.split('?', 1)[0].endswith('/manifest.json')
+        gated_store.hold_when(manifest_upload)
         tid = await manager.api.backup(p.server.ip_addr, p.ks, 't', p.snap, gated_store.address, gated_store.bucket_name, cut_prefix)
 
         async def held():
             return True if gated_store.holding.is_set() else None
         await wait_for(held, deadline())
-        gated_store.fail()
         try:
             await manager.api.abort_task(p.server.ip_addr, tid)
         except Exception as e:
             logger.info(f'The task had already ended: {e}')
         assert (await manager.api.wait_task(p.server.ip_addr, tid))['state'] == 'failed'
-        uploaded = sum(o.size for o in (await objects_of(gated_store, f'{cut_prefix}/')).values())
-        assert 0 < uploaded < size, f'the upload must be part-way: {uploaded} of {size} bytes'
-        gated_store.recover()
+        cut_objects = await objects_of(gated_store, f'{cut_prefix}/')
+        assert cut_objects and not [k for k in cut_objects if k.endswith('/manifest.json')], 'the cut backup must have objects and no manifest'
+        gated_store.release()
 
         p.prefix = backup_prefix(p.ks, 't', p.snap)
         await do_backup(p.server, p.snap, p.prefix, p.ks, 't', gated_store, manager, logger)
+        assert len(cut_objects) < len(await objects_of(gated_store, f'{p.prefix}/')), 'the first backup must have been cut short'
         x = simple_rows(range(2000, 2010), now_us(), 'X')
         await p.write(x)
         await p.covered()
