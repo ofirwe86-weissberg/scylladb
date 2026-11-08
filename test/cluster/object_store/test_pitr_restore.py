@@ -177,6 +177,8 @@ async def test_restore_reports_done_and_leaves_the_source_untouched(manager: Scy
             fragments = await p.cql.run_async(f'SELECT pk FROM MUTATION_FRAGMENTS({p.ks}.{p.cf})')
             return True if deleted not in {f.pk for f in fragments} else None
         await wait_for(purged, deadline())
+        # The row cache may still hold the tombstone, which would hide a replay into the source as well.
+        await manager.api.drop_sstable_caches(p.server.ip_addr)
         assert deleted not in await pks_of(p.cql, p.ks, p.cf)
 
         before = await read_exact(p.cql, p.ks, p.cf)
