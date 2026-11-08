@@ -70,6 +70,7 @@
 #include "db/hints/manager.hh"
 #include "db/commitlog/commitlog_replayer.hh"
 #include "db/pitr/pitr_shipper.hh"
+#include "db/pitr/replay_to.hh"
 #include "db/view/view_builder.hh"
 #include "mutation/timestamp.hh"
 #include "utils/error_injection.hh"
@@ -2803,6 +2804,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                                     });
                         })
                         .get();
+                // A point-in-time replay that was interrupted left the segments
+                // it had fetched behind, and no run will read them again. They
+                // are deliberately not in the commitlog directory, so the
+                // commitlog's own replay above never saw them.
+                db::pitr::sweep_restore_dirs(std::filesystem::path(cfg->work_directory())).get();
             }
 
             // The table-based audit backend needs Raft (via join_cluster)
