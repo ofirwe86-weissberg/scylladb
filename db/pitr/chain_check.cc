@@ -9,6 +9,7 @@
 #include "db/pitr/chain_check.hh"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <exception>
 #include <optional>
@@ -22,7 +23,9 @@
 
 #include "bytes.hh"
 #include "sstables/object_storage_client.hh"
+#include "utils/exceptions.hh"
 #include "utils/log.hh"
+#include "utils/s3/aws_error.hh"
 
 namespace db::pitr {
 
@@ -43,9 +46,24 @@ static std::unexpected<refusal> refuse_damaged(std::string_view key, sstring det
     });
 }
 
+// Whether the read failed because the store does not hold the object, as S3
+// (NoSuchKey) and the GCS client (ENOENT) report it. The GCS client maps a 3xx
+// to ENOENT as well, which its own object_exists() also reads as absent.
+static bool is_absent_object_error(std::exception_ptr ex) {
+    if (const auto* e = try_catch<aws::aws_exception>(ex)) {
+        return e->error().get_error_type() == aws::aws_error_type::NO_SUCH_KEY;
+    }
+    if (const auto* e = try_catch<storage_io_error>(ex)) {
+        return e->code().value() == ENOENT;
+    }
+    return false;
+}
+
 // Reads a whole ledger object, or nothing when the store does not hold it. A
-// read error is told from an absent object by asking the store, so that a
-// failing read never reads as the end of a chain.
+// read that says the object is absent is the end of the chain at that moment:
+// asking again would race the shipper appending it (#131). Any other read
+// error is told from an absent object by asking the store, so that a failing
+// read never reads as the end of a chain.
 static future<std::optional<bytes>> read_ledger_object(sstables::object_storage_client& client, const sstring& bucket, const sstring& key, abort_source& as) {
     std::exception_ptr read_error;
     bytes body;
@@ -73,6 +91,9 @@ static future<std::optional<bytes>> read_ledger_object(sstables::object_storage_
         read_error = std::current_exception();
     }
     if (read_error) {
+        if (is_absent_object_error(read_error)) {
+            co_return std::nullopt;
+        }
         if (co_await client.object_exists(sstables::object_name(bucket, key), &as)) {
             std::rethrow_exception(std::move(read_error));
         }

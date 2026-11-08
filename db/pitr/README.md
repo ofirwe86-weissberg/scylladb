@@ -12,9 +12,12 @@ and then replays the shipped commitlog on top of it, up to T. The feature is
 experimental and limited to one node, replication factor 1, and vnode
 keyspaces. It does not protect against node or disk loss.
 
-**Status: not usable yet.** Shipping and the bound file work, but the replay
-of the shipped history (#18, fetch and replay, not built yet) is missing, so
-no restore can reach `done` today. See [Implementation status](#implementation-status-2026-11-07).
+**Status: experimental, not for production.** A restore of one table to T
+runs end to end, but some refusals this README lists aren't built, so some
+restores report `done` on wrong data (limits 1, 16, 17 and 19). A restore
+from encrypted segments hasn't been tested (limit 11). A full re-review of
+the restore path is open (#92). See
+[Implementation status](#implementation-status-2026-11-08).
 
 ## How it works
 
@@ -93,15 +96,14 @@ snapshot. A backup without this file can't be used for PITR.
    (`nodetool tasks wait <id>`, or `GET /task_manager/wait_task/<id>`).
 4. The task runs on shard 0:
    - It checks the call before touching anything: T parses, the endpoint is
-     configured, the target exists, no replay is running into it or has run
-     into it, its auto-compaction is off, it is empty, the backup's
-     `manifest.json` names the given snapshot, `pitr-bound.txt` is present
-     and valid, and the target's schema matches the backup's apart from
-     the name, the ID and compaction. The chain checks (a dense chain from the
-     backup's bound to T on every shard, and T not past covered-through) and
-     the TRUNCATE and schema refusals are to run here too, before the mark;
-     they come with #18's fetch and replay and with #15. A refusal leaves
-     the node as it was.
+     configured, the target exists and is not in a tablets keyspace, no
+     replay is running into it or has run into it, its auto-compaction is
+     off, it is empty, the backup's `manifest.json` names the given
+     snapshot, `pitr-bound.txt` is present and valid, the target's schema
+     matches the backup's apart from the name, the ID and compaction, and
+     on every shard the chain the backup names is dense from the backup's
+     bound and covers T. A refusal leaves the node as it was. There is no
+     TRUNCATE or schema-change refusal yet (limits 16 and 17).
    - It writes a durable `started` mark for the target, under the node's
      work directory. From then on the target is `incomplete`.
    - It holds every compaction of the target off, on every shard, for the
@@ -112,8 +114,8 @@ snapshot. A backup without this file can't be used for PITR.
    - It flushes the target and replaces the mark with a durable `done`.
    If a compaction could have run on the target during the run, the task
    fails and never reports `done`.
-
-The last two steps are #18's fetch and replay, not built yet.
+5. On success the task's status says only `done`. The result line, with
+   the backup loaded and the counts, goes to the node log (limit 13).
 
 ### Status
 
@@ -142,8 +144,8 @@ one node, or the commitlog disabled, shipping stays off and the node logs
 why. The commitlog clamps the limit it holds segments against to 3/4 of the
 lower of the shard's flush threshold and its share of
 `commitlog_total_space_in_mb`, so a store outage reaches the limit before it
-triggers memtable flushes or blocks writes. Nothing acts on the limit yet:
-that is the outage latch, which is not built (limit 22).
+triggers memtable flushes or blocks writes. When the held segments reach
+that limit, the outage latch releases them and ends the chain (limit 22).
 
 The endpoint is configured as for backup and restore (`docs/dev/object_storage.md`):
 
@@ -161,10 +163,11 @@ pitr_seal_interval_in_seconds: 60
 (`s3:PutObject`) to the shipping prefix and the backup prefix, and read
 access (`s3:GetObject`) to both for a restore. A restore also needs
 `s3:ListBucket` on the bucket: without it, S3 reports a missing key as
-access denied, so restores are expected to fail with a store error (the
-restore path that probes for missing keys isn't built yet). The full list of
-actions hasn't been checked against each store. Buckets with object lock
-aren't supported (limit 37).
+access denied. A restore tells a missing key from a failed read by asking
+the store whether the key exists, and every chain check ends on a missing
+key, so without `s3:ListBucket` every restore fails with a store error. The
+full list of actions hasn't been checked against each store. Buckets with
+object lock aren't supported (limit 37).
 
 ## Quick start
 
@@ -183,14 +186,17 @@ aws s3 cp s3://my-pitr-bucket/backups/ks/t/snap1/schema.cql .
 #    compaction = {..., 'enabled': 'false'}. Then:
 cqlsh -f schema.cql
 
-# 4. Replay to T.
+# 4. Replay to T. Wait until shipping has reached T first: about
+#    pitr_seal_interval_in_seconds plus a few seconds after T (see below).
 curl -X POST "http://localhost:10000/storage_service/pitr/replay_to\
 ?endpoint=https://s3.us-east-1.amazonaws.com:443&bucket=my-pitr-bucket\
 &prefix=backups/ks/t/snap1&keyspace=ks&table=t_restored&snapshot=snap1\
 &t=2026-11-04T14:05:00.000000Z"
 # -> "<task id>"
 
-# 5. Wait for the result, and keep it.
+# 5. Wait for the task. On success, keep the result line from the node log.
+#    A refusal fails the task with the reason as its error text. On
+#    t_past_coverage, T isn't restorable yet (see below).
 nodetool tasks wait <task id>
 
 # 6. Check ks.t_restored, then turn compaction on for it: restate the
@@ -200,8 +206,28 @@ cqlsh -e "ALTER TABLE ks.t_restored WITH compaction = {'class': '<class from sch
 
 If you disabled compaction with `nodetool disableautocompaction ks t_restored`
 instead, turn it back on with `nodetool enableautocompaction ks t_restored`.
-That flag is runtime state and a node restart clears it. Today #18 accepts
-only the nodetool form; its fix round makes it accept the schema option.
+That flag is runtime state and a node restart clears it. Replay accepts
+either form.
+
+**When T is restorable.** A write can be restored once its segment is
+sealed and shipped, about S + U + 1 s after it (see [RPO](#rpo)). With the
+default S of 60 s, wait about a minute and a few seconds past T before
+step 4. There is no status report to ask yet (#14). Before then the replay
+is refused, and the task's error reads:
+
+```
+Point-in-time replay of ks.t_restored refused: t_past_coverage: T is
+2026-11-04T14:05:00.000000Z, and shipping from this node has only reached
+<covered-through>, a lag of <lag>. Retry with a T at or below that time.
+(shard <n>)
+```
+
+The covered-through time is that of the shard that lags most. This check
+runs before the mark, so the target stays empty and can be reused: wait and
+call the replay again with the same T, or call it now with a T at or below
+the time the refusal names. If covered-through doesn't move between
+retries, a shard gets no writes or shipping has stopped (limits 10, 21 and
+22): check the node log.
 
 T is UTC in ISO-8601, ending in an upper-case `Z`, with at most six fractional digits:
 `YYYY-MM-DDThh:mm:ss[.ffffff]Z`. Missing digits below the second count as zero.
@@ -285,17 +311,22 @@ more.
 
 ## Limits
 
-1. Experimental. One node, replication factor 1, vnode keyspaces only. This
-   release will refuse: more than one node or RF other than 1; tablet
-   tables, which are the default for new keyspaces; strongly consistent
-   tables; counter tables; tables with views or secondary indexes, and view
-   and index tables; tables with CDC; `logstor` tables; system and
-   Alternator tables. These refusals aren't built yet (#15).
+1. Experimental. One node, replication factor 1, vnode keyspaces only.
+   Today replay refuses a target in a tablets keyspace, which is the
+   default for new keyspaces, and shipping turns itself off on more than
+   one node. Replay doesn't yet refuse RF other than 1, strongly
+   consistent tables, counter tables, tables with views or secondary
+   indexes, view and index tables, tables with CDC, `logstor` tables, or
+   system and Alternator tables (#15): a restore of one of them goes ahead
+   unchecked. Don't use PITR for them.
 2. No recovery from node or disk loss, or from `DROP TABLE`. The result is
    always a new table. No route back into the original has been tested.
 3. Don't load the copy's files into the original unless the original has
    been truncated: later deletes in the original still win, and rows stay
-   missing with no error.
+   missing with no error. Truncating first has its own cost: every write
+   made to the original after T is dropped, also with no error. If any of
+   those writes must stay, copy the rows you need from the new table
+   instead.
 4. T compares write timestamps, which clients can set:
    - clients with clocks out of step can land on the wrong side of T;
    - an old-timestamped write arriving after a purged delete can bring a
@@ -313,7 +344,7 @@ more.
    client-supplied timestamp, can be missed.
 6. TTL isn't rewound: a cell alive at T may read as expired.
 7. The backup may hold data newer than T. It isn't checked, and that data
-   stays in the new table.
+   stays in the new table, with `done`. Pick a backup taken at or before T.
 8. The named backup isn't checked for belonging to the table that has its
    name now. If the source was dropped and recreated since the backup, a
    restore can give `done` with data missing.
@@ -327,37 +358,48 @@ more.
 11. Encryption at rest doesn't turn shipping off. Segments are shipped as
     the node holds them: encrypted if `system_info_encryption` is on,
     unencrypted otherwise, including tables with their own
-    `scylla_encryption_options`. Replay refuses on a node with
-    `system_info_encryption` on, so such a node has no PITR protection.
+    `scylla_encryption_options`. There is no refusal for a node with
+    `system_info_encryption` on: replay opens the shipped segments through
+    the node's commitlog extensions, and a restore from encrypted segments
+    hasn't been tested. Treat such a node as having no PITR protection.
     Protecting the bucket is up to you.
 12. A second node that joins and leaves within one seal interval isn't
     detected. Writes it acknowledged aren't in the history, and a restore
     past them can give `done` with those writes missing.
-13. The result is given once, as the replay task's outcome, and is also
-    written to the node log. It isn't stored with the table. A second replay
-    into a `done` table is refused. Keep the result.
+13. On success the replay task's status says only `done`. The result line
+    (the backup loaded, the counts, and the upper bound on split writes) is
+    written to the node log only. Refusals and failures are the task's
+    error text. Neither is stored with the table. A second replay into a
+    `done` table is refused. Copy the result line from the node log.
 14. The status report will show no limits, and no per-table protection. A
     `TRUNCATE` or schema change since a listed backup isn't shown either.
     After a restart, its covered-through time is the new chain's.
-15. A table created as a target but never replayed into is empty, and status
-    doesn't list it. Status lists a target `incomplete` from the moment
-    replay passes its checks until `done`. In CQL an unfinished target looks
-    like any table.
-16. After any `TRUNCATE` of the source since its shipping chain started,
-    every T is refused, whether the `TRUNCATE` came before or after the
-    backup. Use the normal backup restore to get the backup's data back.
-    PITR needs a chain that started after the `TRUNCATE`, which means a node
-    restart and a new backup.
-17. After any change to the source's schema since the backup, including an
-    option-only `ALTER`, every T after the backup's snapshot time is
-    refused. Take a new backup after each schema change.
+15. A table created as a target but never replayed into is empty, and
+    nothing records it as a target. Once replay passes its checks it writes
+    a `started` mark, and the target is `incomplete` until the mark says
+    `done`. In CQL an unfinished target looks like any table. Today only the
+    task's status, the node log (each mark it writes) and a second replay
+    into it, refused as `target_already_replayed` with the mark's phase,
+    show it. The status report will list it once it is built (#14).
+16. There is no `TRUNCATE` refusal yet. A restore to a T after a
+    `TRUNCATE` of the source reports `done` with the truncated rows back.
+    Don't restore to such a T. Use the normal backup restore to get the
+    backup's data back. A T after a `TRUNCATE` needs a chain that started
+    after it, which means a node restart and a new backup.
+17. There is no schema-change refusal yet. After a change to the source's
+    schema since the backup, a restore to a later T can report `done` with
+    a dropped column still holding the backup's values, or fail partway,
+    leaving the target `incomplete`, on a write at or below T to an added
+    column. Take a new backup after each schema change, and restore from
+    one taken after the last change before T.
 18. The target's schema is compared with the backup's as text, apart from
     name, ID and compaction. A backup taken on another Scylla version may
     describe the same schema differently and be refused.
 19. If the keyspace's `durable_writes` was turned off and back on since the
     backup, writes made while it was off are missing, with `done`. This
     release will refuse `durable_writes` off when replay runs; that refusal
-    isn't built yet (#15).
+    isn't built yet (#15). Take a new backup after `durable_writes` is
+    turned back on, and restore only to a T after it.
 20. An older Scylla can't load a snapshot or backup taken with shipping on
     until `pitr-bound.txt` is removed from it.
 21. A restart, a failed seal, a failed upload or ledger write, a second
@@ -373,17 +415,20 @@ more.
     however small the table, and other activity on the node can use up space
     while it runs. There is no disk-space check before it starts.
 25. The target must have compaction disabled: with `'enabled': 'false'` in
-    its schema (accepted once #18's fix round lands) or with
-    `nodetool disableautocompaction`. After `done` it stays disabled until
-    you turn it on. The nodetool flag is lost on a node restart.
+    its schema or with `nodetool disableautocompaction`. After `done` it
+    stays disabled until you turn it on. The nodetool flag is lost on a
+    node restart.
 26. Writes into the target between the emptiness check and the load are
     mixed into the result. Don't write to the target before `done`.
 27. The backup's `manifest.json` is read whole into memory on shard 0, up
     to 32 MiB. A backup with very many sstables needs that much free memory.
-28. No automatic cleanup after a failed replay. The target stays, listed
-    `incomplete`. Drop it and restore under a new name.
-29. One restore at a time. No dry run, and no alerting: ask the status
-    report.
+28. No automatic cleanup after a failed replay. The target stays, with its
+    `started` mark: the task's error text says why the run failed, and a
+    second replay into it is refused as `target_already_replayed`. Drop it
+    and restore under a new name.
+29. One restore at a time. No dry run, and no alerting: the task's status
+    and the node log are the only signals until the status report is built
+    (#14).
 30. A large write can be stored across more than one segment. If it is
     incomplete in the history, it isn't applied, and the result gives an
     upper bound on how many there were. Any acknowledged one is still in
@@ -435,15 +480,16 @@ more.
   the flush and the durable `done` (#114);
 - the measured-run harness (#115) and its numbers above (#118).
 
-A restore of one table to T runs end to end, and the node tests for exact
-data at T and for deleted rows pass on the merged code. A full-level
-re-review of the restore path is still open (#92) before a restore is called
-usable in production.
+A restore of one table to T runs end to end, and the node test for exact
+data at T on every shard passes on the merged code. The node tests for
+deleted rows and the other end-to-end cases are in #84, still open. A
+full-level re-review of the restore path is still open (#92) before a
+restore is called usable in production.
 
 **Not built yet:**
 - the table-kind, `durable_writes` and one-node/RF refusals (#15);
-- the TRUNCATE and schema-change refusals, and the encryption and idle-shard
-  refusals;
+- the TRUNCATE, schema-change and encryption refusals (limits 16, 17 and
+  11);
 - the status GET (#14);
 - the marker that shows a backup's upload finished, so an interrupted
   backup is refused (#12).
@@ -462,16 +508,21 @@ usable in production.
 - **Unit tests,** one suite per module, in `test/boost/pitr_*_test.cc`:
   the T parser, the ledger entry format, the ledger writer, segment upload,
   the shipper and its wiring, the bound file and its capture, the chain
-  check, the replay reader, the T filter, apply to target and, in review,
-  `replay_to`.
-- **Node tests** are planned, in review in #84: ten end-to-end tests
-  against a single node with a local object store, in
-  `test/cluster/object_store/`. They cover exact at T on every shard, deleted rows staying deleted,
+  check, the replay reader, the T filter, apply to target and
+  `replay_to`. The outage latch and the more-than-one-node refusal are
+  covered here, in the shipper's suite.
+- **Node tests,** against a single node with a local object store, in
+  `test/cluster/object_store/`. `test_pitr_replay_endpoint.py` runs on the
+  merged code: the endpoint's refusals, including a tablets target, the
+  load of the backup, a full run to exact data at T on every shard with
+  its result line in the node log, the compaction hold, and a failure or
+  an abort leaving the target `started`. `test_pitr_measure.py` is the
+  measured run, skipped unless `PITR_MEASURE=1`.
+- The other `test_pitr_*.py` files are black-box tests that stay skipped
+  until their phase is added to `LANDED_PHASES` in `pitr_util.py`, which is
+  empty. #84, still open, replaces them with ten slim tests: deleted rows,
   compaction during replay, T past coverage (including an idle shard),
   damaged history, TRUNCATE, a schema change, an unfinished backup upload,
   a kill during writes, and a durable `done` beside an `incomplete` target.
-  Each will have an in-test control and a deliberate break, and stays
-  skipped until the pieces it needs land.
-- Not planned for node tests: tablets and the other refused table kinds,
-  two-node cases, encryption, `durable_writes`, the outage latch, and the
-  measured run.
+- No running node test covers the other refused table kinds, two nodes,
+  encryption, `durable_writes` or the outage latch.
