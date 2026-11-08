@@ -281,7 +281,7 @@ more.
 | RPO after `kill -9` at a random point, S = 60 s (release) | 15.7 s, 28.7 s and 60.1 s: the kill's point in the seal cycle plus 1.7 to 2.4 s. No acknowledged write older than L was missing |
 | RTO, release build | 7.6 to 7.8 s: checks 0.2 s, loading the backup 0.5 s, fetching and replaying 360 MB in 18 segments 6.8 to 7.1 s, flush 0.1 s |
 | RTO, dev build | 12.0 to 12.5 s |
-| Larger run, release | 1 GB backup and 900 s of writes (234k rows): lag highest sample 59.98 s; RPO over 5 kills 14.4 to 60.1 s; RTO 55 to 58 s, of which loading the backup 9 to 10 s and fetching and replaying 1.63 GB in 56 to 58 segments 45 to 47 s |
+| Larger run, release | 1 GB backup and 900 s of writes (234k rows): lag highest sample 59.98 s; RTO 55 to 58 s, of which loading the backup 9 to 10 s and fetching and replaying 1.63 GB in 56 to 58 segments 45 to 47 s. RPO, 5 kills each on a separate 5 MB backup with 120 s of writes: 14.4 to 60.1 s |
 
 ## Limits
 
@@ -408,12 +408,17 @@ more.
     retried upload can write an object again with the same bytes.
 38. A restore fetches every shipped segment of the chain the backup names,
     including those holding only writes from before the backup. The
-    backup's bound is conservative, so many of those writes are replayed
-    again on top of the loaded backup. That is harmless, since a write
-    replayed with its own timestamp changes nothing, but it costs time. RTO
-    therefore grows with everything the node wrote in that chain, the
-    backup's own data included. In the 1 GB measured run, all 1.28 million
-    writes were replayed, about 80% of them already in the backup (#117).
+    backup's bound sits lower than the backup needs (cause open, #117), so
+    many of those writes are replayed again on top of the loaded backup.
+    That gives the same data as long as every write that shadows a replayed
+    one is in the backup or is replayed too, which holds for deletes after
+    the backup and for TTL. The exception is a tombstone the backup's
+    compaction already purged (a short `gc_grace_seconds`) together with an
+    older-timestamp write of the same row still in the chain (`USING
+    TIMESTAMP` or clock skew): the replay can bring that row back. It also
+    costs time: RTO grows with everything the node wrote in that chain. In
+    the 1 GB measured run, all 1.28 million writes were replayed, about 80%
+    of them already in the backup.
 
 ## Implementation status (2026-11-08)
 
@@ -447,7 +452,8 @@ usable in production.
 - make RTO follow the history since the backup: skip the chain segments
   wholly below the backup's bound, and find out why the bound sits lower
   than the backup needs, so writes already in the backup aren't replayed
-  again (#117; an optimization, restores are correct without it);
+  again (#117). Besides the time, a tighter bound narrows the purged-
+  tombstone case in limit 38;
 - log the seal instant, so U is measured directly rather than derived
   (#116).
 
