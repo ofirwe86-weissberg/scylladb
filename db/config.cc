@@ -1823,12 +1823,14 @@ db::config::config(std::shared_ptr<db::extensions> exts)
         "It is the floor of the recovery point objective: a write is shipped at the earliest one interval after it is acknowledged. "
         "Must be between 1 and 3600; shipping stays off otherwise.")
     , pitr_unshipped_limit_in_mb(this, "pitr_unshipped_limit_in_mb", value_status::Used, 256,
-        "How much unshipped commitlog data the point-in-time recovery shipper holds, in MiB, before it gives up on protection "
-        "and releases the held segments so that writes keep succeeding. "
-        "Keep it below half of this shard's share of commitlog_total_space_in_mb, which is a disk limit, or an object storage outage "
-        "will trigger memtable flushes, or block writes, before the limit is reached. This is not enforced yet: the clamp against the "
-        "commitlog's own limit comes with the ticket that holds segments. "
-        "Must be greater than 0; shipping stays off otherwise.")
+        "How much unshipped commitlog data the point-in-time recovery shipper may hold on each shard, in MiB. "
+        "The commitlog lowers it to three quarters of the lower of this shard's share of commitlog_flush_threshold_in_mb "
+        "and of commitlog_total_space_in_mb (the flush threshold defaults to half of the latter), so that the limit is reached "
+        "before the commitlog flushes memtables or blocks writes. "
+        "When the held data reaches that limit, for example during an object storage outage, shipping turns off on that shard "
+        "and releases every held segment so that writes keep succeeding: the chain ends at the last entry recorded, and only a restart "
+        "ships a new one. "
+        "0 turns shipping off. In scylla.yaml a negative value fails to parse, so the default applies.")
     , error_injections_at_startup(this, "error_injections_at_startup", error_injection_value_status, {}, "List of error injections that should be enabled on startup.")
     , topology_barrier_stall_detector_threshold_seconds(this, "topology_barrier_stall_detector_threshold_seconds", value_status::Used, 2, "Report sites blocking topology barrier if it takes longer than this.")
     , enable_tablets(this, "enable_tablets", value_status::Used, false, "Enable tablets for newly created keyspaces. (deprecated)")
