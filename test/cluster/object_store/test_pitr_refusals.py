@@ -20,7 +20,7 @@ import pytest
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     assert_exact, backup_prefix, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, keys_on_every_shard,
     keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, put_object,
-    read_exact, Reason, report_stalls, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W, write_several_sstables
+    read_exact, Reason, report_stalls, RESULT_LOGGED_WORDS, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W, write_several_sstables
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.pylib.rest_client import HTTPError
@@ -144,7 +144,7 @@ async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=())
     await assert_exact(p.cql, p.ks, target, [*kept, *later], later[-1].ts)
 
 
-@needs_phase('ep.3', '15-bc')
+@pytest.mark.skip(reason="L7: won't be implemented this release; needs replay to read the source's truncation record (#15)")
 async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
     """T6 (a): REF-10, limit 21, RST-4, P55/P74. Rows R written after the backup, then a TRUNCATE. T between R and the
     TRUNCATE is refused: replaying the history would bring R back. auto_snapshot is off, so nothing else keeps R."""
@@ -236,3 +236,24 @@ async def test_backup_with_unfinished_upload_is_refused(manager: ScyllaClusterMa
         await do_backup(p.server, p.snap, p.prefix, p.ks, 't', s3_storage, manager, logger)
         _, target = await p.replay_done(t)
         assert await read_exact(p.cql, p.ks, target) == await read_exact(p.cql, p.ks, 't')
+
+
+@needs_phase('ep.3')
+async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(manager: ScyllaClusterManager, s3_storage):
+    """R16-P2: REF-13. A second replay into a target that is already `done` is refused, the message says where the first run's
+    result was logged, and the target keeps its rows. Control: the first call was `done` and the target is not empty."""
+    pks = keys_on_every_shard(2)
+    async with pitr_node(manager, s3_storage) as p:
+        await p.write(simple_rows(pks, old_ts(), 'seed'))
+        await p.backup()
+        t = now_us()
+        await p.covered(t + 1_000_000)
+
+        first, target = await p.replay_done(t)
+        rows = await read_exact(p.cql, p.ks, target)
+        assert rows, 'the first replay must have loaded the backup'
+        second, _ = await p.replay(t, target)
+        assert second.state == 'failed' and second.reason == Reason.TARGET_ALREADY_REPLAYED, f'a done target must be refused: {second}'
+        for word in RESULT_LOGGED_WORDS:
+            assert word in second.message.lower(), f'the refusal must name the earlier run: {second}'
+        assert await read_exact(p.cql, p.ks, target) == rows, 'the refused replay changed the target'

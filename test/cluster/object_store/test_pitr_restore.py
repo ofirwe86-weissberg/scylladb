@@ -17,8 +17,8 @@ import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     assert_every_shard, assert_exact, change_statements, deadline, DONE, FAILED, first_history_read_after_load, gated_store,
-    keys_on_every_shard, needs_phase, now_us, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
-    result_line, seed_statements, simple_rows, STEP_US, TABLE_SCHEMA, W, write_and_purge, WRONG_WAY_BACK
+    keys_on_every_shard, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
+    result_line, seed_statements, simple_rows, SHIPPING_PREFIX, STEP_US, TABLE_SCHEMA, W, write_and_purge, WRONG_WAY_BACK
 )
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for
@@ -147,3 +147,85 @@ async def test_compaction_during_replay_never_gives_done_with_a_row_back(manager
                                         f"AND columnfamily_name = '{target}' ALLOW FILTERING")
             ran = [r.compacted_at for r in ran if r.compacted_at >= started]
             assert not ran, f'done after a compaction ran on the target during replay: {ran}'
+
+
+@needs_phase('ep.3')
+async def test_restore_reports_done_and_leaves_the_source_untouched(manager: ScyllaClusterManager, s3_storage):
+    """R06-P1: RST-1. Rows are written on every shard after the backup. The restore ends `done`, the target holds them (so it is
+    not an empty table that merely did no harm), and the source, WRITETIME included, reads as it did before the replay."""
+    pks = keys_on_every_shard(4)
+    async with pitr_node(manager, s3_storage) as p:
+        seed = seed_statements(pks, old_ts())
+        await p.write(seed)
+        await p.backup()
+        y = simple_rows(pks, now_us(), 'Y')
+        await p.write(y)
+        await p.covered()
+
+        before = await read_exact(p.cql, p.ks, p.cf)
+        outcome, target = await p.replay_done(y[-1].ts)
+        assert outcome.state == DONE, outcome
+        assert await read_exact(p.cql, p.ks, p.cf) == before, 'the replay changed the source table'
+        await assert_exact(p.cql, p.ks, target, seed + y, y[-1].ts)
+
+
+@needs_phase('ep.3')
+async def test_a_t_between_two_backups_restores_exactly_from_the_earlier_one(manager: ScyllaClusterManager, s3_storage):
+    """R21-S1: L3's safe path. T is after backup 1 and before backup 2, so the restore names backup 1. It holds the seed and A
+    and not B. Control: backup 2 holds B, so a second backup that already had B would have shown it."""
+    pks = keys_on_every_shard(2)
+    async with pitr_node(manager, s3_storage) as p:
+        seed = seed_statements(pks, old_ts())
+        await p.write(seed)
+        first = await p.backup()
+        first_prefix = p.prefix
+
+        a = simple_rows(pks, now_us(), 'A')
+        await p.write(a)
+        t_a = now_us()
+        b_ts = now_us()
+        assert b_ts > t_a
+        b = [W(b_ts, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 5, 'B') USING TIMESTAMP {{ts}}") for pk in pks]
+        await p.write(b)
+        await p.backup()
+        second = p.snap
+        await p.covered()
+
+        # Backup 2 holds B: restoring it to the time of the last B write must show B.
+        _, control = await p.replay_done(b[-1].ts)
+        assert {r.pk for r in await p.cql.run_async(f"SELECT pk FROM {p.ks}.{control} WHERE ck = 5 ALLOW FILTERING")} == set(pks), \
+            'backup 2 should hold B'
+
+        p.snap, p.prefix = first, first_prefix
+        _, target = await p.replay_done(t_a)
+        await assert_exact(p.cql, p.ks, target, seed + a, t_a)
+        assert not await p.cql.run_async(f"SELECT pk FROM {p.ks}.{target} WHERE ck = 5 ALLOW FILTERING"), 'a B row is in the restore'
+        assert second != first
+
+
+@needs_phase('ep.3')
+async def test_after_a_truncate_a_restart_and_a_new_backup_restore_exactly(manager: ScyllaClusterManager, s3_storage):
+    """R18-S1: L7's safe path (README 16). R is written and shipped, then the table is truncated. After a restart, a new backup
+    and a replay from it give S and U and no R. Control: R's segments were in the bucket before the truncate."""
+    r_pks, s_pks, u_pks = keys_on_every_shard(2, 100), keys_on_every_shard(2, 200), keys_on_every_shard(2, 300)
+    async with pitr_node(manager, s3_storage, auto_snapshot=False) as p:
+        r = simple_rows(r_pks, now_us(), 'R')
+        await p.write(r)
+        await p.backup()
+        await p.covered()
+        old_segments = {k for k in await objects_of(s3_storage, SHIPPING_PREFIX) if '/segments/' in k}
+        assert old_segments, 'R must be in the shipped history of the first chain'
+
+        await p.cql.run_async(f'TRUNCATE TABLE {p.ks}.t')
+        await p.restart()
+        s = simple_rows(s_pks, now_us(), 'S')
+        await p.write(s)
+        await p.backup()
+        u = simple_rows(u_pks, now_us(), 'U')
+        await p.write(u)
+        await p.covered()
+
+        _, target = await p.replay_done(u[-1].ts)
+        seen = await pks_of(p.cql, p.ks, target)
+        assert not seen & set(r_pks), f'truncated rows came back: {seen & set(r_pks)}'
+        await assert_exact(p.cql, p.ks, target, s + u, u[-1].ts)
