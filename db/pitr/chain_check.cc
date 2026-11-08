@@ -47,7 +47,8 @@ static std::unexpected<refusal> refuse_damaged(std::string_view key, sstring det
 }
 
 // Whether the read failed because the store does not hold the object, as S3
-// (NoSuchKey) and the GCS client (a 404 turned into ENOENT) report it.
+// (NoSuchKey) and the GCS client (ENOENT) report it. The GCS client maps a 3xx
+// to ENOENT as well, which its own object_exists() also reads as absent.
 static bool is_absent_object_error(std::exception_ptr ex) {
     if (const auto* e = try_catch<aws::aws_exception>(ex)) {
         return e->error().get_error_type() == aws::aws_error_type::NO_SUCH_KEY;
