@@ -14,13 +14,14 @@ import asyncio
 import logging
 import re
 import time
+from types import SimpleNamespace
 
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_exact, backup_prefix, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, iso,
-    keys_on_every_shard, keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, put_object,
-    read_exact, Reason, report_stalls, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W,
+    assert_exact, backup_prefix, create_target, deadline, delete_object, FAILED, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, iso,
+    keys_on_every_shard, keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, post_raw, put_object,
+    read_exact, Reason, REPLAY_URI, report_stalls, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W,
     write_several_sstables
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
@@ -262,3 +263,105 @@ async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(man
         assert iso(t) in second.message, f'the refusal must name the earlier run\'s T {iso(t)}: {second}'
         assert iso(t2) not in second.message, f'the refusal must not echo this request\'s T {iso(t2)}: {second}'
         assert await read_exact(p.cql, p.ks, target) == rows, 'the refused replay changed the target'
+
+
+async def ready_for_replay(p, pks=None):
+    """S0 plus coverage: a backup, rows after it, and a T the history covers. Returns T."""
+    await p.write(simple_rows(pks or keys_on_every_shard(2), old_ts(), 'seed'))
+    await p.backup()
+    t = now_us()
+    await p.covered(t + 1_000_000)
+    return t
+
+
+@needs_phase('ep.3')
+async def test_a_call_missing_a_required_parameter_is_rejected_naming_it(manager: ScyllaClusterManager, s3_storage):
+    """R06-P4: RST-1. Each of the seven parameters, left out and then given empty with the other six valid, is an HTTP 400 that
+    names it and starts no task. Control: the full call into the same target ends `done`, so no case marked it."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        target = await p.new_target()
+        valid = {'endpoint': s3_storage.address, 'bucket': s3_storage.bucket_name, 'prefix': p.prefix, 'keyspace': p.ks, 'table': target,
+                 'snapshot': p.snap, 't': iso(t)}
+        for name in valid:
+            for how, params in (('left out', {k: v for k, v in valid.items() if k != name}), ('empty', valid | {name: ''})):
+                status, body = await post_raw(manager, p.server, REPLAY_URI, params)
+                assert status == 400, f'{name} {how}: expected HTTP 400, got {status}: {body}'
+                assert f"Missing mandatory parameter '{name}'" in body, f'{name} {how}: the 400 must name the parameter: {body}'
+        await p.assert_nothing_loaded(target)
+        await p.replay_done(t, target)
+
+
+@needs_phase('ep.3')
+async def test_an_endpoint_the_node_does_not_know_is_refused(manager: ScyllaClusterManager, s3_storage):
+    """R06-P5: RST-1. An endpoint name the node isn't configured with is refused with its reason and name, and loads nothing.
+    Control: the configured endpoint into a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        outcome, _ = await p.refused(t, Reason.STORE_LOCATION_MISSING,
+                                     storage=SimpleNamespace(address='nowhere', bucket_name=s3_storage.bucket_name))
+        assert "endpoint='nowhere'" in outcome.message, f'the refusal must name the endpoint: {outcome}'
+        await p.replay_done(t)
+
+
+@needs_phase('ep.3')
+async def test_a_bucket_that_does_not_exist_is_refused_as_no_backup(manager: ScyllaClusterManager, s3_storage):
+    """R06-P6: RST-1. A bucket that doesn't exist is refused as a missing backup, and loads nothing. Control: the real bucket
+    into a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        outcome, _ = await p.refused(t, Reason.BACKUP_FILE_MISSING,
+                                     storage=SimpleNamespace(address=s3_storage.address, bucket_name='no-such-bucket'))
+        assert 'There is no backup under this prefix' in outcome.message, f'the refusal must say there is no backup: {outcome}'
+        await p.replay_done(t)
+
+
+@needs_phase('ep.3')
+async def test_a_target_table_that_does_not_exist_is_refused_and_not_created(manager: ScyllaClusterManager, s3_storage):
+    """R06-P7: RST-1. A replay into a table that doesn't exist is refused naming it, and doesn't create it. Control: once the
+    table is created from the backup's schema.cql, the same call ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        before = await read_exact(p.cql, p.ks, p.cf)
+        outcome, _ = await p.replay(t, 'nosuch')
+        assert outcome.state == FAILED and outcome.reason == Reason.TARGET_MISSING, f'a missing target must be refused: {outcome}'
+        assert f'{p.ks}.nosuch' in outcome.message, f'the refusal must name the target: {outcome}'
+        rows = await p.cql.run_async(f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{p.ks}' AND table_name = 'nosuch'")
+        assert not list(rows), 'the refused replay created the target'
+        assert await read_exact(p.cql, p.ks, p.cf) == before, 'the source changed in a refusal'
+        await create_target(p.cql, s3_storage, p.ks, 'nosuch', p.prefix)
+        await p.replay_done(t, 'nosuch')
+
+
+@needs_phase('ep.3')
+@pytest.mark.parametrize('t', [
+    pytest.param('2026-11-08 10:00:00Z', id='space'),
+    pytest.param('2026-11-08T10:00:00+00:00', id='offset'),
+    pytest.param('2026-11-08t10:00:00z', id='lower_case'),
+    pytest.param('2026-12-31T23:59:60Z', id='leap_second'),
+    pytest.param('2026-11-08T10:00:00.1234567Z', id='seven_digits'),
+    pytest.param('2026-02-30T10:00:00Z', id='feb_30'),
+])
+async def test_an_unparsable_t_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage, t):
+    """R07-P5: RST-2. A T that isn't a UTC time of the documented form is refused as invalid before the backup is loaded, and
+    leaves no mark. Control: a valid T into the same target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        valid = await ready_for_replay(p)
+        outcome, target = await p.refused(t, Reason.T_INVALID)
+        assert 'T must be a UTC time of the form' in outcome.message, f'the refusal must state the form: {outcome}'
+        await p.replay_done(valid, target)
+
+
+@needs_phase('ep.3')
+async def test_a_backup_whose_bound_file_was_removed_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage):
+    """R05-P2: SHP-5. A backup without its pitr-bound.txt is refused, naming the file, and loads nothing. Control: with the file
+    put back, a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        key = f'{p.prefix}/pitr-bound.txt'
+        content = await get_object(s3_storage, key)
+        await delete_object(s3_storage, key)
+        outcome, _ = await p.refused(t, Reason.BACKUP_FILE_MISSING)
+        assert 'pitr-bound.txt' in outcome.message, f'the refusal must name the bound file: {outcome}'
+        await put_object(s3_storage, key, content)
+        await p.replay_done(t)

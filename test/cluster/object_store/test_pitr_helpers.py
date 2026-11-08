@@ -730,3 +730,329 @@ async def test_adapter_parses_what_it_proposes():
     assert pitr.target_statement('CREATE TABLE ks.t (pk int PRIMARY KEY)', 'ks', 'n').endswith("WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'}")
     with pytest.raises(AssertionError):
         pitr.target_statement('CREATE TYPE ks.a (x int);', 'ks', 'n')
+
+
+class BigResponseServer:
+    """Stands in for the store: it answers each request with a response of `size` bytes, and counts the requests."""
+    def __init__(self, size):
+        self.size = size
+        self.requests = 0
+        self.server = None
+        self.port = None
+        self.answer = None      # if set, a response waits until this asyncio.Event is set
+
+    async def _serve(self, reader, writer):
+        try:
+            while data := await reader.readuntil(b'\r\n\r\n'):
+                self.requests += 1
+                if self.answer is not None:
+                    await self.answer.wait()
+                writer.write(b'x' * self.size)
+                await writer.drain()
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+        finally:
+            writer.close()
+
+    async def __aenter__(self):
+        self.server = await asyncio.start_server(self._serve, '127.0.0.1', 0)
+        self.port = self.server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *args):
+        self.server.close()
+
+
+async def test_gate_holds_a_response_part_way_and_only_for_the_request_its_rule_picks():
+    """T: hold_after_response_bytes lets `count` bytes of a picked request's response through and holds the rest until release().
+    R11 holds a segment's read half way with it, and counts the files on disk."""
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: path.startswith('/b/pitr-log/'), 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+
+        other = b'GET /b/backups/x HTTP/1.1\r\n\r\n'
+        writer.write(other)
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a request the rule does not pick is carried whole'
+        assert not gate.holding.is_set()
+
+        writer.write(b'GET /b/pitr-log/seg HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400, 'the first count bytes must get through'
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readexactly(1), 0.5)
+        assert gate.holding.is_set(), 'the gate must say it is holding'
+        gate.release()
+        assert not gate.holding.is_set(), 'release() must clear holding'
+        assert len(await asyncio.wait_for(reader.readexactly(600), 10)) == 600, 'release() must let the rest of the response through'
+
+        # A response shorter than count is never held, and holding stays cleared for the next use of the gate.
+        gate.hold_after_response_bytes(lambda method, path: True, 5000)
+        assert not gate.holding.is_set()
+        writer.write(b'GET /b/pitr-log/small HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000
+        assert not gate.holding.is_set(), 'a response shorter than count must not be held'
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_holds_a_response_and_recover_frees_it():
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400
+        assert gate.holding.is_set()
+        gate.recover()
+        assert not gate.holding.is_set(), 'recover() must clear holding'
+        assert len(await asyncio.wait_for(reader.readexactly(600), 10)) == 600, 'recover() must free the held response'
+
+        gate.hold_after_response_bytes(lambda method, path: True, 1000)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a response of exactly count bytes is carried whole'
+        assert not gate.holding.is_set(), 'a response of exactly count bytes is not held'
+        gate.recover()
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'recover() must clear the hold'
+        assert store.requests == 3
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_does_not_hold_the_next_request_after_a_short_picked_response():
+    """The budget of a picked response shorter than count must not carry over to the next request on the connection."""
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: path.startswith('/b/pick/'), 1500)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/pick/small HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000
+        writer.write(b'GET /b/other HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'an unrelated request must be carried whole'
+        assert not gate.holding.is_set(), 'an unrelated request must not be held'
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_does_not_hold_a_response_that_arrives_after_release():
+    async with BigResponseServer(1000) as store:
+        store.answer = asyncio.Event()
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+
+        async def arrived():
+            return True if store.requests else None
+        await wait_for(arrived, time.time() + 10)
+        gate.release()
+        store.answer.set()
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a released hold must carry the response whole'
+        assert not gate.holding.is_set(), 'holding must not turn true after release()'
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_stop_frees_a_held_response_without_release():
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readexactly(1), 0.5)
+        gate.stop()
+        try:
+            await asyncio.wait_for(reader.read(), 5)
+        except ConnectionError:
+            pass
+        writer.close()
+
+
+async def test_segment_keys_lists_one_shard_by_its_zero_padded_directory(monkeypatch):
+    """The product names a shard's directory with ten digits. Segments of the chain are found and ledger entries are not."""
+    keys = {
+        'pitr-log/h/0000000000/c1/segments/CommitLog-3-1.log': 1, 'pitr-log/h/0000000000/c1/00000000000000000042.entry': 1,
+        'pitr-log/h/0000000000/c1/head': 1, 'pitr-log/h/0000000001/c1/segments/CommitLog-3-2.log': 1,
+    }
+    asked = []
+
+    async def objects_of(storage, prefix):
+        asked.append(prefix)
+        return {k: v for k, v in keys.items() if k.startswith(prefix)}
+    monkeypatch.setattr(pitr, 'objects_of', objects_of)
+    assert await pitr.segment_keys(None, 'h', 0) == {'pitr-log/h/0000000000/c1/segments/CommitLog-3-1.log'}
+    assert await pitr.segment_keys(None, 'h', 1) == {'pitr-log/h/0000000001/c1/segments/CommitLog-3-2.log'}
+    assert asked == ['pitr-log/h/0000000000/', 'pitr-log/h/0000000001/']
+
+
+def test_entry_uploads_are_told_from_segment_uploads_and_reads():
+    entry = '/bkt/pitr-log/host/0/chain/000042.entry'
+    segment = '/bkt/pitr-log/host/0/chain/segments/CommitLog-3-1.log'
+    assert pitr.is_entry_upload('PUT', entry) and pitr.is_entry_upload('PUT', entry + '?x-id=PutObject')
+    assert not pitr.is_entry_upload('PUT', segment), 'a segment upload is not an entry upload'
+    assert not pitr.is_entry_upload('GET', entry) and not pitr.is_entry_upload('HEAD', entry), 'a read of an entry is not an upload'
+    assert not pitr.is_entry_upload('PUT', '/bkt/backups/ks/t/snap/x.entry'), 'only the shipping prefix counts'
+    assert pitr.is_shipping_upload('PUT', entry) and pitr.is_shipping_upload('PUT', segment)
+
+
+def test_lag_is_read_in_microseconds_whatever_the_unit_spelling():
+    assert pitr.lag_us('T 2026-11-04T14:05:01Z is past ..., a lag of 1500000us') == 1500000
+    assert pitr.lag_us('with a lag of 1µs.') == 1 and pitr.lag_us('a lag of 7μs') == 7
+    assert pitr.lag_us('a lag of 12 us') == 12
+    for text in ('lag 1 s', 'a lag of us', 'a lag of 5ms', ''):
+        with pytest.raises(AssertionError, match='no `a lag of'):
+            pitr.lag_us(text)
+
+
+async def test_log_wait_finds_a_line_from_a_mark_and_fails_at_the_deadline(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from test.pylib.log_browsing import ScyllaLogFile
+    path = tmp_path / 'node.log'
+    path.write_text('INFO fetching the history into /w/pitr/restore/old\n')
+    with ThreadPoolExecutor(1) as pool:
+        log = ScyllaLogFile(pool, path)
+        monkeypatch.setattr(pitr, 'deadline', lambda: time.time() + 1)
+        mark = await log.mark()
+        with pytest.raises(AssertionError, match='no line matching'):
+            await pitr.wait_log(log, 'never written')
+        assert await pitr.fetch_dir(log) == '/w/pitr/restore/old', 'without a mark, the log is read from its start'
+        with pytest.raises(AssertionError, match='no line matching'):
+            await pitr.fetch_dir(log, from_mark=mark)   # the old line is before the mark
+        with path.open('a') as f:
+            f.write('INFO other\nINFO [shard 0] fetching the history into /w/pitr/restore/new-1\n')
+        assert await pitr.fetch_dir(log, from_mark=mark) == '/w/pitr/restore/new-1'
+        assert (await pitr.wait_log(log, r'other(\n)?', from_mark=mark)).group(0).startswith('other')
+
+
+def test_later_than_is_after_its_argument_when_the_clock_stepped_back(monkeypatch):
+    monkeypatch.setattr(pitr, 'now_us', lambda: 1000)
+    assert pitr.later_than(500) == 1000
+    assert pitr.later_than(1000) == 1001
+    assert pitr.later_than(1150) == 1151, 'a clock 150 us behind must not give an earlier timestamp'
+
+
+def test_count_files_counts_every_file_whatever_its_size(tmp_path):
+    assert pitr.count_files(str(tmp_path / 'absent')) == 0
+    assert pitr.count_files(str(tmp_path)) == 0
+    (tmp_path / 'a').write_bytes(b'')
+    (tmp_path / 'sub').mkdir()
+    (tmp_path / 'sub' / 'b').write_bytes(b'x' * 10)
+    assert pitr.count_files(str(tmp_path)) == 2, 'an empty file and one in a subdirectory count'
+
+
+class FlakyStore:
+    """Hands out resources whose put and delete fail as scripted, and counts the resources handed out."""
+    bucket_name = 'b'
+
+    def __init__(self, failures):
+        self.failures = list(failures)
+        self.resources = 0
+        self.calls = []
+
+    def get_resource(self):
+        self.resources += 1
+        store = self
+
+        def act(name):
+            def run(**kwargs):
+                store.calls.append(name)
+                if store.failures:
+                    raise store.failures.pop(0)
+            return run
+        return SimpleNamespace(Object=lambda bucket, key: SimpleNamespace(put=act('put'), delete=act('delete')))
+
+
+def closed():
+    return botocore.exceptions.ConnectionClosedError(endpoint_url='http://x')
+
+
+class FakeClock:
+    """Stands in for the time module in pitr_util: sleeping advances the clock and is recorded, so that nothing waits."""
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+async def test_tamper_calls_retry_a_dropped_connection_with_backoff_and_a_fresh_resource(caplog, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(pitr, 'time', clock)
+    monkeypatch.setattr(pitr, 'deadline', lambda: clock.now + 60)
+    store = FlakyStore([closed(), ConnectionResetError()])
+    with caplog.at_level(logging.WARNING):
+        await pitr.put_object(store, 'k', b'v')
+    assert store.calls == ['put'] * 3 and store.resources == 3, 'each attempt must use a fresh resource'
+    assert sum('retry' in r.getMessage() for r in caplog.records) == 2, 'each retry must be logged'
+    assert clock.slept == [0.2, 0.5], 'the pause must grow'
+
+    clock.slept.clear()
+    store = FlakyStore([closed()] * 6)
+    await pitr.delete_object(store, 'k')
+    assert len(store.calls) == 7, 'more than three drops must still be retried'
+    assert clock.slept == [0.2, 0.5, 1, 2, 2, 2], 'the pause must grow to 2 s and stay there'
+
+    clock.slept.clear()
+    start = clock.now
+    store = FlakyStore([closed()] * 1000)
+    with pytest.raises(botocore.exceptions.ConnectionClosedError):
+        await pitr.delete_object(store, 'k')
+    assert 58 <= sum(clock.slept) <= 60 and clock.now - start == pytest.approx(sum(clock.slept)), 'a persistent drop must be retried up to the deadline and then fail'
+
+    denied = botocore.exceptions.ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'no'}}, 'PutObject')
+    store = FlakyStore([denied])
+    with pytest.raises(botocore.exceptions.ClientError):
+        await pitr.put_object(store, 'k', b'v')
+    assert store.calls == ['put'], 'only a dropped connection is retried: a real error must reach the test'
+
+
+async def test_raw_post_returns_the_status_and_body_of_a_rejection_and_of_a_success():
+    seen = []
+
+    async def serve(reader, writer):
+        head = await reader.readuntil(b'\r\n\r\n')
+        seen.append(head.split(b'\r\n')[0].decode())
+        status, body = (b'400 Bad Request', b'{"message": "Missing mandatory parameter \'t\'"}') if b't=' not in head.split(b'\r\n')[0] \
+            else (b'200 OK', b'"task-id"')
+        writer.write(b'HTTP/1.1 %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s' % (status, len(body), body))
+        await writer.drain()
+        writer.close()
+    server = await asyncio.start_server(serve, '127.0.0.1', 0)
+    port = server.sockets[0].getsockname()[1]
+    manager = SimpleNamespace(api=SimpleNamespace(client=SimpleNamespace(default_port=port)))
+    node = SimpleNamespace(ip_addr='127.0.0.1')
+    try:
+        status, body = await pitr.post_raw(manager, node, pitr.REPLAY_URI, {'keyspace': 'ks'})
+        assert status == 400 and "Missing mandatory parameter 't'" in body
+        status, body = await pitr.post_raw(manager, node, pitr.REPLAY_URI, {'keyspace': 'ks', 't': ''})
+        assert (status, body) == (200, '"task-id"'), 'an empty value is sent, not dropped'
+        assert seen[0].startswith('POST /storage_service/pitr/replay_to?keyspace=ks ') and 't=' in seen[1]
+    finally:
+        server.close()
+
+
+async def test_abort_task_posts_to_the_task_and_surfaces_a_refusal():
+    aborted = []
+
+    async def abort(ip, tid):
+        if tid == 'bad':
+            raise HTTPError('uri', 404, {}, None, 'no such task')
+        aborted.append((ip, tid))
+    manager = SimpleNamespace(api=SimpleNamespace(abort_task=abort))
+    node = SimpleNamespace(ip_addr='127.0.0.1')
+    await pitr.abort_task(manager, node, 'id1')
+    assert aborted == [('127.0.0.1', 'id1')]
+    with pytest.raises(HTTPError):
+        await pitr.abort_task(manager, node, 'bad')
