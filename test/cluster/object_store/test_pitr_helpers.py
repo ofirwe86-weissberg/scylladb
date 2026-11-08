@@ -739,11 +739,14 @@ class BigResponseServer:
         self.requests = 0
         self.server = None
         self.port = None
+        self.answer = None      # if set, a response waits until this asyncio.Event is set
 
     async def _serve(self, reader, writer):
         try:
             while data := await reader.readuntil(b'\r\n\r\n'):
                 self.requests += 1
+                if self.answer is not None:
+                    await self.answer.wait()
                 writer.write(b'x' * self.size)
                 await writer.drain()
         except (ConnectionError, asyncio.IncompleteReadError):
@@ -800,12 +803,84 @@ async def test_gate_holds_a_response_and_recover_frees_it():
         reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
         writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
         assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a response of exactly count bytes is carried whole'
+        assert not gate.holding.is_set(), 'a response of exactly count bytes is not held'
         gate.recover()
         writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
         assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'recover() must clear the hold'
         assert store.requests == 2
         writer.close()
         gate.stop()
+
+
+async def test_gate_does_not_hold_the_next_request_after_a_short_picked_response():
+    """The budget of a picked response shorter than count must not carry over to the next request on the connection."""
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: path.startswith('/b/pick/'), 1500)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/pick/small HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000
+        writer.write(b'GET /b/other HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'an unrelated request must be carried whole'
+        assert not gate.holding.is_set(), 'an unrelated request must not be held'
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_does_not_hold_a_response_that_arrives_after_release():
+    async with BigResponseServer(1000) as store:
+        store.answer = asyncio.Event()
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+
+        async def arrived():
+            return True if store.requests else None
+        await wait_for(arrived, time.time() + 10)
+        gate.release()
+        store.answer.set()
+        assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a released hold must carry the response whole'
+        assert not gate.holding.is_set(), 'holding must not turn true after release()'
+        writer.close()
+        gate.stop()
+
+
+async def test_gate_stop_frees_a_held_response_without_release():
+    async with BigResponseServer(1000) as store:
+        gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
+        gate.start()
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readexactly(1), 0.5)
+        gate.stop()
+        try:
+            await asyncio.wait_for(reader.read(), 5)
+        except ConnectionError:
+            pass
+        writer.close()
+
+
+async def test_segment_keys_lists_one_shard_by_its_zero_padded_directory(monkeypatch):
+    """The product names a shard's directory with ten digits. Segments of the chain are found and ledger entries are not."""
+    keys = {
+        'pitr-log/h/0000000000/c1/segments/CommitLog-3-1.log': 1, 'pitr-log/h/0000000000/c1/00000000000000000042.entry': 1,
+        'pitr-log/h/0000000000/c1/head': 1, 'pitr-log/h/0000000001/c1/segments/CommitLog-3-2.log': 1,
+    }
+    asked = []
+
+    async def objects_of(storage, prefix):
+        asked.append(prefix)
+        return {k: v for k, v in keys.items() if k.startswith(prefix)}
+    monkeypatch.setattr(pitr, 'objects_of', objects_of)
+    assert await pitr.segment_keys(None, 'h', 0) == {'pitr-log/h/0000000000/c1/segments/CommitLog-3-1.log'}
+    assert await pitr.segment_keys(None, 'h', 1) == {'pitr-log/h/0000000001/c1/segments/CommitLog-3-2.log'}
+    assert asked == ['pitr-log/h/0000000000/', 'pitr-log/h/0000000001/']
 
 
 def test_entry_uploads_are_told_from_segment_uploads_and_reads():
@@ -842,7 +917,7 @@ async def test_log_wait_finds_a_line_from_a_mark_and_fails_at_the_deadline(tmp_p
         with pytest.raises(AssertionError, match='no line matching'):
             await pitr.fetch_dir(log, from_mark=mark)   # the old line is before the mark
         with path.open('a') as f:
-            f.write('INFO other\nINFO [shard 0] fetching the history into /w/pitr/restore/new-1 done\n')
+            f.write('INFO other\nINFO [shard 0] fetching the history into /w/pitr/restore/new-1\n')
         assert await pitr.fetch_dir(log, from_mark=mark) == '/w/pitr/restore/new-1'
         assert (await pitr.wait_log(log, r'other(\n)?', from_mark=mark)).group(0).startswith('other')
 

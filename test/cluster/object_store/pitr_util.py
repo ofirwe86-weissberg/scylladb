@@ -331,7 +331,7 @@ async def wait_log(log, pattern: str, from_mark: int | None = None) -> re.Match:
     return found[0][1]
 
 
-FETCH_DIR_RE = r'fetching the history into (\S+)'
+FETCH_DIR_RE = r'fetching the history into (\S+)\n'
 
 
 async def fetch_dir(log, from_mark: int | None = None) -> str:
@@ -746,7 +746,7 @@ async def delete_object(storage, key):
 async def segment_keys(storage, host, shard) -> set[str]:
     """The keys of the segments shipped by one shard of one node: <prefix>/<host id>/<shard>/<chain>/segments/<file>. A chain
     directory's ledger entries are not segments and are left out."""
-    keys = await objects_of(storage, f'{SHIPPING_PREFIX}/{host}/{shard}/')
+    keys = await objects_of(storage, f'{SHIPPING_PREFIX}/{host}/{int(shard):010d}/')
     return {k for k in keys if SEGMENT_KEY_RE.search(k)}
 
 
@@ -884,7 +884,7 @@ class GatedStore:
         """For a request that matches rule(method, path): carries its response up to count bytes (headers included), then holds
         that connection, with the rest of the response unsent, until release(). The request itself goes through at once, so
         the node is mid-read of an object, for a test that looks at what it has on disk then. A response shorter than count
-        is never held. Every other connection is carried as before. Replaces hold_when()."""
+        is never held, nor is one of exactly count bytes. Every other connection is carried as before. Clears any hold_when() rule."""
         assert count > 0, 'a hold after no bytes is hold_when'
         self.holding.clear()
         self._rule = None
@@ -929,11 +929,13 @@ class GatedStore:
                             if not held_here and rule is not None and rule(method, path):
                                 held_here = True
                                 self.holding.set()
+                            # Decided at every request, so that a short response doesn't leave its budget to the next request.
                             after = self._after
-                            if after is not None and response_left is None and after[0](method, path):
-                                response_left = after[1]
+                            response_left = after[1] if after is not None and after[0](method, path) else None
                     elif response_left is not None and not self.down:
-                        if len(data) < response_left:
+                        if self._after is None:
+                            response_left = None
+                        elif len(data) <= response_left:
                             response_left -= len(data)
                         else:
                             head, data = data[:response_left], data[response_left:]
