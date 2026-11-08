@@ -4438,6 +4438,46 @@ static future<> write_schema_as_cql(snapshot_writer& writer, cql3::description s
     }
 }
 
+// The bound one shard records: what the snapshot's sstables recorded, raised to
+// the chain's floor, then capped by the commitlog's own floor. Either source
+// alone can sit above a write the sstables do not hold. A write is given its
+// position before it reaches the memtable and can yield in between, so a large
+// write can land after the flush while a smaller, later one is in the sstables;
+// the cap covers that, since the large write's segment is still live. The
+// sstable value covers the case the floor gets wrong (#103).
+//
+// The raise is for a shard flushed before this chain began: its sstables record
+// positions below the chain's floor, which reads as a backup taken before
+// shipping started and is refused, though the sstables hold everything. It is
+// sound because every write made after the capture lands at or above the floor,
+// and an unflushed write below the floor keeps its segment live, so the cap
+// still pulls the bound under the floor and that backup is still refused.
+//
+// With nothing flushed here there is no recorded position, and the chain's
+// floor stands in: below it nothing is shipped. With no chain, segment 1 - such
+// a backup is refused for the missing chain anyway (PM-50), so the value only
+// has to be encodable.
+//
+// Erring low is sound: the replay filters at T and applies each write with its
+// own timestamp, so re-applying what the sstables hold leaves the same data.
+// Erring high loses writes with no error.
+static db::replay_position lowest_safe_bound(
+        unsigned shard, db::replay_position captured, db::replay_position commitlog_floor, const std::optional<db::pitr::shard_chain>& chain) {
+    // A table with no commitlog reports no floor, and a zero position is no bound.
+    const auto with_floor = [&](db::replay_position rp) {
+        return commitlog_floor == db::replay_position() ? rp : std::min(rp, commitlog_floor);
+    };
+    // A chain's floor is a whole segment id, carrying the shard already.
+    const auto chain_floor = chain && chain->floor_segment_id ? std::optional(db::replay_position(*chain->floor_segment_id, 0)) : std::nullopt;
+    if (captured != db::replay_position()) {
+        return with_floor(chain_floor ? std::max(captured, *chain_floor) : captured);
+    }
+    if (chain_floor) {
+        return with_floor(*chain_floor);
+    }
+    return db::replay_position(shard, db::segment_id_type(1), 0);
+}
+
 /*!
  * \brief write the snapshot's point-in-time-recovery bound file.
  *
@@ -4447,12 +4487,13 @@ static future<> write_schema_as_cql(snapshot_writer& writer, cql3::description s
  * (#12). A backup uploads it with the snapshot's other non-sstable files.
  */
 static future<> write_bound_file(snapshot_writer& writer, const schema& s, const std::vector<db::replay_position>& bounds,
-        const std::vector<std::optional<db::pitr::shard_chain>>& chains) {
+        const std::vector<db::replay_position>& commitlog_floors, const std::vector<std::optional<db::pitr::shard_chain>>& chains) {
     db::pitr::bound_file bf;
     bf.capture_time_us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::system_clock::now().time_since_epoch()).count();
     bf.schema_version = s.version();
     for (unsigned shard = 0; shard < bounds.size(); ++shard) {
-        bf.shards.push_back(db::pitr::shard_bound{.shard = shard, .bound = bounds[shard], .chain = chains[shard]});
+        bf.shards.push_back(db::pitr::shard_bound{
+                .shard = shard, .bound = lowest_safe_bound(shard, bounds[shard], commitlog_floors[shard], chains[shard]), .chain = chains[shard]});
     }
     // Encoded whole before anything is opened, so a row this node cannot
     // represent fails the snapshot instead of leaving a partial file behind.
@@ -4524,6 +4565,9 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         // Per-shard commitlog bound, each taken together with that shard's sstable
         // list. Point-in-time recovery records these with the snapshot (#12).
         std::vector<db::replay_position> commitlog_bounds(this_smp_shard_count());
+        // Beside each bound, the commitlog's own floor at the same capture: it caps
+        // what the bound file records (lowest_safe_bound(), #103).
+        std::vector<db::replay_position> commitlog_floors(this_smp_shard_count());
         // The chain each shard was shipping, for the bound file below. Only
         // collected when PITR can run, so that a snapshot taken on a node
         // without it stays byte for byte what it was.
@@ -4533,15 +4577,17 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         co_await writer->init();
         co_await smp::invoke_on_all([&] -> future<> {
             auto& t = *table_shards;
-            auto [tables, bound, permit] = co_await t.snapshot_sstables();
+            auto [tables, bound, commitlog_floor, permit] = co_await t.snapshot_sstables();
             commitlog_bounds[this_shard_id()] = bound;
+            commitlog_floors[this_shard_id()] = commitlog_floor;
             if (write_pitr_bound) {
                 // A chain belongs to the shard's boot, not to the sstable list,
                 // so it needs no ordering against the capture.
                 pitr_chains[this_shard_id()] = sharded_db.local().pitr_chain();
             }
             auto sstables_metadata = co_await t.get_sstables_manager().take_snapshot(std::move(tables), name);
-            sstable_sets[this_shard_id()] = make_foreign(std::make_unique<utils::chunked_vector<sstables::sstable_snapshot_metadata>>(std::move(sstables_metadata)));
+            sstable_sets[this_shard_id()] =
+                    make_foreign(std::make_unique<utils::chunked_vector<sstables::sstable_snapshot_metadata>>(std::move(sstables_metadata)));
         });
         co_await writer->sync();
 
@@ -4552,13 +4598,13 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
         // With internals, so that schema.cql records the table's dropped columns: without them, an
         // sstable that still holds a dropped column's data is unreadable once restored.
         auto schema_desc = s->describe(replica::make_schema_describe_helper(table_shards), cql3::describe_option::STMTS_AND_INTERNALS);
-        co_await write_schema_as_cql(*writer, std::move(schema_desc)).handle_exception([&] (std::exception_ptr ptr) {
+        co_await write_schema_as_cql(*writer, std::move(schema_desc)).handle_exception([&](std::exception_ptr ptr) {
             tlogger.error("Failed writing schema file in snapshot in {} with exception {}", name, ptr);
             ex = std::move(ptr);
         });
         if (write_pitr_bound) {
             tlogger.debug("snapshot {}: writing {}", name, db::pitr::bound_file_name);
-            co_await write_bound_file(*writer, *s, commitlog_bounds, pitr_chains).handle_exception([&name, &ex](std::exception_ptr ptr) {
+            co_await write_bound_file(*writer, *s, commitlog_bounds, commitlog_floors, pitr_chains).handle_exception([&name, &ex](std::exception_ptr ptr) {
                 tlogger.error("Failed writing {} in snapshot {}: {}", db::pitr::bound_file_name, name, ptr);
                 ex = std::move(ptr);
             });
@@ -4645,18 +4691,28 @@ future<> database::snapshot_table_on_all_shards(sharded<database>& sharded_db, c
 
 future<table::snapshot_sstable_list> table::snapshot_sstables() {
     auto permit = co_await get_sstable_list_permit();
-    // Both reads happen under the sstable-list permit, which flush and compaction
-    // take too, so they are one observation. A flush completing between them would
-    // add an sstable this list misses and let the commitlog release that sstable's
-    // segments, lifting the bound above writes the snapshot does not hold. That
-    // ordering is what the permit buys: a flush releases its segments
-    // (discard_completed_segments, below) only after adding the sstable to the
-    // list under the permit. Not
-    // yielding between the reads is belt and braces, not the guarantee. Read the
-    // member, not commitlog(), which refuses a readonly table. #12
-    auto bound = _commitlog ? _commitlog->min_position() : db::replay_position();
     auto tables = *_sstables->all() | std::ranges::to<std::vector<sstables::shared_sstable>>();
-    co_return snapshot_sstable_list{std::move(tables), bound, std::move(permit)};
+    // An sstable records the highest commitlog position whose writes it holds, so
+    // every write this list does not hold is above the highest such position over
+    // it. Same rule and same filter as the commitlog replayer's, which replays
+    // above the positions discard_sstables() records in system.truncated.
+    //
+    // Not commitlog::min_position() alone, which this used to be: it answers which
+    // positions a reboot may still replay, and with no live segment it names the
+    // newest reserve, whose id can exceed the next active segment's. A write made
+    // after the capture then falls below the bound and a replay drops it (#103).
+    db::replay_position bound;
+    for (const auto& sst : tables) {
+        co_await coroutine::maybe_yield();
+        const auto& recorded = sst->get_stats_metadata().position;
+        if (sst->originated_on_this_node().value_or(false) && recorded.shard_id() == this_shard_id()) {
+            bound = std::max(bound, recorded);
+        }
+    }
+    // The permit, which flush and compaction also take, makes the three reads one
+    // observation; deriving the bound from the list makes those two one by
+    // construction. The caller takes the minimum of the last two. #12
+    co_return snapshot_sstable_list{std::move(tables), bound, _commitlog ? _commitlog->min_position() : db::replay_position(), std::move(permit)};
 }
 
 future<bool> table::snapshot_exists(sstring tag) {

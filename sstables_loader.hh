@@ -9,6 +9,7 @@
 #pragma once
 
 #include <algorithm>
+#include <filesystem>
 #include <vector>
 #include <seastar/core/sharded.hh>
 #include "db/pitr/replay_target.hh"
@@ -44,6 +45,11 @@ namespace view {
 class view_builder;
 class view_building_worker;
 }
+namespace pitr {
+// In `replay_to.hh`, which this header does not include: it would pull a JSON
+// parser into every translation unit that sees the loader.
+struct replay_start;
+} // namespace pitr
 }
 namespace service {
 class storage_service;
@@ -159,10 +165,17 @@ private:
     future<bool> pitr_compaction_still_held(table_id target);
     future<> release_pitr_compaction(table_id target) noexcept;
 
-    // Loads the backup's sstables into the target through the restore path,
-    // with compaction held off for the whole of it.
+    // Loads the backup's sstables into the target through the restore path. The
+    // caller holds compaction off around it, for the whole run.
     future<> load_backup_into_target(
             const db::pitr::replay_to_params& params, const std::vector<sstring>& toc_names, download_progress& progress, table_id target, abort_source& as);
+
+    // Replays the shipped history into the target and makes the result durable:
+    // the replay, the flush, the last check of the hold, then the `done` mark,
+    // in that order, so a crash anywhere before the mark leaves `started`.
+    // Returns the run's result line. The caller holds compaction off.
+    future<sstring> replay_history_and_finish(
+            const db::pitr::replay_to_params& params, const db::pitr::replay_start& start, const std::filesystem::path& restore_dir, abort_source& as);
 
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
     future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);

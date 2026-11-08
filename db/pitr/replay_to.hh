@@ -19,6 +19,7 @@
 #include <seastar/core/sharded.hh>
 #include <seastar/core/sstring.hh>
 
+#include "db/pitr/apply_to_target.hh"
 #include "db/pitr/bound_file.hh"
 #include "db/pitr/chain_check.hh"
 #include "db/pitr/refusal.hh"
@@ -104,11 +105,14 @@ std::filesystem::path replay_state_path(const std::filesystem::path& state_dir, 
 
 // A crash leaves either no file or a complete one: fsynced under a temporary
 // name, renamed over the final one, then the directory fsynced.
-future<> write_replay_state(const std::filesystem::path& state_dir, ::table_id target, const replay_state&);
+//
+// Everything below takes its path and its state by value: these suspend, and a
+// coroutine's reference parameter outlives nothing a caller built inline (#18).
+future<> write_replay_state(std::filesystem::path state_dir, ::table_id target, replay_state);
 
 // `nullopt` only when there is no mark. An unreadable one throws: damage is not
 // a target that was never replayed into.
-future<std::optional<replay_state>> read_replay_state(const std::filesystem::path& state_dir, ::table_id target);
+future<std::optional<replay_state>> read_replay_state(std::filesystem::path state_dir, ::table_id target);
 
 // Where a run's fetched segments live: under the work directory, one directory
 // per target, and never under the commitlog directory - startup replays
@@ -117,13 +121,13 @@ std::filesystem::path restore_root(const std::filesystem::path& work_dir);
 std::filesystem::path restore_dir_path(const std::filesystem::path& work_dir, ::table_id target);
 
 // Empty: what a crashed run of the same target left is of no use to this one.
-future<std::filesystem::path> make_restore_dir(const std::filesystem::path& work_dir, ::table_id target);
+future<std::filesystem::path> make_restore_dir(std::filesystem::path work_dir, ::table_id target);
 
 // Called on every path out of a run, a failure and an abort too, so neither
 // throws: a leftover costs disk and nothing else. The sweep runs at node start,
 // where no run is in flight, so it drops the whole root.
-future<> remove_restore_dir(const std::filesystem::path& work_dir, ::table_id target) noexcept;
-future<> sweep_restore_dirs(const std::filesystem::path& work_dir) noexcept;
+future<> remove_restore_dir(std::filesystem::path work_dir, ::table_id target) noexcept;
+future<> sweep_restore_dirs(std::filesystem::path work_dir) noexcept;
 
 // Streams one shipped segment into `dir`, under the file name the source wrote
 // it with, since replay reads the segment's id and base position out of it, and
@@ -145,6 +149,13 @@ future<sstring> normalize_schema_cql(std::string_view);
 // Compares the two statements, ignoring the three above.
 future<std::optional<refusal>> check_schema_match(std::string_view target_cql, std::string_view backup_cql);
 
+// The id of the table the backup was taken from, which is the id its commitlog
+// entries carry and the only one a replay may apply: the target's id is a
+// different one, and the manifest records the source's name but not its id.
+// `nullopt` when the statement carries no `ID` option, which a snapshot's
+// `schema.cql` always does.
+std::optional<::table_id> parse_source_table_id(std::string_view schema_cql);
+
 // What a checked and marked replay hands to the load and, after it, to ep.3.
 struct replay_start {
     ::table_id target;
@@ -159,6 +170,8 @@ struct replay_start {
     utils::chunked_vector<sstring> toc_names;
     sstring source_keyspace;
     sstring source_table;
+    // From the backup's schema: what the shipped entries are matched on.
+    ::table_id source_table_id;
     // Held until the run ends, so no second replay enters this target.
     replay_in_flight::guard in_flight;
 };
@@ -183,5 +196,54 @@ struct replay_start {
 // yields per read and per entry, and needs every reference to outlive the call.
 future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
         std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
+
+// What the history replay did, for the run's result line.
+struct replay_run_stats {
+    // Shipped segments fetched and read, and the bytes of them, which are the
+    // sizes the ledger recorded and the fetch proved.
+    uint64_t objects_read = 0;
+    uint64_t bytes_read = 0;
+    uint64_t entries_replayed = 0;
+    // Entries the reader dropped as below the backup's bound: the snapshot's
+    // sstables hold them. A non-zero count with nothing replayed on a shard is
+    // the shape of #103, where the chain was missing the bound's own segment.
+    uint64_t dropped_below_bound = 0;
+    // Split writes a chain ended inside. Counted and not applied, and reported
+    // as "up to N": an incomplete write cannot be decoded, so neither its table
+    // nor its timestamp is readable (P22, `replay_reader_stats`).
+    uint64_t incomplete_split_writes = 0;
+    apply_stats applier;
+
+    bool operator==(const replay_run_stats&) const = default;
+};
+
+// Fetches, replays, filters at T and applies every chain of `start.history`
+// into `start.target`, shard by shard and in ledger order within a shard. One
+// segment is on local disk at a time: each is fetched into `restore_dir`, read,
+// and removed before the next is fetched, so a history of any length costs the
+// disk one segment.
+//
+// Nothing is applied that the target cannot hold, and nothing above T: the
+// applier refuses the first and the filter drops the second. A refusal here
+// comes from the store - an object missing or not the one its record describes -
+// and the caller must never write `done` after one. A store or disk error is an
+// exception, and so is anything the applier refuses, since the target is already
+// marked and the run is over either way.
+//
+// A chain is read in one call to the reader, which fetches through a hook and
+// drops each segment before the next, so one reassembly state spans the chain
+// and a write split over a segment boundary is applied whole. One still
+// incomplete where the chain ends is counted, not applied.
+//
+// Runs on the shard the run runs on; the apply of each entry happens on the
+// shard that owns its key. Yields per fetched chunk, per segment and per entry.
+// Every reference must outlive the call.
+future<std::expected<replay_run_stats, refusal>> replay_history_into_target(sharded<replica::database>& db, sstables::object_storage_client& client,
+        sstring bucket, const replay_start& start, std::filesystem::path restore_dir, seastar::abort_source& as);
+
+// The run's one line: T as the user wrote it and in microseconds, the backup and
+// the table it was taken from, what was read, what was applied, what was dropped
+// as written after T, and what could not be verified (PM-66).
+sstring format_replay_result(const replay_to_params&, const replay_start&, const replay_run_stats&);
 
 } // namespace db::pitr
