@@ -438,7 +438,7 @@ async def test_replay_fails_if_auto_compaction_is_enabled_while_it_runs(manager:
     turned back on. The run checks what it holds after the load and again after the flush, and
     fails rather than reporting a recovery it cannot vouch for: a compaction between the backup's
     sstables and the replayed history purges a tombstone before the writes it covers. Each park
-    reaches one of the two checks, and both fail with their own code (#111)."""
+    reaches one of the two checks, and both fail with that code (#111)."""
     server = await one_server(manager, object_storage, shipping=True)
     cql = manager.get_cql()
     async with new_test_keyspace(manager, RF_1) as ks:
