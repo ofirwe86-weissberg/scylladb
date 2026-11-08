@@ -621,7 +621,11 @@ async def run_nodetool(manager, server, argv):
     exe = await manager.server_get_exe(server.server_id)
     proc = await asyncio.create_subprocess_exec(exe, *argv, '--host', server.ip_addr,
                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    out, err = await proc.communicate()
+    try:
+        out, err = await proc.communicate()
+    except asyncio.CancelledError:
+        proc.kill()  # a caller's timeout must not leave nodetool running
+        raise
     assert proc.returncode == 0, f'{argv} failed: {out} {err}'
 
 

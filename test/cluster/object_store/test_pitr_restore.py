@@ -379,8 +379,9 @@ async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(ma
     """R06-S1: L14's boundary. Every kind of change is written on every shard before the backup, and they are in the shipped history
     too, so the replay applies them a second time on top of the backup. Among them is a write issued after a newer one but with an
     older timestamp, so a replay that let the last applied write win would show it. The target must equal the answer at T, and the
-    result line must count more applied cells than the post-backup writes hold, which shows the pre-backup writes were replayed
-    (if the replay stops starting from the beginning of the chain, this fails and the test needs another form). Control: the
+    result line must count more applied writes than the post-backup ones, which shows the pre-backup writes were replayed. They
+    are, because the replay's bound is capped at the commitlog's lowest safe position, which stays low while other tables' segments
+    are dirty. If that changes (#117), this fails and the test needs another form. Control: the
     changes' segments are in the bucket before the backup."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
@@ -403,8 +404,9 @@ async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(ma
         await assert_exact(p.cql, p.ks, target, seed + changes + z, z[-1].ts)
         assert {r.v for r in await p.cql.run_async(f'SELECT v FROM {p.ks}.{target} WHERE ck = 60 ALLOW FILTERING')} == {'newer'}
         line = await result_for(p, target)
-        applied = count_in_result(line, 'cell(s)')
-        assert applied is not None and applied > len(z), f'the pre-backup writes must be replayed too ({len(z)} post-backup writes): {line}'
+        m = re.search(r'in (\d+) write\(s\)', line or '')
+        # Each post-backup row is one write. (The cell count also counts row markers, so z alone would pass it.)
+        assert m and int(m[1]) > len(z), f'the pre-backup writes must be replayed too ({len(z)} post-backup writes): {line}'
 
 
 @needs_phase('ep.3')
@@ -584,8 +586,9 @@ async def test_a_delete_within_gc_grace_stays_deleted_after_the_source_compacts(
     gc_grace, and tombstone_gc `timeout`, as `repair` purges at once on a keyspace with one replica). The backup holds the
     tombstones and the shipped history holds both writes. The target must not have the rows back. Controls: the source's data
     shows tombstones and no rows for the deleted keys, and a never-deleted row written with them is in the target. While the
-    replay starts from the beginning of the chain (L14), the history's own delete also hides the rows, so this test cannot tell
-    a lost backup tombstone from a kept one."""
+    replay's bound is capped at the commitlog's lowest safe position, which is low while other tables' segments are dirty, the
+    history's own delete is applied again and also hides the rows, so this test cannot tell a lost backup tombstone from a kept
+    one. Its teeth depend on that cap."""
     gone, kept = keys_on_every_shard(1, 1000), keys_on_every_shard(1, 2000)
     async with pitr_node(manager, s3_storage, schema=f"{TABLE_SCHEMA} WITH tombstone_gc = {{'mode': 'timeout'}}") as p:
         ts1 = old_ts()
