@@ -258,8 +258,8 @@ The copy-ready time runs from the replay call to `done`. It is made of:
 
 Step 2 depends on how much the whole node wrote in the backup's chain, before
 and after T, not on the table's size or the backup's age, so a small table on
-a busy node pays for all of the node's writes. Taking backups more often doesn't shorten it
-today; #117 would make it.
+a busy node pays for all of the node's writes. Taking backups more often
+doesn't shorten it today; #117 would make it.
 
 ### Measured run
 
