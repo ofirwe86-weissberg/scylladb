@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, NamedTuple
 
+import aiohttp
+import botocore.exceptions
 import pytest
 
 from cassandra.metadata import Murmur3Token
@@ -306,6 +308,53 @@ def now_us() -> int:
 
 def deadline() -> float:
     return time.time() + DEADLINE_SECONDS
+
+
+LAG_RE = re.compile(r'a lag of (\d+)\s?(?:us|\u00b5s|\u03bcs)')
+
+
+def lag_us(text: str) -> int:
+    """The `a lag of <n>us` a refusal past coverage states, in microseconds. The unit may print as `us` or `\u00b5s`; the
+    number is exact, whatever the precision of the ISO times beside it."""
+    m = LAG_RE.search(text)
+    assert m, f'no `a lag of <n>us` in: {text}'
+    return int(m[1])
+
+
+async def wait_log(log, pattern: str, from_mark: int | None = None) -> re.Match:
+    """Waits until the node's log has a line matching pattern, from a mark if given, and returns the match. It fails at the
+    test's deadline instead of hanging, which ScyllaLogFile.wait_for would for 10 minutes."""
+    try:
+        _, found = await log.wait_for(pattern, from_mark=from_mark, timeout=max(deadline() - time.time(), 0.001))
+    except TimeoutError:
+        raise AssertionError(f'the log has no line matching {pattern!r}') from None
+    return found[0][1]
+
+
+FETCH_DIR_RE = r'fetching the history into (\S+)'
+
+
+async def fetch_dir(log, from_mark: int | None = None) -> str:
+    """The directory a replay fetches the shipped segments into, from the node's INFO line `fetching the history into <dir>`."""
+    return (await wait_log(log, FETCH_DIR_RE, from_mark)).group(1)
+
+
+def count_files(directory: str) -> int:
+    """Every file under directory, whatever its size; 0 if it doesn't exist (yet, or any more)."""
+    return sum(len(files) for _, _, files in os.walk(directory))
+
+
+async def abort_task(manager, server, task_id: str):
+    """Aborts a task through the task manager's REST API. A refused abort raises HTTPError: the call returned 200 or it fails."""
+    await manager.api.abort_task(server.ip_addr, task_id)
+
+
+async def post_raw(manager, server, uri: str, params: Mapping[str, str]) -> tuple[int, str]:
+    """POSTs to the node's REST API and returns the status and body whatever they are, where start_replay raises on a non-200,
+    for a test of how a call is rejected. A parameter is left out by leaving it out of params."""
+    url = f'http://{server.ip_addr}:{manager.api.client.default_port}{uri}'
+    async with aiohttp.request('POST', url, params=params, timeout=aiohttp.ClientTimeout(total=DEADLINE_SECONDS)) as resp:
+        return resp.status, await resp.text()
 
 
 def backup_prefix(ks, cf, snap) -> str:
@@ -670,12 +719,35 @@ async def get_object(storage, key) -> bytes:
     return await asyncio.to_thread(get)
 
 
+RETRIES = 3     # how many times a tamper call is repeated after the connection was dropped under it
+
+
+def _retrying(storage, what: str, call):
+    """Runs call(resource) with a fresh resource each time, again if the mock store dropped the connection under it
+    (#111: a keep-alive connection the mock has closed). Only a closed or reset connection is retried, up to RETRIES times,
+    and each retry is logged: any other error, and a failure that persists, reaches the test as it is."""
+    for attempt in range(RETRIES + 1):
+        try:
+            return call(storage.get_resource())
+        except (botocore.exceptions.ConnectionClosedError, ConnectionResetError) as e:
+            if attempt == RETRIES:
+                raise
+            logger.warning(f'{what}: connection dropped ({type(e).__name__}), retry {attempt + 1} of {RETRIES}')
+
+
 async def put_object(storage, key, data: bytes):
-    await asyncio.to_thread(lambda: storage.get_resource().Object(storage.bucket_name, key).put(Body=data))
+    await asyncio.to_thread(_retrying, storage, f'put {key}', lambda r: r.Object(storage.bucket_name, key).put(Body=data))
 
 
 async def delete_object(storage, key):
-    await asyncio.to_thread(lambda: storage.get_resource().Object(storage.bucket_name, key).delete())
+    await asyncio.to_thread(_retrying, storage, f'delete {key}', lambda r: r.Object(storage.bucket_name, key).delete())
+
+
+async def segment_keys(storage, host, shard) -> set[str]:
+    """The keys of the segments shipped by one shard of one node: <prefix>/<host id>/<shard>/<chain>/segments/<file>. A chain
+    directory's ledger entries are not segments and are left out."""
+    keys = await objects_of(storage, f'{SHIPPING_PREFIX}/{host}/{shard}/')
+    return {k for k in keys if SEGMENT_KEY_RE.search(k)}
 
 
 REQUEST_LINE_RE = re.compile(rb'([A-Z]+) (\S+) HTTP/1\.[01]\r\n')
@@ -736,6 +808,7 @@ class GatedStore:
         self._budget = None
         self._held = False
         self._rule = None
+        self._after = None
         self.holding = threading.Event()
         self.requests: list[tuple[str, str]] = []
         self._loop = None
@@ -804,16 +877,29 @@ class GatedStore:
         carries every other connection as before. The rule sees every request in order, on the gate's thread, so it may
         keep state, such as "the first read of the history after the backup's Data.db"."""
         self.holding.clear()
+        self._after = None
         self._rule = rule
+
+    def hold_after_response_bytes(self, rule: Callable[[str, str], bool], count: int):
+        """For a request that matches rule(method, path): carries its response up to count bytes (headers included), then holds
+        that connection, with the rest of the response unsent, until release(). The request itself goes through at once, so
+        the node is mid-read of an object, for a test that looks at what it has on disk then. A response shorter than count
+        is never held. Every other connection is carried as before. Replaces hold_when()."""
+        assert count > 0, 'a hold after no bytes is hold_when'
+        self.holding.clear()
+        self._rule = None
+        self._after = (rule, count)
 
     def release(self):
         self._rule = None
+        self._after = None
 
     def recover(self):
         self.down = False
         self._budget = None
         self._held = False
         self._rule = None
+        self._after = None
 
     async def _serve(self, reader, writer):
         if self.down:
@@ -829,8 +915,10 @@ class GatedStore:
             return
         self._conns.add(up_writer)
         starts = RequestStarts()
+        response_left = None    # bytes of the matching request's response still to carry before the hold
 
         async def pump(src, dst, towards_store):
+            nonlocal response_left
             held_here = False
             try:
                 while data := await src.read(65536):
@@ -841,6 +929,23 @@ class GatedStore:
                             if not held_here and rule is not None and rule(method, path):
                                 held_here = True
                                 self.holding.set()
+                            after = self._after
+                            if after is not None and response_left is None and after[0](method, path):
+                                response_left = after[1]
+                    elif response_left is not None and not self.down:
+                        if len(data) < response_left:
+                            response_left -= len(data)
+                        else:
+                            head, data = data[:response_left], data[response_left:]
+                            response_left = None
+                            if head:
+                                dst.write(head)
+                                await dst.drain()
+                            self.holding.set()
+                            while self._after is not None and not self.down:
+                                await asyncio.sleep(0.01)
+                            if not data:
+                                continue
                     while (self._held or (held_here and self._rule is not None)) and not self.down:
                         await asyncio.sleep(0.01)
                     held_here = False
@@ -874,6 +979,12 @@ def is_history_read(method, path) -> bool:
 
 def is_shipping_upload(method, path) -> bool:
     return method in ('PUT', 'POST') and f'/{SHIPPING_PREFIX}/' in path
+
+
+def is_entry_upload(method, path) -> bool:
+    """A hold rule: the upload of a ledger entry (<sequence>.entry). A segment's own upload is not one, so a rule that holds
+    this lets the segment through and stops coverage from passing it."""
+    return method == 'PUT' and f'/{SHIPPING_PREFIX}/' in path and path.split('?', 1)[0].endswith('.entry')
 
 
 def first_history_read_after_load():
