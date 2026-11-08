@@ -25,7 +25,7 @@ import botocore.exceptions
 import pytest
 
 from test.cluster.object_store import pitr_util as pitr
-from test.cluster.object_store.pitr_util import GatedStore, W, gated_store  # noqa: F401 (gated_store is a fixture)
+from test.cluster.object_store.pitr_util import GatedStore, gated_store  # noqa: F401 (gated_store is a fixture)
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace
 from test.pylib.rest_client import HTTPError

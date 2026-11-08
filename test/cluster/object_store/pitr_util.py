@@ -22,7 +22,7 @@ import threading
 import time
 
 from collections.abc import Mapping, Set as AbstractSet
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, NamedTuple
@@ -679,7 +679,9 @@ async def run_nodetool(manager, server, argv):
     try:
         out, err = await proc.communicate()
     except asyncio.CancelledError:
-        proc.kill()  # a caller's timeout must not leave nodetool running
+        with suppress(ProcessLookupError):
+            proc.kill()  # a caller's timeout must not leave nodetool running
+        await proc.wait()  # reap it
         raise
     assert proc.returncode == 0, f'{argv} failed: {out} {err}'
 

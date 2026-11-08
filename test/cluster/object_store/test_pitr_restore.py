@@ -775,7 +775,9 @@ async def test_a_delete_purged_on_default_tombstone_gc_keeps_the_row_deleted(man
     and so the backup's bound, at or below that write. The source is compacted until neither R nor its tombstone is in its
     data, and backed up. The delete is then below the bound and the older write above it: a replay that drops the one and
     applies the other brings R back. Controls: the result line counts the dropped delete, and rows K, written with the older
-    write, are in the target."""
+    write, are in the target.
+
+    Unskipped, it reproduces the bug in about 12 of 14 runs, so one pass doesn't mean #126 is fixed: run it repeatedly."""
     r = keys_on_shard(0, 1, 5000)[0]
     kept = keys_on_every_shard(1, 6000)
     async with pitr_node(manager, s3_storage) as p:
