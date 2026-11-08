@@ -461,14 +461,21 @@ more.
     the backup and for TTL. The exception is a tombstone the backup's
     compaction already purged, together with an older-timestamp write of
     the same row that is still in the chain: the replay can bring that row
-    back and still report `done` (#126). The tombstone can be purged by a
-    short `gc_grace_seconds`, or on default settings: on a keyspace with
-    one replica, the default `tombstone_gc` is `repair`, which purges as
-    soon as the delete's commitlog segment is gone, with no grace wait.
-    The older write must arrive after the delete: `USING TIMESTAMP`, or
+    back and still report `done` (#126). This happens on default
+    settings: PITR supports only replication factor 1, where the default
+    `tombstone_gc` is `repair`, which purges a tombstone with no grace wait
+    once no live commitlog segment still holds an older write to the
+    table. A short `gc_grace_seconds` under `timeout` does it too. The
+    older write must arrive after the delete: `USING TIMESTAMP`, or
     client-side timestamps with clock skew or a delayed retry. Plain server
     timestamps don't trigger it. On protected tables, set `tombstone_gc =
-    {'mode': 'timeout'}` with a `gc_grace_seconds` longer than the backup
+    {'mode': 'timeout'}` and keep `gc_grace_seconds` at its default of 10
+    days. What matters is how far the backup's replay start can lag behind
+    the backup, not the backup interval alone: the start can go back to
+    the oldest live commitlog segment, which stays live while any table on
+    the node has unflushed writes in it, or while shipping is held by a
+    store outage, so it can be hours or days old. A lower
+    `gc_grace_seconds` must stay well above that lag plus the backup
     interval. It also costs time: RTO grows with everything the node wrote
     in that chain. In the 1 GB measured run, all 1.28 million writes were
     replayed, about 80% of them already in the backup.
