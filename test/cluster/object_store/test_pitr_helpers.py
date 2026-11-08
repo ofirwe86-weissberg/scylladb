@@ -150,6 +150,43 @@ async def test_gate_holds_traffic_until_it_recovers():
         gate.stop()
 
 
+async def test_gate_holds_only_the_requests_its_rule_picks():
+    """hold_when() holds the connection of a request its rule picks, and nothing else: not other connections, and not bytes in a
+    body that look like a request. T3 and T10 hold the first read of the history with it, and T4 every shipping upload."""
+    starts = pitr.RequestStarts()
+    assert starts.feed(b'GET /b/k HTTP/1.1\r\nHo') == [], 'a request counts once its head is whole'
+    assert starts.feed(b'st: h\r\nContent-Length: 4\r\n\r\nGET ') == [('GET', '/b/k')]
+    assert starts.feed(b'PUT /b/c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n') == [('PUT', '/b/c')]
+    assert starts.feed(b'5\r\nGET /\r\n0\r\n\r\n') == [], 'a chunked body is skipped'
+    assert starts.feed(b'HEAD /b/n HTTP/1.1\r\n\r\n') == [('HEAD', '/b/n')]
+
+    async with EchoServer() as echo:
+        gate = gate_for(echo)
+        gate.hold_when(lambda method, path: path.startswith('/b/pitr-log/'))
+        body = b'GET /b/pitr-log/in-a-body HTTP/1.1\r\n\r\n'
+        other_request = b'PUT /b/backups/x HTTP/1.1\r\nContent-Length: %d\r\n\r\n%s' % (len(body), body)
+        other_reader, other_writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        other_writer.write(other_request)
+        assert await asyncio.wait_for(other_reader.readexactly(len(other_request)), 10) == other_request
+        assert not gate.holding.is_set(), 'bytes in a body are not a request'
+
+        picked = b'GET /b/pitr-log/seg HTTP/1.1\r\nHost: h\r\n\r\n'
+        reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(picked)
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(reader.readexactly(len(picked)), 0.5)
+        assert gate.holding.is_set()
+
+        later = b'GET /b/backups/y HTTP/1.1\r\n\r\n'
+        other_writer.write(later)
+        assert await asyncio.wait_for(other_reader.readexactly(len(later)), 10) == later, 'another connection must go on'
+
+        gate.release()
+        assert await asyncio.wait_for(reader.readexactly(len(picked)), 10) == picked, 'release() must let the held request through'
+        assert ('GET', '/b/pitr-log/seg') in gate.requests and ('GET', '/b/pitr-log/in-a-body') not in gate.requests
+        gate.stop()
+
+
 def _resource(storage, endpoint, secret):
     return boto3.resource('s3', endpoint_url=endpoint, aws_access_key_id=storage.acc_key, aws_secret_access_key=secret, verify=False,
                           config=botocore.config.Config(signature_version='s3v4', retries={'max_attempts': 1}, connect_timeout=5, read_timeout=5))
@@ -337,6 +374,8 @@ async def test_scenario_statements_are_valid_and_reach_every_shard(manager: Scyl
             await pitr.assert_every_shard(cql, ks, 't', [pks[0]])
 
         tokens = {r[0]: r[1] for r in await cql.run_async(f'SELECT pk, token(pk) FROM {ks}.t') if r[0] in pks}
+        # keys_on_shard() places keys with the client's own token, so it must agree with the node's.
+        assert {pk: pitr.token_of(pk) for pk in pks} == tokens
         exe = await manager.server_get_exe(server.server_id)
         for pk in pks:
             # A partition key in the form of the tool: int32, big-endian, length-prefixed.
@@ -353,29 +392,6 @@ async def test_scenario_statements_are_valid_and_reach_every_shard(manager: Scyl
         await writer.wait_acked(3)
         await writer.stop()
         await pitr.assert_acked_writes_present(cql, ks, 'writer', [writer], pitr.now_us() + 2 * pitr.CLOCK_MARGIN_US, [])
-
-
-async def test_scenario_schemas_are_valid(manager: ScyllaClusterManager, s3_storage):
-    """Every table and schema change the scenarios make, on the node configurations they use."""
-    server = await manager.server_add(config=pitr.unsupported_tables_config(pitr.node_config(s3_storage, shipping=False)))
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, pitr.VNODES_KS) as ks, \
-               new_test_keyspace(manager, pitr.TABLETS_KS) as tablet_ks, \
-               new_test_keyspace(manager, pitr.STRONG_KS) as strong_ks, \
-               new_test_keyspace(manager, pitr.NONDURABLE_KS) as nondurable_ks, \
-               new_test_keyspace(manager, pitr.RF2_KS) as rf2_ks:
-        cases = await pitr.create_unsupported_tables(server, cql, ks, tablet_ks, strong_ks, nondurable_ks)
-        for k, cf, _ in cases:
-            # A strongly consistent table can't be scanned, as assert_refused() allows for.
-            if k != strong_ks:
-                assert await cql.run_async(f'SELECT * FROM {k}.{cf} LIMIT 1') is not None
-
-        # T19
-        await cql.run_async(f'CREATE TABLE {rf2_ks}.t {pitr.TABLE_SCHEMA}')
-        assert await pitr.read_all(cql, rf2_ks, 't') == []
-        await cql.run_async(f'CREATE TABLE {ks}.altered {pitr.TABLE_SCHEMA}')
-        await cql.run_async(pitr.ALTER_KEYSPACE_RF2.format(ks=ks))
-        await cql.run_async(pitr.ALTER_KEYSPACE_RF1_NONDURABLE.format(ks=ks))
 
 
 async def test_scenario_schema_changes_are_valid(manager: ScyllaClusterManager):
@@ -396,22 +412,6 @@ async def test_scenario_schema_changes_are_valid(manager: ScyllaClusterManager):
         # T33
         await cql.run_async(f'CREATE TYPE {ks}.unused (zip int)')
         await cql.run_async(f'ALTER TYPE {ks}.unused ADD extra int')
-
-
-async def test_conditional_history_reads_back_real_timestamps(manager: ScyllaClusterManager):
-    """T29: conditional writes, one not applied, against the timestamps the source reports."""
-    await manager.server_add()
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA}')
-        history = await pitr.conditional_history(cql, ks)
-        assert await pitr.read_exact(cql, ks, 't') == await pitr.expected_at(cql, ks, history, max(w.ts for w in history))
-        first, second, _ = history
-        for t, value in ((first.ts, 'first'), (second.ts - 1, 'first'), (second.ts, 'second')):
-            at_t = await pitr.expected_at(cql, ks, history, t)
-            assert [row for row in at_t if row.startswith('(1, 0,')] == [repr((1, 0, value, None, None, None, None,
-                                                                              first.ts if value == 'first' else second.ts,
-                                                                              None, None, None, None, None, None))], f'at {t}'
 
 
 async def test_flush_keeps_a_row_and_its_tombstone_with_expired_grace(manager: ScyllaClusterManager):
@@ -461,7 +461,6 @@ async def test_snapshot_backup_and_tampering(manager: ScyllaClusterManager, s3_s
         assert key not in await pitr.objects_of(s3_storage, key)
         await pitr.put_object(s3_storage, key, original)
         assert await pitr.get_object(s3_storage, key) == original
-        assert pitr.is_immutable(key) and not pitr.is_immutable(f'{pitr.SHIPPING_PREFIX}/head')
 
         # T30
         skip_flush = unique_name('skipflush_')
@@ -508,71 +507,6 @@ async def test_restart_ends_a_writer_and_the_snapshot_survives(manager: ScyllaCl
         assert await pitr.objects_of(s3_storage, pitr.backup_prefix(ks, 't', snap))
 
 
-# Helpers that must fail when they should. These feed them what the feature would report.
-
-def entry(**kwargs):
-    fields = dict(keyspace='ks', table='t', state=pitr.PROTECTED, reason=None, commands=[], restart_required=False, break_cause=None, break_time_us=None,
-                  backups=[], latest_us=None, lag_seconds=None, step=None, text='')
-    return pitr.TableStatus(**(fields | kwargs))
-
-
-async def test_polling_helpers_time_out_and_succeed(monkeypatch):
-    monkeypatch.setattr(pitr, 'deadline', lambda: time.time() + 1)
-    current = entry(latest_us=100)
-
-    async def fake_status(*args):
-        return current
-    monkeypatch.setattr(pitr, 'table_status', fake_status)
-
-    assert await pitr.wait_covered(None, None, 'ks', 't', 100) == 100
-    with pytest.raises(AssertionError):
-        await pitr.wait_covered(None, None, 'ks', 't', 101)
-    with pytest.raises(AssertionError):
-        await pitr.wait_covered(None, None, 'ks', 't')
-
-    backup = pitr.Backup('b', 1, 2)
-    current = entry(backups=[backup])
-    assert await pitr.wait_protected(None, None, 'ks', 't', 'b') == backup
-    assert await pitr.wait_protected(None, None, 'ks', 't') == backup
-    with pytest.raises(AssertionError):
-        await pitr.wait_protected(None, None, 'ks', 't', 'other')
-    current = entry(state=pitr.NOT_PROTECTED, backups=[backup])
-    with pytest.raises(AssertionError):
-        await pitr.wait_protected(None, None, 'ks', 't', 'b')
-
-
-async def test_absence_helpers_fail_when_something_appears(monkeypatch, s3_storage):
-    started = time.time()
-    await pitr.assert_nothing_appears(s3_storage)
-    assert time.time() - started >= pitr.ABSENCE_WINDOW_SECONDS, 'the window must really be watched'
-
-    async def put_late():
-        await asyncio.sleep(1)
-        await pitr.put_object(s3_storage, f'{pitr.SHIPPING_PREFIX}/late', b'x')
-    late = asyncio.create_task(put_late())
-    started = time.time()
-    with pytest.raises(AssertionError):
-        await pitr.assert_nothing_appears(s3_storage)
-    assert time.time() - started < pitr.ABSENCE_WINDOW_SECONDS, 'it must fail when the object appears'
-    await late
-    await pitr.assert_nothing_appears(s3_storage, ('sstables/', pitr.SHIPPING_PREFIX))
-
-    calls = 0
-
-    async def turns_protected(*args):
-        nonlocal calls
-        calls += 1
-        return entry(state=pitr.NOT_PROTECTED) if calls < 3 else entry(state=pitr.PROTECTED)
-    monkeypatch.setattr(pitr, 'table_status', turns_protected)
-    with pytest.raises(AssertionError):
-        await pitr.assert_stays_unprotected(None, None, 'ks', 't')
-
-    async def stays_not_protected(*args):
-        return entry(state=pitr.NOT_PROTECTED)
-    monkeypatch.setattr(pitr, 'table_status', stays_not_protected)
-    assert (await pitr.assert_stays_unprotected(None, None, 'ks', 't')).state == pitr.NOT_PROTECTED
-
-
 async def test_row_helpers_fail_when_they_should(manager: ScyllaClusterManager):
     """wait_acked() ends as soon as a write fails. assert_acked_writes_present() notices a missing and an unexpected row."""
     await manager.server_add()
@@ -607,76 +541,192 @@ async def test_row_helpers_fail_when_they_should(manager: ScyllaClusterManager):
             await pitr.assert_acked_writes_present(cql, ks, 't', [writer], t, [12345])
 
 
+
+
+async def test_target_from_the_backup_schema_is_empty_and_uncompacted(manager: ScyllaClusterManager, s3_storage):
+    """create_target() follows the README: the backup's schema.cql, renamed, with compaction off. Every replay starts from it,
+    and the endpoint refuses a target whose schema differs from the backup's in more than name, ID and compaction."""
+    server = await manager.server_add(config=pitr.node_config(s3_storage, shipping=False))
+    cql = manager.get_cql()
+    async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
+        await cql.run_async(f'CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA} {pitr.PURGEABLE_OPTIONS}')
+        await pitr.apply(cql, ks, 't', pitr.simple_rows(range(4), pitr.old_ts()))
+        snap, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
+        prefix = pitr.backup_prefix(ks, 't', snap)
+        await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
+
+        await pitr.create_target(cql, s3_storage, ks, 'target', prefix)
+        assert await pitr.read_all(cql, ks, 'target') == []
+
+        def columns(table):
+            return cql.run_async(f"SELECT column_name, type, kind FROM system_schema.columns WHERE keyspace_name = '{ks}' AND table_name = '{table}'")
+        assert sorted(await columns('target')) == sorted(await columns('t'))
+        options = (await cql.run_async(f"SELECT compaction, gc_grace_seconds, id FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name IN ('t', 'target')"))
+        source, target = sorted(options, key=lambda r: r.compaction.get('enabled', 'true') == 'false')
+        assert target.compaction.get('enabled') == 'false' and source.compaction.get('enabled', 'true') != 'false'
+        assert target.gc_grace_seconds == source.gc_grace_seconds == 0 and target.id != source.id
+
+
+async def test_polling_helpers_time_out_and_succeed(monkeypatch):
+    monkeypatch.setattr(pitr, 'deadline', lambda: time.time() + 1)
+    p = pitr.Pitr(None, None, None, None, 'ks')
+    current = 100
+
+    async def covered_through(self):
+        return current
+
+    async def no_pulse(self):
+        pass
+    monkeypatch.setattr(pitr.Pitr, 'covered_through', covered_through)
+    monkeypatch.setattr(pitr.Pitr, 'pulse', no_pulse)
+    assert await p.covered(100) == 100
+    with pytest.raises(AssertionError):
+        await p.covered(101)
+    with pytest.raises(AssertionError):
+        await p.covered()
+    current = None
+    with pytest.raises(AssertionError):
+        await p.covered(1)
+
+    states = []
+
+    async def task_status(ip, tid):
+        return {'state': states.pop(0) if len(states) > 1 else states[0], 'error': ''}
+    manager = SimpleNamespace(api=SimpleNamespace(get_task_status=task_status))
+    server = SimpleNamespace(ip_addr='127.0.0.1')
+    states[:] = ['created', 'running', 'done']
+    assert (await pitr.wait_replay(manager, server, 'id')).state == pitr.DONE
+    states[:] = ['running']
+    with pytest.raises(AssertionError, match='replay task'):
+        await pitr.wait_replay(manager, server, 'id')
+
+
+async def test_coverage_probe_reads_a_refusal_and_reuses_its_target(monkeypatch):
+    """Until status lands, covered_through() asks for a far-future T on one throwaway target, and reads the latest restorable time
+    from the refusal. Anything but that refusal gives no answer, and a refusal saying the probe was used up fails the test."""
+    async def no_status(*args):
+        return None
+    monkeypatch.setattr(pitr, 'get_status', no_status)
+    targets, asked = [], []
+
+    async def new_target(self):
+        targets.append(f'probe{len(targets)}')
+        return targets[-1]
+    answer = {}
+
+    async def replay(self, t, target=None, storage=None):
+        asked.append(target)
+        return answer['outcome'](t), target
+    monkeypatch.setattr(pitr.Pitr, 'new_target', new_target)
+    monkeypatch.setattr(pitr.Pitr, 'replay', replay)
+    p = pitr.Pitr(None, None, None, None, 'ks')
+
+    latest = pitr.from_iso('2026-11-04T14:05:00.000001Z')
+    answer['outcome'] = lambda t: pitr.Outcome(pitr.FAILED, pitr.Reason.T_PAST_COVERAGE,
+                                               f't_past_coverage: T {pitr.iso(t)} is past {pitr.iso(latest)}; lag 3 s', '')
+    assert await p.covered_through() == latest
+    assert await p.covered_through() == latest
+    assert asked == ['probe0', 'probe0'], 'the probe target is made once and used again'
+
+    answer['outcome'] = lambda t: pitr.Outcome(pitr.FAILED, pitr.Reason.RECORDS_MISSING, 'protection_records_missing: none yet', '')
+    assert await p.covered_through() is None
+    answer['outcome'] = lambda t: pitr.Outcome(pitr.FAILED, pitr.Reason.TARGET_ALREADY_REPLAYED, 'target_already_replayed: x', '')
+    with pytest.raises(AssertionError, match='probe usable'):
+        await p.covered_through()
+
+
 async def test_assert_refused_catches_each_rule_of_a_refusal(monkeypatch, manager: ScyllaClusterManager):
     await manager.server_add()
     cql = manager.get_cql()
     async with new_test_keyspace(manager, pitr.VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {pitr.TABLE_SCHEMA}')
-        await cql.run_async(f'CREATE TABLE {ks}.watched {pitr.TABLE_SCHEMA}')
+        for cf in ('t', 'watched', 'target'):
+            await cql.run_async(f'CREATE TABLE {ks}.{cf} {pitr.TABLE_SCHEMA}')
         await pitr.apply(cql, ks, 't', pitr.simple_rows([1], 1))
-        refusal = pitr.Result(state=pitr.FAILED, reason='code', message='why')
+        refusal = pitr.Outcome(state=pitr.FAILED, reason='code', message='code: why, and what to do', result_text='')
         action = None
+        status = None
 
-        async def fake_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace=None):
+        async def fake_replay(self, t, target=None, storage=None):
             if action:
-                await cql.run_async(action.format(new=new_table))
-            return fake_restore.result
-        fake_restore.result = refusal
-        monkeypatch.setattr(pitr, 'run_restore', fake_restore)
+                await cql.run_async(action)
+            return fake_replay.outcome, 'target'
+        fake_replay.outcome = refusal
 
-        async def refused(reason='code'):
-            return await pitr.assert_refused(manager, None, cql, ks, 't', 'b', 1, reason, ['watched'])
+        async def fake_status(*args):
+            return status
+        monkeypatch.setattr(pitr.Pitr, 'replay', fake_replay)
+        monkeypatch.setattr(pitr, 'get_status', fake_status)
+        p = pitr.Pitr(manager, None, cql, None, ks)
+
+        async def refused(reasons='code', **kwargs):
+            return (await p.refused(1, reasons, ['watched'], **kwargs))[0]
 
         assert await refused() == refusal
         assert await refused({'code', 'other'}) == refusal
-        with pytest.raises(AssertionError, match='expected reason'):
+        with pytest.raises(AssertionError, match='expected a reason'):
             await refused('other')
-        for bad, words in ((pitr.Result(state=pitr.DONE), 'must be refused'),
-                           (pitr.Result(state=pitr.FAILED, reason='code'), 'states the reason'),
-                           (pitr.Result(state=pitr.FAILED, reason='code', message='why', cells_applied=1), 'before any data')):
-            fake_restore.result = bad
+        for bad, words in ((pitr.Outcome(pitr.DONE, None, '', ''), 'must be refused'),
+                           (pitr.Outcome(pitr.FAILED, 'code', '', ''), 'states the reason'),
+                           (pitr.Outcome(pitr.FAILED, 'code', 'code', ''), 'states the reason')):
+            fake_replay.outcome = bad
             with pytest.raises(AssertionError, match=words):
                 await refused()
-        fake_restore.result = refusal
+        fake_replay.outcome = refusal
 
-        action = f'INSERT INTO {ks}.watched (pk, ck, v) VALUES (5, 0, \'x\')'
+        action = f"INSERT INTO {ks}.watched (pk, ck, v) VALUES (5, 0, 'x')"
         with pytest.raises(AssertionError, match='changed'):
             await refused()
         await cql.run_async(f'TRUNCATE TABLE {ks}.watched')
-        action = f'INSERT INTO {ks}.t (pk, ck, v) VALUES (6, 0, \'x\')'
+        action = f"INSERT INTO {ks}.t (pk, ck, v) VALUES (6, 0, 'x')"
         with pytest.raises(AssertionError, match='changed'):
             await refused()
-        action = f'CREATE TABLE {ks}.{{new}} (pk int PRIMARY KEY)'
-        with pytest.raises(AssertionError, match='no new table'):
+
+        # Rows in the target: a refusal before load fails, and a late one needs the target listed incomplete once status exists.
+        action = None
+        await cql.run_async(f"INSERT INTO {ks}.target (pk, ck, v) VALUES (7, 0, 'x')")
+        with pytest.raises(AssertionError, match='empty'):
+            await refused()
+        status = pitr.Status('on', None, None, incomplete=[])
+        with pytest.raises(AssertionError, match='listed incomplete'):
+            await refused(loaded_ok=True)
+        status = pitr.Status('on', None, None, incomplete=[(ks, 'target')])
+        assert await refused(loaded_ok=True) == refusal
+        await cql.run_async(f'TRUNCATE TABLE {ks}.target')
+        with pytest.raises(AssertionError, match='must not list'):
             await refused()
 
 
 async def test_adapter_parses_what_it_proposes():
-    """The adapter's parsing against the surface it proposes, so a typo in it fails here rather than as a puzzling result later."""
+    """The adapter's parsing against the surface it assumes, so a typo in it fails here rather than as a puzzling result later."""
     t_text, later = '2026-11-04T14:05:00.000001Z', '2026-11-04T14:05:01Z'
     t_us = pitr.from_iso(t_text)
     assert pitr.iso(t_us) == t_text and pitr.from_iso(later) == t_us + 999_999
     assert pitr.iso_times(f'from {t_text} to {later}, not 2026-11-04') == [t_us, t_us + 999_999]
 
-    status = pitr._parse_status({'shipping': 'on', 'store': {'reachable': True, 'error': ''}, 'limits': ['one', 'two'], 'tables': [
-        {'keyspace': 'ks', 'table': 't', 'state': pitr.NOT_PROTECTED, 'reason': pitr.Reason.BROKEN, 'backup_commands': ['nodetool x'], 'restart_required': True,
-         'break': {'cause': pitr.CAUSE_OUTAGE, 'time': t_text}, 'backups': [{'name': 'b', 'start': t_text, 'end': later}],
-         'latest_restorable': later, 'lag_seconds': 1.5, 'step': 'load'}]})
-    assert status.shipping_on and status.store_reachable and status.limits_text == 'one two'
-    parsed = pitr.table_entry(status, 'ks', 't')
-    assert parsed.break_time_us == t_us and parsed.backups == [pitr.Backup('b', t_us, t_us + 999_999)] and parsed.latest_us == t_us + 999_999
-    assert parsed.restart_required and parsed.commands == ['nodetool x'] and parsed.lag_seconds == 1.5 and parsed.step == 'load'
-    with pytest.raises(AssertionError):
-        pitr.table_entry(status, 'ks', 'other')
-    two = pitr.Status(True, '', True, '', '', [parsed, parsed])
-    with pytest.raises(AssertionError, match='one answer'):
-        pitr.table_entry(two, 'ks', 't')
+    assert pitr.reason_in('target_missing: no table ks.x') == pitr.Reason.TARGET_MISSING
+    assert pitr.reason_in('refused (t_past_coverage), not target_missing') == pitr.Reason.T_PAST_COVERAGE
+    assert pitr.reason_in('error: the target_not_empty check') == pitr.Reason.TARGET_NOT_EMPTY
+    assert pitr.reason_in('not_t_past_coverage_at_all') is None and pitr.reason_in('') is None
 
-    result = pitr._parse_result({'state': pitr.FAILED, 'reason': 'r', 'message': 'm', 'notices': ['a', 'b'], 'backup_commands': ['c'], 't': t_text,
-                                 'backup': 'b',
-                                 'objects_read': 1, 'bytes_read': 2, 'cells_applied': 3, 'cells_dropped_after_t': 4, 'flags': ['f'],
-                                 'steps': {'check': {'seconds': 1.0, 'bytes': 5}}, 'total_seconds': 1.0, 'other_tables_bytes': 6,
-                                 'needed_bytes': 7, 'free_bytes': 8, 'reserve_bytes': 9, 'remaining_interval': {'start': t_text, 'end': later}})
-    assert (result.reason, result.message, result.notices, result.t_us, result.cells_dropped) == ('r', 'm', 'a\nb', t_us, 4)
-    assert result.steps == {'check': pitr.Step(1.0, 5)} and (result.remaining_start_us, result.remaining_end_us) == (t_us, t_us + 999_999)
-    assert pitr._parse_result({'state': pitr.FAILED}).remaining_start_us is None
+    refused = pitr.parse_outcome({'id': 'x', 'state': 'failed', 'error': f't_past_coverage: T {later} is past {t_text}; lag 1 s'})
+    assert (refused.state, refused.reason) == (pitr.FAILED, pitr.Reason.T_PAST_COVERAGE) and t_text in refused.result_text
+    assert pitr.latest_restorable(refused, t_us + 999_999) == t_us
+    with pytest.raises(AssertionError):
+        pitr.latest_restorable(refused, t_us)
+    done = pitr.parse_outcome({'state': 'done', 'error': '', 'children': [{'text': pitr.WRONG_WAY_BACK}]})
+    assert done.reason is None and pitr.WRONG_WAY_BACK in done.result_text
+
+    status = pitr.parse_status({'state': 'shipping', 'covered_through': later, 'backups': [{'snapshot': 's', 'time': t_text}],
+                                'incomplete': [{'keyspace': 'ks', 'table': 'x'}]})
+    assert status.covered_through_us == t_us + 999_999 and status.backups == [('s', t_us)] and status.incomplete == [('ks', 'x')]
+
+    schema = ("-- the schema of ks.t\nCREATE TABLE IF NOT EXISTS ks.t (\n    pk int,\n    v text,\n    PRIMARY KEY (pk)\n) WITH ID = "
+              "01234567-89ab-cdef-0123-456789abcdef\n    AND compaction = {'class': 'LeveledCompactionStrategy'}\n    AND gc_grace_seconds = 0;\n")
+    target = pitr.target_statement(schema, 'other', 'target')
+    assert target.startswith('CREATE TABLE other.target (') and 'ID' not in target and 'Leveled' not in target, target
+    assert "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'}" in target and 'gc_grace_seconds = 0' in target, target
+    bare = pitr.target_statement('CREATE TABLE ks.t (pk int PRIMARY KEY) WITH comment = \'c\';', 'ks', 'n')
+    assert bare.endswith("AND compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'}"), bare
+    assert pitr.target_statement('CREATE TABLE ks.t (pk int PRIMARY KEY)', 'ks', 'n').endswith("WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'}")
+    with pytest.raises(AssertionError):
+        pitr.target_statement('CREATE TYPE ks.a (x int);', 'ks', 'n')

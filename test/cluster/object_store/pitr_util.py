@@ -7,50 +7,48 @@
 
 """What the test_pitr_*.py tests share: the adapter to the feature's surface, setup, statements and a store that can fail.
 
-The tests are black box, written from docs-work/requirements-must.md (issue #22). They use only what an operator has: CQL,
-REST, nodetool, configuration, the bucket, and starting or killing the node. The IDs in their docstrings match docs-work/test-plan.md.
+The tests are black box, written from docs-work/requirements-must.md and the slim plan, docs-work/test-plan-slim.md (issue #22).
+They use only what an operator has: CQL, REST, nodetool, configuration, the bucket, and starting or killing the node.
 
-Each test is skipped until the phase it needs has landed: add the phase to LANDED_PHASES to enable it. A skipped test proves nothing.
+Each test is skipped until the product pieces it needs have landed: add them to LANDED_PHASES to enable it. A skipped test proves nothing.
 """
 
 import asyncio
-import json
 import logging
 import os
-import random
 import re
 import shlex
 import threading
 import time
-import uuid
 
 from collections.abc import Mapping, Set as AbstractSet
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, NamedTuple
+from typing import Any, Callable, NamedTuple
 
-import boto3
 import pytest
 
-from cassandra.cluster import ConsistencyLevel
-from cassandra.query import SimpleStatement
+from cassandra.metadata import Murmur3Token
 from cassandra.util import SortedSet
 
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace, reconnect_driver, wait_for_cql_and_get_hosts
 from test.pylib.rest_client import HTTPError
-from test.pylib.s3mock_server import create_bucket, create_conf
-from test.pylib.scylla_cluster_manager import ScyllaClusterManager
+from test.pylib.s3mock_server import create_conf
 from test.pylib.util import unique_name, wait_for
 
 logger = logging.getLogger(__name__)
 
-# The build layers from the requirements (1.1 ship, 1.2 backup and status, 1.3 correct restore, 1.4 result and finish).
-# Add a phase here when it lands, to enable the tests that need it.
+# The product pieces the tests wait for (docs-work/test-plan-slim.md, section 2):
+#   ep.3    the replay_to endpoint fetches and replays the history and ends in a minimal `done` (with ep.1 and ep.2 before it)
+#   st.1    the status GET (#14)
+#   15-bc   the refusals 15-b and 15-c, with the P68 messages
+#   12-2.2  the upload-finished marker of a backup
+# Add a piece here when it lands, to enable the tests that need it.
 LANDED_PHASES: tuple[str, ...] = ()
 
-# Each test must fail on a build without the change, so PITR_RUN_SKIPPED=1 runs every test as if its phase had landed. With
+# Each test must fail on a build without the change, so PITR_RUN_SKIPPED=1 runs every test as if its pieces had landed. With
 # PITR_DEADLINE_SECONDS=10 as well, a poll of an endpoint that doesn't exist gives up quickly. Neither is for normal runs.
 RUN_SKIPPED = os.environ.get('PITR_RUN_SKIPPED') == '1'
 
@@ -59,12 +57,13 @@ def landed(phase: str) -> bool:
     return RUN_SKIPPED or phase in LANDED_PHASES
 
 
-def needs_phase(phase: str):
-    """Skips a test until its phase lands. A typed skip, because test.py reports a bare pytest.mark.skip as an error."""
-    if landed(phase):
+def needs_phase(*phases: str):
+    """Skips a test until every piece it needs lands. A typed skip, because test.py reports a bare pytest.mark.skip as an error."""
+    missing = [p for p in phases if not landed(p)]
+    if not missing:
         return lambda test: test
     return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/22",
-                                reason=f"PITR phase {phase} hasn't landed; the surface in the adapter section is only proposed")
+                                reason=f"PITR pieces {', '.join(missing)} haven't landed")
 
 
 @pytest.fixture(autouse=True)
@@ -82,244 +81,199 @@ async def report_stalls(manager):
 
 ####################################################################################################
 # ADAPTER: every assumption about the feature's surface is here, and nothing below names any of it.
-# None of this is defined yet. It's the surface QA proposes for the design (docs-work/test-plan.md, section 5).
 # A rename changes this section only.
 ####################################################################################################
 
-SHIPPING_PREFIX = 'pitr-log'  # all shipped objects are assumed to be under this prefix
-MUTABLE_OBJECTS = ('head',)   # last component of the shipped objects the product overwrites. All others are immutable
-BACKUP_PREFIX = 'pitr-backups'  # where a backup must go to protect a table: "the shipping store" in SHP-5
+SHIPPING_PREFIX = 'pitr-log'    # the value the tests give pitr_prefix: every shipped object is under it
+BACKUP_PREFIX = 'backups'       # where the tests put a backup, as the README tells the user
 
-CFG_ENDPOINT = 'pitr_endpoint'  # real, from #5: setting this and the bucket turns shipping on
-CFG_BUCKET = 'pitr_bucket'  # real, from #5
-CFG_PREFIX = 'pitr_prefix'  # real, from #5
-CFG_SEAL_SECONDS = 'pitr_seal_interval_in_seconds'  # real, from #5
-CFG_UNSHIPPED_LIMIT_MB = 'pitr_unshipped_limit_in_mb'  # real, from #5
-CFG_DISK_RESERVE_PERCENT = 'pitr_disk_reserve_percent'  # assumed live-updatable
+CFG_ENDPOINT = 'pitr_endpoint'  # db/config.cc: setting this and the bucket turns shipping on
+CFG_BUCKET = 'pitr_bucket'
+CFG_PREFIX = 'pitr_prefix'
+CFG_SEAL_SECONDS = 'pitr_seal_interval_in_seconds'
+CFG_UNSHIPPED_LIMIT_MB = 'pitr_unshipped_limit_in_mb'
 
-STATUS_URI = '/storage_service/pitr/status'  # GET
-RESTORE_URI = '/storage_service/pitr/restore'  # POST, returns a task manager id, or 400 with a refusal as JSON
-RESULT_URI = '/storage_service/pitr/restore_result'  # GET, durable, survives a restart
+# POST, api/api-doc/storage_service.json on pitr/18-ep1b-endpoint. Returns a task manager id. The outcome is the task's
+# state, and a refusal is its failure text.
+REPLAY_URI = '/storage_service/pitr/replay_to'
+# GET. Proposed: st.1 hasn't defined it yet. Until it lands, the coverage wait falls back to the probe below.
+STATUS_URI = '/storage_service/pitr/status'
 
-PROTECTED = 'protected'
-NOT_PROTECTED = 'not protected'
-INCOMPLETE = 'incomplete'
 DONE = 'done'
 FAILED = 'failed'
-CAUSE_RESTART = 'restart'
-CAUSE_OUTAGE = 'outage'
-FLAG_EMPTY_BACKUP = 'empty_backup'
-STEPS = ('check', 'fetch', 'load', 'replay', 'flush')
+SEAL_SECONDS = 1
 
 
 class Reason:
-    """Stable reason codes, for status (table) and for refusals (restore)."""
-    # status
-    BROKEN = 'protection_broken'
-    RESTORED_TABLE = 'restored_table'
-    # table kinds: status and refusal
-    TABLETS = 'table_uses_tablets'
-    STRONG = 'table_strongly_consistent'
-    COUNTERS = 'table_has_counters'
-    VIEW_BASE = 'table_has_view'
-    INDEXED = 'table_has_index'
-    VIEW_TABLE = 'table_is_view'
-    INDEX_TABLE = 'table_is_index'
-    CDC = 'table_uses_cdc'
-    DURABLE = 'durable_writes_false'
-    LOGSTOR = 'table_uses_logstor'
-    SYSTEM = 'table_is_system'
-    ALTERNATOR = 'table_is_alternator'
-    # refusals
-    NODES = 'more_than_one_node'
-    RF = 'replication_factor_not_1'
-    OBJECT_MISSING = 'shipped_object_missing'
-    OBJECT_DAMAGED = 'shipped_object_damaged'
+    """Reason codes in a refusal's text. All but the last three are real: db/pitr/refusal.cc on pitr/18-ep3c-splits."""
+    T_INVALID = 't_invalid'
+    T_PAST_COVERAGE = 't_past_coverage'
     RECORDS_MISSING = 'protection_records_missing'
     RECORDS_DAMAGED = 'protection_records_damaged'
     BACKUP_BEFORE_SHIPPING = 'backup_before_shipping'
-    BACKUP_NOT_USABLE = 'backup_not_usable'
-    T_PAST_COVERAGE = 't_past_coverage'
-    T_BEFORE_COVERAGE = 't_before_coverage'
-    NO_SUCH_BACKUP = 'no_such_backup'
-    NO_BACKUP = 'no_backup'
+    STORE_LOCATION_MISSING = 'store_location_missing'
+    TARGET_MISSING = 'target_missing'
+    TARGET_NOT_EMPTY = 'target_not_empty'
+    TARGET_SCHEMA_DIFFERS = 'target_schema_differs'
+    TARGET_AUTO_COMPACTION = 'target_auto_compaction_enabled'
+    TARGET_ALREADY_REPLAYED = 'target_already_replayed'
+    BACKUP_FILE_MISSING = 'backup_file_missing'
+    BOUND_FILE_DAMAGED = 'bound_file_damaged'
+    BACKUP_NAMES_ANOTHER_TABLE = 'backup_names_another_table'
+    REPLAY_ALREADY_RUNNING = 'replay_already_running'
+    BACKUP_MANIFEST_DAMAGED = 'backup_manifest_damaged'
+    BACKUP_FILE_TOO_LARGE = 'backup_file_too_large'
+    TARGET_USES_TABLETS = 'target_uses_tablets'
+    SEGMENT_MISSING = 'shipped_object_missing'
+    SEGMENT_DAMAGED = 'shipped_object_damaged'
+    # Proposed: no real code exists yet for these. They need 15-b/c (TRUNCATE, schema change) and 12-2.2 (upload unfinished),
+    # which aren't built (their tests are untouched). Change the spelling here when the piece lands and names its code. A compaction during a replay has no
+    # code either: T3 accepts any real one.
+    TRUNCATED = 'source_truncated'
+    SCHEMA_CHANGED = 'source_schema_changed'
     BACKUP_UNFINISHED = 'backup_upload_unfinished'
-    SCHEMA_CHANGED = 'schema_changed_in_window'
-    TRUNCATED = 'truncate_in_window'
-    T_INVALID = 't_invalid'
-    DISK = 'disk_reserve'
-    NAME_TAKEN = 'new_table_name_taken'
-    NAME_INVALID = 'new_table_name_invalid'
-    NAME_OTHER_KEYSPACE = 'new_table_other_keyspace'
 
 
-# Words that show a limit or a next action is stated. Lowercase; each is looked for in the lowercased text.
-STATUS_LIMIT_WORDS = ['experimental', 'vnodes', 'tablets', 'object lock']
-RESULT_LIMIT_WORDS = {'limit 3': 'clocks', 'limit 3, batches': 'batch', 'limit 4': 'ttl', 'limit 5': 'newer than t', 'limit 6': "isn't checked",
-                      'limit 15': 'refresh', 'limit 8': 'truncated'}
+KNOWN_REASONS = tuple(v for k, v in vars(Reason).items() if not k.startswith('_'))
+# The history between the backup and T is damaged or has a gap (REF-4).
+HISTORY_DAMAGED = {Reason.RECORDS_MISSING, Reason.RECORDS_DAMAGED, Reason.SEGMENT_MISSING, Reason.SEGMENT_DAMAGED}
+
+# RTN-1, verbatim: requirements-must.md.
 WRONG_WAY_BACK = ("Don't load this copy's files into the original unless it's been truncated: "
                   "later deletes in the original still win, and rows stay missing with no error.")
-NOT_VERIFIED_RE = re.compile(r'Not verified: (\d+) collections may differ at this exact T; retry with T one microsecond off\.')
-COPY_NOTICE_WORDS = ['copy', 'production', 'route back', 'own backup']
-SHIPPING_OFF_WORDS = ['node']
-TOPOLOGY_LIMIT_WORDS = {Reason.NODES: 'one node', Reason.RF: 'rf=1'}
+# The line the node logs when a replay ends in `done` (db/pitr/replay_to.cc, format_replay_result). Tasks carry no success text
+# (#100), so the log is where the result is.
+RESULT_MARK = 'is done: restored from backup'
 PAST_COVERAGE_WORDS = ['lag']
-NEWER_BACKUP_WORDS = ['newer backup', 'earlier']
-UNFINISHED_BACKUP_WORDS = ['finish']
-INCOMPLETE_ACTION_WORDS = ['drop', 'new name']
+# P68 (PM-67): the refusal on a done table says where the result was written.
+RESULT_LOGGED_WORDS = ['log']
 
 
 @dataclass
-class Backup:
-    name: str
-    start_us: int
-    end_us: int
-
-
-@dataclass
-class TableStatus:
-    keyspace: str
-    table: str
+class Outcome:
+    """How a replay ended, read from its task."""
     state: str
     reason: str | None
-    commands: list[str]         # exact commands that restore protection
-    restart_required: bool
-    break_cause: str | None
-    break_time_us: int | None
-    backups: list[Backup]
-    latest_us: int | None       # latest restorable time, including after a break
-    lag_seconds: float | None
-    step: str | None            # for an incomplete restore
-    text: str                   # everything the entry says, for checking a next action is stated
+    message: str            # the failure text: the refusal's reason and next action
+    result_text: str        # every string the finished task carries, where a `done` result is looked for
+    raw: Any = None
 
 
 @dataclass
 class Status:
-    shipping_on: bool
-    off_reason: str
-    store_reachable: bool
-    store_error: str
-    limits_text: str
-    tables: list[TableStatus]
-
-
-@dataclass
-class Step:
-    seconds: float
-    bytes: int
-
-
-@dataclass
-class Result:
+    """The node's PITR status (STA-1 as changed by P68): shipping state, covered-through, usable backups, `incomplete` tables."""
     state: str
-    reason: str | None = None
-    message: str = ''
-    notices: str = ''           # the result's limits and warnings as text
-    commands: list[str] = field(default_factory=list)
-    t_us: int | None = None
-    backup: str | None = None
-    objects_read: int | None = None
-    bytes_read: int | None = None
-    cells_applied: int | None = None
-    cells_dropped: int | None = None
-    flags: list[str] = field(default_factory=list)
-    steps: dict[str, Step] = field(default_factory=dict)
-    total_seconds: float | None = None
-    other_tables_bytes: int | None = None
-    needed_bytes: int | None = None
-    free_bytes: int | None = None
-    reserve_bytes: int | None = None
-    remaining_start_us: int | None = None     # after a gap: the interval that's still restorable, or None if none remains
-    remaining_end_us: int | None = None
+    break_cause: str | None
+    covered_through_us: int | None
+    backups: list[tuple[str, int]] = field(default_factory=list)       # (snapshot, its time)
+    incomplete: list[tuple[str, str]] = field(default_factory=list)    # (keyspace, table)
     raw: Any = None
 
 
-def backup_prefix(ks, cf, snap) -> str:
-    return f'{BACKUP_PREFIX}/{ks}/{cf}/{snap}'
+def _strings(j):
+    if isinstance(j, str):
+        yield j
+    elif isinstance(j, Mapping):
+        for v in j.values():
+            yield from _strings(v)
+    elif isinstance(j, list):
+        for v in j:
+            yield from _strings(v)
 
 
-def shipping_options(storage, seal_seconds=1, **extra) -> dict:
-    return {CFG_ENDPOINT: storage.address, CFG_BUCKET: storage.bucket_name, CFG_PREFIX: SHIPPING_PREFIX,
-            CFG_SEAL_SECONDS: seal_seconds} | extra
+def reason_in(text: str) -> str | None:
+    """The reason code a refusal's text carries: a leading `<code>:` if there is one, else the first known code in it as a
+    whole word. Matching words is the fallback, because the product doesn't yet promise where the code goes."""
+    m = re.match(r'\s*([a-z][a-z0-9_]*)\s*:', text)
+    if m and m[1] in KNOWN_REASONS:
+        return m[1]
+    found = [(m.start(), code) for code in KNOWN_REASONS for m in [re.search(rf'\b{code}\b', text)] if m]
+    return min(found)[1] if found else None
 
 
-def _parse_status(j) -> Status:
-    tables = []
-    for t in j.get('tables', []):
-        brk = t.get('break') or {}
-        tables.append(TableStatus(
-            keyspace=t['keyspace'], table=t['table'], state=t['state'], reason=t.get('reason'),
-            commands=t.get('backup_commands', []), restart_required=t.get('restart_required', False),
-            break_cause=brk.get('cause'), break_time_us=from_iso(brk['time']) if brk.get('time') else None,
-            backups=[Backup(b['name'], from_iso(b['start']), from_iso(b['end'])) for b in t.get('backups', [])],
-            latest_us=from_iso(t['latest_restorable']) if t.get('latest_restorable') else None,
-            lag_seconds=t.get('lag_seconds'), step=t.get('step'), text=str(t)))
-    store = j.get('store', {})
-    return Status(shipping_on=j['shipping'] == 'on', off_reason=j.get('off_reason', ''), store_reachable=store.get('reachable', False),
-                  store_error=store.get('error', ''), limits_text=' '.join(j.get('limits', [])), tables=tables)
+def parse_outcome(task) -> Outcome:
+    error = task.get('error') or ''
+    return Outcome(state=task['state'], reason=reason_in(error) if task['state'] == FAILED else None, message=error,
+                   result_text='\n'.join(_strings(task)), raw=task)
 
 
-def _parse_result(j) -> Result:
-    remaining = j.get('remaining_interval') or {}
-    return Result(
-        remaining_start_us=from_iso(remaining['start']) if remaining else None,
-        remaining_end_us=from_iso(remaining['end']) if remaining else None,
-        state=j['state'], reason=j.get('reason'), message=j.get('message', ''), notices='\n'.join(j.get('notices', [])),
-        commands=j.get('backup_commands', []), t_us=from_iso(j['t']) if j.get('t') else None, backup=j.get('backup'),
-        objects_read=j.get('objects_read'), bytes_read=j.get('bytes_read'), cells_applied=j.get('cells_applied'),
-        cells_dropped=j.get('cells_dropped_after_t'), flags=j.get('flags', []),
-        steps={k: Step(v['seconds'], v['bytes']) for k, v in j.get('steps', {}).items()}, total_seconds=j.get('total_seconds'),
-        other_tables_bytes=j.get('other_tables_bytes'), needed_bytes=j.get('needed_bytes'), free_bytes=j.get('free_bytes'),
-        reserve_bytes=j.get('reserve_bytes'), raw=j)
+def parse_status(j) -> Status:
+    return Status(state=j['state'], break_cause=j.get('break_cause'),
+                  covered_through_us=from_iso(j['covered_through']) if j.get('covered_through') else None,
+                  backups=[(b['snapshot'], from_iso(b['time'])) for b in j.get('backups', [])],
+                  incomplete=[(x['keyspace'], x['table']) for x in j.get('incomplete', [])], raw=j)
 
 
-async def get_status(manager, server) -> Status:
-    return _parse_status(await manager.api.client.get_json(STATUS_URI, host=server.ip_addr))
+async def start_replay(manager, server, *, endpoint, bucket, prefix, ks, target, snapshot, t) -> str:
+    """Returns the task id. T is microseconds, or a string to pass as it is."""
+    params = {'endpoint': endpoint, 'bucket': bucket, 'prefix': prefix, 'keyspace': ks, 'table': target, 'snapshot': snapshot,
+              't': iso(t) if isinstance(t, int) else t}
+    return await manager.api.client.post_json(REPLAY_URI, host=server.ip_addr, params=params)
 
 
-async def start_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace=None) -> str | Result:
-    """Returns a task id, or the Result of a refusal made at once. T is microseconds, or a string to pass as it is."""
-    params = {'keyspace': ks, 'table': cf, 'backup': backup, 'time': iso(t) if isinstance(t, int) else t, 'new_table': new_table}
-    if new_keyspace:
-        params['new_keyspace'] = new_keyspace
+async def wait_replay(manager, server, task_id) -> Outcome:
+    """Polls the task with a deadline: wait_task has none, and a hung replay must fail the test rather than the run."""
+    async def ended():
+        task = await manager.api.get_task_status(server.ip_addr, task_id)
+        return task if task['state'] in (DONE, FAILED) else None
+    return parse_outcome(await wait_for(ended, deadline(), label=f'replay task {task_id}'))
+
+
+async def result_line(pitr) -> str | None:
+    """The `done` result line of a replay into this node, from its log, or None if there is none."""
+    log = await pitr.manager.server_open_log(server_id=pitr.server.server_id)
+    found = await log.grep(re.escape(RESULT_MARK))
+    return found[-1][0] if found else None
+
+
+async def get_status(manager, server) -> Status | None:
+    """None while st.1 hasn't landed and the URI doesn't exist. Once it has, a missing status is an error."""
     try:
-        return await manager.api.client.post_json(RESTORE_URI, host=server.ip_addr, params=params)
+        return parse_status(await manager.api.client.get_json(STATUS_URI, host=server.ip_addr))
     except HTTPError as e:
-        assert e.code == 400, f'a refusal must not look like a server error: {e}'
-        return _parse_result(json.loads(e.message))
+        # RUN_SKIPPED must not claim the endpoint exists: the status GET (#14) isn't built, so a 404 is the answer.
+        if e.code == 404 and 'st.1' not in LANDED_PHASES:
+            return None
+        raise
 
 
-async def get_result(manager, server, ks, new_table) -> Result:
-    return _parse_result(await manager.api.client.get_json(RESULT_URI, host=server.ip_addr, params={'keyspace': ks, 'new_table': new_table}))
+def target_statement(schema_cql: str, ks: str, target: str) -> str:
+    """The CREATE TABLE the README tells the user to run: the backup's own schema.cql, renamed, without its ID, with
+    compaction disabled."""
+    text = re.sub(r'/\*.*?\*/', '', schema_cql, flags=re.S)
+    text = '\n'.join(line for line in text.splitlines() if not line.lstrip().startswith('--'))
+    creates = [s.strip() for s in text.split(';') if re.match(r'\s*CREATE\s+TABLE\b', s, re.I)]
+    assert len(creates) == 1, f'expected one CREATE TABLE in schema.cql: {schema_cql}'
+    stmt, renamed = re.subn(r'^CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?("?\w+"?)\.("?\w+"?)', f'CREATE TABLE {ks}.{target}', creates[0], flags=re.I)
+    assert renamed == 1, f'no table name in {creates[0]}'
+    stmt = re.sub(r'\bID\s*=\s*[0-9a-fA-F-]{36}\s*', '', stmt)
+    stmt = re.sub(r'\bWITH\s+AND\b', 'WITH', stmt, flags=re.I)
+    stmt = re.sub(r'\bAND\s+AND\b', 'AND', stmt, flags=re.I)
+    stmt = re.sub(r'\s+(AND|WITH)\s*$', '', stmt, flags=re.I)
+    disabled = "compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'}"
+    stmt, replaced = re.subn(r"\bcompaction\s*=\s*\{[^}]*\}", disabled, stmt, flags=re.I)
+    if not replaced:
+        stmt += f' AND {disabled}' if re.search(r'\)\s*WITH\b', stmt, re.I) else f' WITH {disabled}'
+    return stmt
 
 ####################################################################################################
 # End of the adapter.
 ####################################################################################################
 
 VNODES_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'enabled': false}"
-TABLETS_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1}"
-STRONG_KS = TABLETS_KS + " AND tablets = {'initial': 1} AND consistency = 'global'"
-NONDURABLE_KS = VNODES_KS + ' AND durable_writes = false'
-RF2_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'enabled': false}"
-ALTER_KEYSPACE_RF2 = "ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 2}}"
-ALTER_KEYSPACE_RF1_NONDURABLE = ("ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} "
-                                 "AND durable_writes = false")
 PURGEABLE_OPTIONS = "WITH gc_grace_seconds = 0 AND tombstone_gc = {'mode': 'immediate'}"
 DEADLINE_SECONDS = int(os.environ.get('PITR_DEADLINE_SECONDS', 300))
 # The VM's clock steps by up to about 150 ms (docs-work/baseline.md:115-116), so a comparison between a time
 # measured here and one reported by the node has this margin.
 CLOCK_MARGIN_US = 1_000_000
 STEP_US = 1000
-# Absence has no event to poll for, so a check for it watches the bucket for this long: 5 seal intervals, at S = 1 s.
-# T01 requires objects to appear within this time once shipping is on, which is what shows that the window can catch shipping.
-ABSENCE_WINDOW_SECONDS = 5
 SHARDS = 2                      # test/pylib/scylla_server.py:153
-SEAL_SECONDS = 1                # the default of shipping_options()
-IDLE_WINDOW_US = 10_000_000
 IGNORE_MSB_BITS = 12            # the default of murmur3_partitioner_ignore_msb_bits
+FAR_FUTURE_US = 86400_000_000   # how far past now the coverage probe asks for, so that it's always refused
 TABLE_SCHEMA = '(pk int, ck int, v text, w int, s int static, m map<int, text>, st set<int>, PRIMARY KEY (pk, ck))'
 EXACT_COLUMNS = ('pk, ck, v, w, s, m, st, WRITETIME(v), WRITETIME(w), WRITETIME(s), '
                  'WRITETIME(m[1]), WRITETIME(m[2]), WRITETIME(st[1]), WRITETIME(st[2])')
+UNCOMPRESSED_SCHEMA = f"{TABLE_SCHEMA} WITH compression = {{'sstable_compression': ''}}"
 ISO_RE = re.compile(r'\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(?:\.\d{1,6})?Z')
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 
@@ -336,6 +290,14 @@ def iso_times(text: str) -> list[int]:
     return [from_iso(m) for m in ISO_RE.findall(text)]
 
 
+def latest_restorable(outcome: Outcome, t: int) -> int:
+    """The latest restorable time a REF-5 refusal of T states: the latest time in its message below T. The message may
+    repeat T, which is never restorable, so T and anything after it don't count."""
+    below = [x for x in iso_times(outcome.message) if x < t]
+    assert below, f'a refusal past coverage must state the latest restorable time: {outcome}'
+    return max(below)
+
+
 def now_us() -> int:
     return time.time_ns() // 1000
 
@@ -344,129 +306,34 @@ def deadline() -> float:
     return time.time() + DEADLINE_SECONDS
 
 
-def node_config(storage, shipping=True, **extra) -> dict:
-    cfg = {'object_storage_endpoints': storage.create_endpoint_conf(), 'task_ttl_in_seconds': 300}
+def backup_prefix(ks, cf, snap) -> str:
+    return f'{BACKUP_PREFIX}/{ks}/{cf}/{snap}'
+
+
+def node_config(storage, shipping=True, ship_to=None, also=(), **extra) -> dict:
+    """`storage` is the endpoint backups and replays name. Shipping goes to `ship_to`, by default the same one. `also` are
+    other endpoints to configure, so that one test can ship through a gate and back up around it, or the other way round."""
+    ship_to = ship_to or storage
+    endpoints = storage.create_endpoint_conf()
+    for other in (ship_to, *also):
+        endpoints += [e for e in other.create_endpoint_conf() if e['name'] not in {x['name'] for x in endpoints}]
+    cfg = {'object_storage_endpoints': endpoints, 'task_ttl_in_seconds': 300}
     if shipping:
-        cfg |= shipping_options(storage)
+        cfg |= {CFG_ENDPOINT: ship_to.address, CFG_BUCKET: ship_to.bucket_name, CFG_PREFIX: SHIPPING_PREFIX, CFG_SEAL_SECONDS: SEAL_SECONDS}
     return cfg | extra
 
 
-def table_entry(status: Status, ks, cf) -> TableStatus:
-    found = [t for t in status.tables if (t.keyspace, t.table) == (ks, cf)]
-    assert len(found) == 1, f'{ks}.{cf} must have one answer, got {found}'
-    return found[0]
-
-
-async def table_status(manager, server, ks, cf) -> TableStatus:
-    return table_entry(await get_status(manager, server), ks, cf)
-
-
-async def backup_table(manager, server, storage, ks, cf) -> str:
-    snap, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
-    await do_backup(server, snap, backup_prefix(ks, cf, snap), ks, cf, storage, manager, logger)
-    return snap
-
-
-async def wait_protected(manager, server, ks, cf, name=None) -> Backup:
-    """Waits for the table to be protected by the named backup, or by any backup. Returns the backup."""
-    async def protected():
-        t = await table_status(manager, server, ks, cf)
-        if t.state != PROTECTED:
-            return None
-        found = [b for b in t.backups if name is None or b.name == name]
-        return found[-1] if found else None
-    return await wait_for(protected, deadline())
-
-
-async def protect_table(manager, server, storage, ks, cf) -> Backup:
-    return await wait_protected(manager, server, ks, cf, await backup_table(manager, server, storage, ks, cf))
-
-
-async def wait_covered(manager, server, ks, cf, us=None) -> int:
-    """Waits until the latest restorable time reaches a time, by default a little after now, so that
-    every write acknowledged before this call is covered. Returns the latest restorable time."""
-    target = us if us is not None else now_us() + CLOCK_MARGIN_US
-    async def covered():
-        t = await table_status(manager, server, ks, cf)
-        return t.latest_us if t.latest_us is not None and t.latest_us >= target else None
-    return await wait_for(covered, deadline())
-
-
-async def run_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace=None) -> Result:
-    started = await start_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace)
-    if isinstance(started, Result):
-        return started
-    await manager.api.wait_task(server.ip_addr, started)
-    return await get_result(manager, server, new_keyspace or ks, new_table)
-
-
-async def restore_ok(manager, server, ks, cf, backup, t, new_table) -> Result:
-    result = await run_restore(manager, server, ks, cf, backup, t, new_table)
-    assert result.state == DONE, f'restore to {t} must succeed, got {result}'
-    return result
-
-
 async def read_all(cql, ks, table) -> list[str]:
-    # CL ONE: the session's default is LOCAL_QUORUM, which a single node can't meet at RF above 1.
-    statement = SimpleStatement(f'SELECT * FROM {ks}.{table}', consistency_level=ConsistencyLevel.ONE)
-    return sorted(repr(tuple(r)) for r in await cql.run_async(statement))
+    return sorted(repr(tuple(r)) for r in await cql.run_async(f'SELECT * FROM {ks}.{table}'))
 
 
-async def table_exists(cql, ks, table) -> bool:
-    rows = await cql.run_async(f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{ks}' AND table_name = '{table}'")
-    return len(list(rows)) > 0
-
-
-async def assert_refused(manager, server, cql, ks, cf, backup, t, reason, watched=(), new_table=None, new_keyspace=None, read_source=True) -> Result:
-    """Checks the refusal rules in the requirements' Terms. `watched` are other tables that must read the same."""
-    if new_table is None:
-        new_table = unique_name('restored_')
-    expect_absent = new_keyspace is None and not await table_exists(cql, ks, new_table)
-    tables = [(ks, cf), *[(ks, w) for w in watched]] if read_source and not ks.startswith('system') else []
-    before = {w: await read_all(cql, *w) for w in tables}
-    result = await run_restore(manager, server, ks, cf, backup, t, new_table, new_keyspace)
-    assert result.state == FAILED, f'must be refused: {result}'
-    assert result.reason in ({reason} if isinstance(reason, str) else reason), f'expected reason {reason}: {result}'
-    assert result.message, f'a refusal states the reason and next action: {result}'
-    assert not result.cells_applied, f'refusal happens before any data is loaded: {result}'
-    for w, rows in before.items():
-        assert await read_all(cql, *w) == rows, f'{w} changed in a refusal'
-    if expect_absent:
-        assert not await table_exists(cql, ks, new_table), f'a refusal leaves no new table: {result}'
-    return result
+async def create_target(cql, storage, ks, target, prefix):
+    """Creates the target the way the README tells the user: from the backup's schema.cql in the bucket."""
+    schema = (await get_object(storage, f'{prefix}/schema.cql')).decode()
+    await cql.run_async(target_statement(schema, ks, target))
 
 
 # Scenario setup, shared with test_pitr_helpers.py, which checks it on a build with no PITR.
-
-def unsupported_tables_config(cfg: dict) -> dict:
-    return cfg | {'alternator_port': 8000, 'alternator_write_isolation': 'only_rmw_uses_lwt',
-                  'experimental_features': ['strongly-consistent-tables', 'logstor']}
-
-
-async def create_unsupported_tables(server, cql, ks, tablet_ks, strong_ks, nondurable_ks) -> list[tuple[str, str, str]]:
-    """One table of each kind REF-1 refuses. Returns its keyspace, name and reason code."""
-    alternator = boto3.resource('dynamodb', endpoint_url=f'http://{server.ip_addr}:8000', region_name='us-east-1',
-                                aws_access_key_id='alternator', aws_secret_access_key='secret_pass')
-    await cql.run_async(f'CREATE TABLE {tablet_ks}.t (pk int PRIMARY KEY, v int)')
-    await cql.run_async(f'CREATE TABLE {strong_ks}.t (pk int PRIMARY KEY, v int)')
-    await cql.run_async(f'CREATE TABLE {nondurable_ks}.t (pk int PRIMARY KEY, v int)')
-    await cql.run_async(f'CREATE TABLE {ks}.counters (pk int PRIMARY KEY, c counter)')
-    await cql.run_async(f'CREATE TABLE {ks}.viewed (pk int, ck int, v int, PRIMARY KEY (pk, ck))')
-    await cql.run_async(f'CREATE MATERIALIZED VIEW {ks}.a_view AS SELECT * FROM {ks}.viewed WHERE pk IS NOT NULL AND ck IS NOT NULL PRIMARY KEY (ck, pk)')
-    await cql.run_async(f'CREATE TABLE {ks}.indexed (pk int PRIMARY KEY, v int)')
-    await cql.run_async(f'CREATE INDEX an_index ON {ks}.indexed (v)')
-    await cql.run_async(f"CREATE TABLE {ks}.cdc (pk int PRIMARY KEY, v int) WITH cdc = {{'enabled': true}}")
-    # In a tablet keyspace, as in test_logstor.py. The refusal must still name logstor.
-    await cql.run_async(f"CREATE TABLE {tablet_ks}.logstor (pk int PRIMARY KEY, v int) WITH storage_engine = 'logstor'")
-    await asyncio.to_thread(alternator.create_table, TableName='alt', BillingMode='PAY_PER_REQUEST', KeySchema=[{'AttributeName': 'p', 'KeyType': 'HASH'}],
-                            AttributeDefinitions=[{'AttributeName': 'p', 'AttributeType': 'S'}],
-                            Tags=[{'Key': 'system:initial_tablets', 'Value': 'none'}])
-    return [(tablet_ks, 't', Reason.TABLETS), (strong_ks, 't', Reason.STRONG), (nondurable_ks, 't', Reason.DURABLE),
-            (ks, 'counters', Reason.COUNTERS), (ks, 'viewed', Reason.VIEW_BASE), (ks, 'a_view', Reason.VIEW_TABLE),
-            (ks, 'indexed', Reason.INDEXED), (ks, 'an_index_index', Reason.INDEX_TABLE),
-            (ks, 'cdc', Reason.CDC), (ks, 'cdc_scylla_cdc_log', Reason.CDC), (tablet_ks, 'logstor', Reason.LOGSTOR),
-            ('system', 'local', Reason.SYSTEM), ('system_schema', 'tables', Reason.SYSTEM), ('alternator_alt', 'alt', Reason.ALTERNATOR)]
-
 
 async def create_rich_table(cql, ks) -> tuple[str, list[str]]:
     """Table src with non-default options, a UDT, a static and a dropped column, and one row. Returns its DESCRIBE and its rows."""
@@ -492,18 +359,18 @@ async def create_alterable_table(cql, ks):
     await cql.run_async(f'CREATE TABLE {ks}.t (pk int, ck int, v text, w int, a frozen<addr>, PRIMARY KEY (pk, ck))')
 
 
-async def write_and_purge(manager, server, cql, ks):
-    """Row 1 written and deleted, row 2 written, in table purged. Returns once row 1 and its tombstone are out of the data."""
+async def write_and_purge(manager, server, cql, ks, table='purged', purged_pk=1, kept_pks=(2,)):
+    """Row purged_pk written and deleted, rows kept_pks written. Returns once purged_pk and its tombstone are out of the data."""
     ts = now_us() - 3600_000_000
-    await apply(cql, ks, 'purged', simple_rows([1, 2], ts))
-    await cql.run_async(f'DELETE FROM {ks}.purged USING TIMESTAMP {ts + 1} WHERE pk = 1')
-    await manager.api.keyspace_flush(server.ip_addr, ks, 'purged')
+    await apply(cql, ks, table, simple_rows([purged_pk, *kept_pks], ts))
+    await cql.run_async(f'DELETE FROM {ks}.{table} USING TIMESTAMP {ts + 1} WHERE pk = {purged_pk}')
+    await manager.api.keyspace_flush(server.ip_addr, ks, table)
     # A tombstone can't be purged in the second it was written, so compaction is repeated until it's gone.
     # If it never goes, the case would prove nothing, and the wait fails.
     async def purged():
-        await manager.api.keyspace_compaction(server.ip_addr, ks, 'purged')
-        fragments = await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.purged)')
-        return True if {f.pk for f in fragments} == {2} else None
+        await manager.api.keyspace_compaction(server.ip_addr, ks, table)
+        fragments = await cql.run_async(f'SELECT * FROM MUTATION_FRAGMENTS({ks}.{table})')
+        return True if {f.pk for f in fragments} == set(kept_pks) else None
     await wait_for(purged, deadline())
     return ts
 
@@ -523,41 +390,20 @@ async def row_is_in_the_data(cql, ks, pk) -> bool:
     return any(f.pk == pk and f.mutation_fragment_kind == 'clustering row' for f in fragments)
 
 
-async def write_several_sstables(manager, server, cql, ks):
+async def write_several_sstables(manager, server, cql, ks, table='t'):
     """Uncompressed, so that an upload has real bytes, and several sstables, so that an upload cut part-way has finished some objects."""
     for first in range(0, 1200, 300):
-        await apply(cql, ks, 't', simple_rows(range(first, first + 300), old_ts(), 'x' * 1024))
-        await manager.api.keyspace_flush(server.ip_addr, ks, 't')
-
-
-UNCOMPRESSED_SCHEMA = f"{TABLE_SCHEMA} WITH compression = {{'sstable_compression': ''}}"
-
-
-async def conditional_history(cql, ks) -> list:
-    """Conditional writes on table t, one not applied. A conditional write can't choose its timestamp, so this returns
-    plain statements with the timestamps the table reports."""
-    async def conditional(statement, row, value, applied=True):
-        rows = await cql.run_async(statement)
-        assert rows[0][0] is applied, f'{statement}: {rows}'
-        pk, ck = row
-        written = await cql.run_async(f'SELECT WRITETIME(v) FROM {ks}.t WHERE pk = {pk} AND ck = {ck}')
-        return W(written[0][0], f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, {ck}, '{value}') USING TIMESTAMP {{ts}}")
-
-    first = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'first') IF NOT EXISTS", (1, 0), 'first')
-    await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (1, 0, 'lost') IF NOT EXISTS", (1, 0), 'first', applied=False)
-    second = await conditional(f"UPDATE {ks}.t SET v = 'second' WHERE pk = 1 AND ck = 0 IF v = 'first'", (1, 0), 'second')
-    other = await conditional(f"INSERT INTO {ks}.t (pk, ck, v) VALUES (2, 0, 'other') IF NOT EXISTS", (2, 0), 'other')
-    # Only writes to one partition are ordered. The other partition's write has a timestamp of its own, from its own shard's
-    # clock, which steps on this VM. A repeat saw it below the second write.
-    assert first.ts < second.ts, [first, second]
-    return [first, second, other]
+        await apply(cql, ks, table, simple_rows(range(first, first + 300), old_ts(), 'x' * 1024))
+        await manager.api.keyspace_flush(server.ip_addr, ks, table)
 
 
 # Statements, and the independent answer for "exact at T".
 
 class W(NamedTuple):
+    """A statement and its timestamp. With values, it's prepared and bound, so that a large value isn't parsed as CQL text."""
     ts: int
     cql: str
+    values: tuple = ()
 
 
 class Batch(NamedTuple):
@@ -572,6 +418,12 @@ async def apply(cql, ks, table, statements, t=None):
     each batch and then splitting it, which is the requirements' definition of exact at T."""
     def text(w):
         return w.cql.format(t=f'{ks}.{table}', ts=w.ts)
+
+    async def run(w):
+        if w.values:
+            await cql.run_async(cql.prepare(text(w)), w.values)
+        else:
+            await cql.run_async(text(w))
     for s in statements:
         if isinstance(s, Batch):
             if t is None:
@@ -579,9 +431,9 @@ async def apply(cql, ks, table, statements, t=None):
             else:
                 for w in s.parts if s.merged is None else s.merged:
                     if w.ts <= t:
-                        await cql.run_async(text(w))
+                        await run(w)
         elif t is None or s.ts <= t:
-            await cql.run_async(text(s))
+            await run(s)
 
 
 def _plain(value):
@@ -598,19 +450,23 @@ async def read_exact(cql, ks, table) -> list[str]:
 
 
 async def expected_at(cql, ks, statements, t, table_options='') -> list[str]:
-    """Builds a reference table now, after the restore it's compared with, so it can't be in the history
-    that restore read."""
+    """Builds a reference table now, after the replay it's compared with, so it can't be in the history
+    that replay read."""
     ref = unique_name('ref_')
     await cql.run_async(f'CREATE TABLE {ks}.{ref} {TABLE_SCHEMA} {table_options}')
     await apply(cql, ks, ref, statements, t)
     return await read_exact(cql, ks, ref)
 
 
+def _short(rows) -> list[str]:
+    return [r if len(r) <= 200 else r[:200] + f'... ({len(r)} chars)' for r in rows]
+
+
 async def assert_exact(cql, ks, restored, statements, t) -> list[str]:
     expected = await expected_at(cql, ks, statements, t)
     actual = await read_exact(cql, ks, restored)
-    assert actual == expected, (f'{restored} is not exact at {iso(t)}. Expected but missing: {sorted(set(expected) - set(actual))}. '
-                                f'Present but not expected: {sorted(set(actual) - set(expected))}')
+    assert actual == expected, (f'{restored} is not exact at {iso(t)}. Expected but missing: {_short(sorted(set(expected) - set(actual)))}. '
+                                f'Present but not expected: {_short(sorted(set(actual) - set(expected)))}')
     return expected
 
 
@@ -677,6 +533,25 @@ def shard_of(token: int) -> int:
     # dht/token.cc:120-122
     t = ((token + 2**63) << IGNORE_MSB_BITS) & (2**64 - 1)
     return (t * SHARDS) >> 64
+
+
+def token_of(pk: int) -> int:
+    """The murmur3 token of an int partition key, as the driver computes it for routing."""
+    return Murmur3Token.hash_fn(pk.to_bytes(4, 'big', signed=True))
+
+
+def keys_on_shard(shard: int, count: int, start: int = 0) -> list[int]:
+    """The first `count` int keys from `start` that land on the shard. test_pitr_helpers.py checks this against the node."""
+    out, pk = [], start
+    while len(out) < count:
+        if shard_of(token_of(pk)) == shard:
+            out.append(pk)
+        pk += 1
+    return out
+
+
+def keys_on_every_shard(per_shard: int, start: int = 0) -> list[int]:
+    return [pk for shard in range(SHARDS) for pk in keys_on_shard(shard, per_shard, start)]
 
 
 async def assert_every_shard(cql, ks, cf, pks):
@@ -749,8 +624,8 @@ async def run_nodetool(manager, server, argv):
 
 
 async def run_status_commands(manager, server, commands):
-    """Runs the commands status gave, unchanged, with real nodetool. That's what makes them exact."""
-    assert commands, 'status must give the exact commands'
+    """Runs commands unchanged, with real nodetool. That's what makes them exact."""
+    assert commands, 'expected exact commands'
     for command in commands:
         assert '<' not in command, f'not an exact command: {command}'
         argv = shlex.split(command)
@@ -773,37 +648,6 @@ async def assert_acked_writes_present(cql, ks, table, writers, t, seeded) -> dic
     return required
 
 
-async def assert_nothing_appears(storage, allowed_prefixes=('sstables/',)):
-    """Absence has no event to poll for, so this watches the bucket for a bounded time, and fails at once if anything appears."""
-    end = time.time() + ABSENCE_WINDOW_SECONDS
-    while True:
-        keys = await objects_of(storage, '')
-        unexpected = [k for k in keys if not k.startswith(tuple(allowed_prefixes))]
-        assert not unexpected, f'nothing else may be in the store: {unexpected}'
-        if time.time() >= end:
-            return
-        await asyncio.sleep(0.2)
-
-
-async def assert_status_stays(manager, server, ks, cf, holds, expected: str) -> TableStatus:
-    """As above, for status: what must not change has to stay that way for the whole window. Fails at once if it doesn't."""
-    end = time.time() + ABSENCE_WINDOW_SECONDS
-    while True:
-        entry = await table_status(manager, server, ks, cf)
-        assert holds(entry), f'expected {expected}, saw: {entry}'
-        if time.time() >= end:
-            return entry
-        await asyncio.sleep(0.2)
-
-
-async def assert_stays_unprotected(manager, server, ks, cf) -> TableStatus:
-    return await assert_status_stays(manager, server, ks, cf, lambda e: e.state == NOT_PROTECTED and not e.backups, 'not protected, with no usable backup')
-
-
-def is_immutable(key: str) -> bool:
-    return key.rsplit('/', 1)[-1] not in MUTABLE_OBJECTS
-
-
 # The bucket, seen from outside. These are blocking calls, so they leave the event loop to a store gate.
 
 def _objects(storage, prefix):
@@ -812,10 +656,6 @@ def _objects(storage, prefix):
 
 async def objects_of(storage, prefix) -> dict:
     return await asyncio.to_thread(_objects, storage, prefix)
-
-
-async def shipped_bytes(storage) -> int:
-    return sum(o.size for o in (await objects_of(storage, SHIPPING_PREFIX)).values())
 
 
 async def get_object(storage, key) -> bytes:
@@ -832,10 +672,51 @@ async def delete_object(storage, key):
     await asyncio.to_thread(lambda: storage.get_resource().Object(storage.bucket_name, key).delete())
 
 
+REQUEST_LINE_RE = re.compile(rb'([A-Z]+) (\S+) HTTP/1\.[01]\r\n')
+
+
+class RequestStarts:
+    """Finds the HTTP/1.1 requests in the bytes going towards the store, so that a hold rule can pick one. It skips a body by
+    its Content-Length, so that bytes in a body never look like a request. A chunked body has no length up front: inside one,
+    only a read that starts with a request line counts, which holds because the client waits for a response before it sends
+    its next request on a connection."""
+    def __init__(self):
+        self._head = None
+        self._body_left = 0
+        self._chunked = False
+
+    def feed(self, data: bytes) -> list[tuple[str, str]]:
+        """The (method, path) of each request whose head ends in these bytes."""
+        found = []
+        while data:
+            if self._body_left:
+                n = min(self._body_left, len(data))
+                self._body_left -= n
+                data = data[n:]
+                continue
+            if self._head is None:
+                if self._chunked and not REQUEST_LINE_RE.match(data):
+                    return found
+                self._chunked = False
+                self._head = b''
+            self._head += data
+            end = self._head.find(b'\r\n\r\n')
+            if end < 0:
+                return found
+            head, data = self._head[:end + 2], self._head[end + 4:]
+            self._head = None
+            if m := REQUEST_LINE_RE.match(head):
+                found.append((m[1].decode(), m[2].decode()))
+            length = re.search(rb'(?im)^content-length:\s*(\d+)\r$', head)
+            self._chunked = re.search(rb'(?im)^transfer-encoding:\s*chunked\r$', head) is not None
+            self._body_left = int(length[1]) if length and not self._chunked else 0
+        return found
+
+
 class GatedStore:
     """The store behind a TCP pass-through which the test can cut or slow, for store failures from outside. Nothing in
     test/pylib can make a store fail on demand: s3_proxy.py only injects random retryable errors for a whole run. It
-    carries bytes unchanged, so it knows nothing about the protocol.
+    carries bytes unchanged. Only the hold rule looks at them, to find where each request starts.
 
     It has a thread and an event loop of its own. It has to outlive the test's event loop, because the node keeps using
     the store until the cluster is torn down, and a blocking call in a test mustn't stall the store."""
@@ -848,6 +729,9 @@ class GatedStore:
         self._conns = set()
         self._budget = None
         self._held = False
+        self._rule = None
+        self.holding = threading.Event()
+        self.requests: list[tuple[str, str]] = []
         self._loop = None
         self._thread = None
 
@@ -876,7 +760,8 @@ class GatedStore:
             pending = asyncio.all_tasks(self._loop)
             for task in pending:
                 task.cancel()
-            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            if pending:
+                self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
             self._loop.close()
         self._thread = threading.Thread(target=run, daemon=True, name='GatedStore')
         self._thread.start()
@@ -908,10 +793,21 @@ class GatedStore:
         """Stops carrying bytes, without cutting anything. Whatever needs the store waits. No moment to hit."""
         self._held = True
 
+    def hold_when(self, rule: Callable[[str, str], bool]):
+        """Holds each connection on which a request matches rule(method, path), from that request until release(), and
+        carries every other connection as before. The rule sees every request in order, on the gate's thread, so it may
+        keep state, such as "the first read of the history after the backup's Data.db"."""
+        self.holding.clear()
+        self._rule = rule
+
+    def release(self):
+        self._rule = None
+
     def recover(self):
         self.down = False
         self._budget = None
         self._held = False
+        self._rule = None
 
     async def _serve(self, reader, writer):
         if self.down:
@@ -926,12 +822,22 @@ class GatedStore:
             up_writer.transport.abort()
             return
         self._conns.add(up_writer)
+        starts = RequestStarts()
 
         async def pump(src, dst, towards_store):
+            held_here = False
             try:
                 while data := await src.read(65536):
-                    while self._held and not self.down:
+                    if towards_store:
+                        for method, path in starts.feed(data):
+                            self.requests.append((method, path))
+                            rule = self._rule
+                            if not held_here and rule is not None and rule(method, path):
+                                held_here = True
+                                self.holding.set()
+                    while (self._held or (held_here and self._rule is not None)) and not self.down:
                         await asyncio.sleep(0.01)
+                    held_here = False
                     if towards_store and self._budget is not None:
                         self._budget -= len(data)
                         if self._budget <= 0:
@@ -956,6 +862,28 @@ def gated_store(s3_storage, scylla_cluster_teardowns) -> GatedStore:
     return gate
 
 
+def is_history_read(method, path) -> bool:
+    return method in ('GET', 'HEAD') and f'/{SHIPPING_PREFIX}/' in path
+
+
+def is_shipping_upload(method, path) -> bool:
+    return method in ('PUT', 'POST') and f'/{SHIPPING_PREFIX}/' in path
+
+
+def first_history_read_after_load():
+    """A hold rule: the first read under the shipping prefix after the backup's Data.db was read. That is, the backup is
+    loaded and the history isn't read yet. A shipping upload is never held, so shipping goes on."""
+    loaded = False
+
+    def rule(method, path):
+        nonlocal loaded
+        if method == 'GET' and f'/{BACKUP_PREFIX}/' in path and path.endswith('Data.db'):
+            loaded = True
+            return False
+        return loaded and is_history_read(method, path)
+    return rule
+
+
 OLD_TS_US = 3600_000_000    # how far back seed data is written, so that it's always older than the backup
 
 
@@ -964,50 +892,154 @@ def old_ts() -> int:
 
 
 @dataclass
-class ProtectedTable:
-    """A node, and table t in a vnode keyspace, seeded and protected by one backup. Nothing else."""
+class Pitr:
+    """A node with shipping on, and table t in a vnode keyspace, with what a test does to it. `storage` is the endpoint
+    backups and replays name."""
     manager: Any
     server: Any
     cql: Any
     storage: Any
     ks: str
-    backup: Backup
-    seed: list
     cf: str = 't'
+    snap: str | None = None
+    prefix: str | None = None
+    backup_keys: set = field(default_factory=set)
+    _probe: str | None = None
+    _pulse_pks: list = field(default_factory=list)
+    _pulse_checked: bool = False
 
-    async def covered(self, us=None) -> int:
-        return await wait_covered(self.manager, self.server, self.ks, self.cf, us)
+    async def write(self, statements, table=None):
+        await apply(self.cql, self.ks, table or self.cf, statements)
 
-    async def write(self, statements):
-        await apply(self.cql, self.ks, self.cf, statements)
+    async def backup(self, storage=None) -> str:
+        """Snapshot and backup of t. Records what was under the shipping prefix when it finished."""
+        storage = storage or self.storage
+        self.snap, _ = await take_snapshot_on_one_server(self.ks, self.server, self.manager, logger)
+        self.prefix = backup_prefix(self.ks, self.cf, self.snap)
+        await do_backup(self.server, self.snap, self.prefix, self.ks, self.cf, storage, self.manager, logger)
+        self.backup_keys = set(await objects_of(self.storage, SHIPPING_PREFIX))
+        self._probe = None
+        return self.snap
 
-    async def status(self) -> TableStatus:
-        return await table_status(self.manager, self.server, self.ks, self.cf)
+    async def new_target(self) -> str:
+        target = unique_name('target_')
+        await create_target(self.cql, self.storage, self.ks, target, self.prefix)
+        return target
 
-    async def restore(self, t, new_table=None, backup=None) -> tuple[Result, str]:
-        """A restore that has to succeed. Returns its result and the new table's name."""
-        new_table = new_table or unique_name('restored_')
-        result = await restore_ok(self.manager, self.server, self.ks, self.cf, backup or self.backup.name, t, new_table)
-        return result, new_table
+    async def replay(self, t, target=None, storage=None) -> tuple[Outcome, str]:
+        storage = storage or self.storage
+        target = target or await self.new_target()
+        tid = await start_replay(self.manager, self.server, endpoint=storage.address, bucket=storage.bucket_name, prefix=self.prefix,
+                                 ks=self.ks, target=target, snapshot=self.snap, t=t)
+        outcome = await wait_replay(self.manager, self.server, tid)
+        logger.info(f'Replay of {self.snap} into {target} to {iso(t) if isinstance(t, int) else t}: {outcome}')
+        return outcome, target
 
-    async def refused(self, t, reason, backup=None, **kwargs) -> Result:
-        return await assert_refused(self.manager, self.server, self.cql, self.ks, self.cf, backup or self.backup.name, t, reason, **kwargs)
+    async def replay_done(self, t, target=None) -> tuple[Outcome, str]:
+        outcome, target = await self.replay(t, target)
+        assert outcome.state == DONE, f'replay to {iso(t)} must be done, got {outcome}'
+        return outcome, target
 
-    async def assert_restored_exact(self, history, t) -> list[str]:
-        _, new = await self.restore(t)
-        return await assert_exact(self.cql, self.ks, new, history, t)
+    async def status(self) -> Status | None:
+        return await get_status(self.manager, self.server)
 
-    async def restart(self, kill=False):
-        self.cql = await restart(self.manager, self.server, kill)
+    async def incomplete(self) -> list[tuple[str, str]] | None:
+        """The `incomplete` tables, or None while status hasn't landed: a check of it is then left out, and logged."""
+        status = await self.status()
+        if status is None:
+            logger.warning('status has not landed: the `incomplete` check is left out')
+            return None
+        return status.incomplete
+
+    async def assert_nothing_loaded(self, target):
+        """P52: replay loads the backup itself, so a refusal after the load leaves rows. Nothing loaded means the target
+        reads empty, and status doesn't list it `incomplete`."""
+        assert await read_all(self.cql, self.ks, target) == [], f'a refusal must leave {target} empty'
+        incomplete = await self.incomplete()
+        assert incomplete is None or (self.ks, target) not in incomplete, f'a refusal before load must not list {target} incomplete'
+
+    async def assert_incomplete(self, target, required=False):
+        incomplete = await self.incomplete()
+        assert incomplete is not None or not required, 'status must exist to show `incomplete`'
+        assert incomplete is None or (self.ks, target) in incomplete, f'{target} must be listed incomplete: {incomplete}'
+
+    async def refused(self, t, reasons, watched=(), target=None, loaded_ok=False) -> tuple[Outcome, str]:
+        """Checks the refusal rules: failed, with one of the reasons and a message, the source and `watched` unchanged, and
+        nothing loaded unless the refusal may come after the load (`loaded_ok`), in which case the target is `incomplete`."""
+        reasons = {reasons} if isinstance(reasons, str) else set(reasons)
+        tables = [self.cf, *watched]
+        before = {w: await read_all(self.cql, self.ks, w) for w in tables}
+        outcome, target = await self.replay(t, target)
+        assert outcome.state == FAILED, f'replay to {iso(t)} must be refused: {outcome}'
+        assert outcome.reason in reasons, f'expected a reason in {reasons}: {outcome}'
+        assert outcome.message.strip() not in ('', outcome.reason), f'a refusal states the reason and next action: {outcome}'
+        for w, rows in before.items():
+            assert await read_all(self.cql, self.ks, w) == rows, f'{w} changed in a refusal'
+        if loaded_ok and await read_all(self.cql, self.ks, target):
+            await self.assert_incomplete(target)
+        else:
+            await self.assert_nothing_loaded(target)
+        return outcome, target
+
+    async def pulse(self):
+        """One write on every shard, to a table of its own, so that every shard's coverage moves. P62: an idle shard stops it."""
+        if not self._pulse_pks:
+            await self.cql.run_async(f'CREATE TABLE IF NOT EXISTS {self.ks}.pulse (pk int PRIMARY KEY, v bigint)')
+            self._pulse_pks = keys_on_every_shard(1, 10_000)
+        for pk in self._pulse_pks:
+            await self.cql.run_async(f'INSERT INTO {self.ks}.pulse (pk, v) VALUES ({pk}, {now_us()})')
+        if not self._pulse_checked:
+            # Ask the node where the keys went: an idle shard holds coverage at 0, and the test would only time out.
+            rows = await self.cql.run_async(f'SELECT pk, token(pk) FROM {self.ks}.pulse')
+            reached = {shard_of(r[1]) for r in rows if r[0] in self._pulse_pks}
+            assert reached == set(range(SHARDS)), f'the pulse must reach every shard, it reaches {sorted(reached)}'
+            self._pulse_checked = True
+
+    async def covered_through(self) -> int | None:
+        """The node's covered-through time, from status. Until status lands, from the probe: a replay to a far-future T on one
+        throwaway target, whose refusal states the latest restorable time and leaves the target empty to be used again."""
+        status = await self.status()
+        if status is not None:
+            return status.covered_through_us
+        if self._probe is None:
+            self._probe = await self.new_target()
+        t = now_us() + FAR_FUTURE_US
+        outcome, _ = await self.replay(t, self._probe)
+        assert outcome.reason != Reason.TARGET_ALREADY_REPLAYED, f'a refusal before load must leave the probe usable: {outcome}'
+        if outcome.state != FAILED or outcome.reason != Reason.T_PAST_COVERAGE:
+            logger.info(f'The coverage probe got {outcome}')
+            return None
+        return latest_restorable(outcome, t)
+
+    async def covered(self, us=None, pulse=True) -> int:
+        """Waits until the covered-through time reaches a time, by default a little after now, so that every write acknowledged
+        before this call is covered. With pulse, it writes on every shard while it waits. Returns the covered-through time."""
+        target = us if us is not None else now_us() + CLOCK_MARGIN_US
+
+        async def reached():
+            if pulse:
+                await self.pulse()
+            latest = await self.covered_through()
+            return latest if latest is not None and latest >= target else None
+        return await wait_for(reached, deadline(), label=f'covered-through {iso(target)}')
+
+    async def snapshot_time(self) -> int:
+        """The backup's snapshot time, from the usable backups in status."""
+        status = await self.status()
+        assert status is not None, 'the snapshot time is read from status'
+        found = [ts for name, ts in status.backups if name == self.snap]
+        assert len(found) == 1, f'status must list backup {self.snap} once: {status}'
+        return found[0]
+
+    async def restart(self, kill=False, while_down=None):
+        self.cql = await restart(self.manager, self.server, kill, while_down)
+        self._probe = None
 
 
 @asynccontextmanager
-async def protected_table(manager, storage, seed=None, schema=TABLE_SCHEMA, **config):
-    server = await manager.server_add(config=node_config(storage, **config))
+async def pitr_node(manager, storage, schema=TABLE_SCHEMA, ship_to=None, also=(), **config):
+    server = await manager.server_add(config=node_config(storage, ship_to=ship_to, also=also, **config))
     cql = manager.get_cql()
     async with new_test_keyspace(manager, VNODES_KS) as ks:
         await cql.run_async(f'CREATE TABLE {ks}.t {schema}')
-        seed = simple_rows(range(4), old_ts()) if seed is None else seed
-        await apply(cql, ks, 't', seed)
-        backup = await protect_table(manager, server, storage, ks, 't')
-        yield ProtectedTable(manager, server, cql, storage, ks, backup, seed)
+        yield Pitr(manager, server, cql, storage, ks)
