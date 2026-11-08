@@ -306,6 +306,12 @@ def now_us() -> int:
     return time.time_ns() // 1000
 
 
+def later_than(previous_us: int) -> int:
+    """A timestamp after previous_us even if the clock was stepped back since it was taken: the host's time sync does that by
+    about 150 ms, which put a later now_us() before an earlier one."""
+    return max(now_us(), previous_us + 1)
+
+
 def deadline() -> float:
     return time.time() + DEADLINE_SECONDS
 
@@ -719,20 +725,24 @@ async def get_object(storage, key) -> bytes:
     return await asyncio.to_thread(get)
 
 
-RETRIES = 3     # how many times a tamper call is repeated after the connection was dropped under it
+RETRY_DELAYS = (0.2, 0.5, 1, 2)     # seconds between attempts after the connection was dropped under a tamper call; the last repeats
 
 
 def _retrying(storage, what: str, call):
     """Runs call(resource) with a fresh resource each time, again if the mock store dropped the connection under it
-    (#111: a keep-alive connection the mock has closed). Only a closed or reset connection is retried, up to RETRIES times,
-    and each retry is logged: any other error, and a failure that persists, reaches the test as it is."""
-    for attempt in range(RETRIES + 1):
+    (#111: a keep-alive connection the mock has closed). Only a closed or reset connection is retried, with a growing pause,
+    until the test's deadline, and each retry is logged: any other error, and a failure that outlasts the deadline, reaches the
+    test as it is."""
+    end = deadline()
+    for attempt in range(1 << 30):
         try:
             return call(storage.get_resource())
         except (botocore.exceptions.ConnectionClosedError, ConnectionResetError) as e:
-            if attempt == RETRIES:
+            delay = RETRY_DELAYS[min(attempt, len(RETRY_DELAYS) - 1)]
+            if time.time() + delay > end:
                 raise
-            logger.warning(f'{what}: connection dropped ({type(e).__name__}), retry {attempt + 1} of {RETRIES}')
+            logger.warning(f'{what}: connection dropped ({type(e).__name__}), retry {attempt + 1} after {delay} s')
+            time.sleep(delay)
 
 
 async def put_object(storage, key, data: bytes):
@@ -893,6 +903,7 @@ class GatedStore:
     def release(self):
         self._rule = None
         self._after = None
+        self.holding.clear()
 
     def recover(self):
         self.down = False
@@ -900,6 +911,7 @@ class GatedStore:
         self._held = False
         self._rule = None
         self._after = None
+        self.holding.clear()
 
     async def _serve(self, reader, writer):
         if self.down:

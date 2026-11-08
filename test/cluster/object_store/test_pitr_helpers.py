@@ -783,6 +783,7 @@ async def test_gate_holds_a_response_part_way_and_only_for_the_request_its_rule_
             await asyncio.wait_for(reader.readexactly(1), 0.5)
         assert gate.holding.is_set(), 'the gate must say it is holding'
         gate.release()
+        assert not gate.holding.is_set(), 'release() must clear holding'
         assert len(await asyncio.wait_for(reader.readexactly(600), 10)) == 600, 'release() must let the rest of the response through'
 
         # A response shorter than count is never held, and holding stays cleared for the next use of the gate.
@@ -799,15 +800,23 @@ async def test_gate_holds_a_response_and_recover_frees_it():
     async with BigResponseServer(1000) as store:
         gate = GatedStore(SimpleNamespace(ip='127.0.0.1', port=store.port, region='us-east-1'))
         gate.start()
-        gate.hold_after_response_bytes(lambda method, path: True, 1000)
+        gate.hold_after_response_bytes(lambda method, path: True, 400)
         reader, writer = await asyncio.open_connection('127.0.0.1', gate.port)
+        writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
+        assert len(await asyncio.wait_for(reader.readexactly(400), 10)) == 400
+        assert gate.holding.is_set()
+        gate.recover()
+        assert not gate.holding.is_set(), 'recover() must clear holding'
+        assert len(await asyncio.wait_for(reader.readexactly(600), 10)) == 600, 'recover() must free the held response'
+
+        gate.hold_after_response_bytes(lambda method, path: True, 1000)
         writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
         assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'a response of exactly count bytes is carried whole'
         assert not gate.holding.is_set(), 'a response of exactly count bytes is not held'
         gate.recover()
         writer.write(b'GET /b/k HTTP/1.1\r\n\r\n')
         assert len(await asyncio.wait_for(reader.readexactly(1000), 10)) == 1000, 'recover() must clear the hold'
-        assert store.requests == 2
+        assert store.requests == 3
         writer.close()
         gate.stop()
 
@@ -922,6 +931,13 @@ async def test_log_wait_finds_a_line_from_a_mark_and_fails_at_the_deadline(tmp_p
         assert (await pitr.wait_log(log, r'other(\n)?', from_mark=mark)).group(0).startswith('other')
 
 
+def test_later_than_is_after_its_argument_when_the_clock_stepped_back(monkeypatch):
+    monkeypatch.setattr(pitr, 'now_us', lambda: 1000)
+    assert pitr.later_than(500) == 1000
+    assert pitr.later_than(1000) == 1001
+    assert pitr.later_than(1150) == 1151, 'a clock 150 us behind must not give an earlier timestamp'
+
+
 def test_count_files_counts_every_file_whatever_its_size(tmp_path):
     assert pitr.count_files(str(tmp_path / 'absent')) == 0
     assert pitr.count_files(str(tmp_path)) == 0
@@ -957,25 +973,43 @@ def closed():
     return botocore.exceptions.ConnectionClosedError(endpoint_url='http://x')
 
 
-async def test_tamper_calls_retry_a_dropped_connection_with_a_fresh_resource_and_nothing_else(caplog):
+class FakeClock:
+    """Stands in for the time module in pitr_util: sleeping advances the clock and is recorded, so that nothing waits."""
+    def __init__(self):
+        self.now = 1000.0
+        self.slept = []
+
+    def time(self):
+        return self.now
+
+    def sleep(self, seconds):
+        self.slept.append(seconds)
+        self.now += seconds
+
+
+async def test_tamper_calls_retry_a_dropped_connection_with_backoff_and_a_fresh_resource(caplog, monkeypatch):
+    clock = FakeClock()
+    monkeypatch.setattr(pitr, 'time', clock)
+    monkeypatch.setattr(pitr, 'deadline', lambda: clock.now + 60)
     store = FlakyStore([closed(), ConnectionResetError()])
     with caplog.at_level(logging.WARNING):
         await pitr.put_object(store, 'k', b'v')
     assert store.calls == ['put'] * 3 and store.resources == 3, 'each attempt must use a fresh resource'
     assert sum('retry' in r.getMessage() for r in caplog.records) == 2, 'each retry must be logged'
+    assert clock.slept == [0.2, 0.5], 'the pause must grow'
 
-    store = FlakyStore([closed()])
+    clock.slept.clear()
+    store = FlakyStore([closed()] * 6)
     await pitr.delete_object(store, 'k')
-    assert store.calls == ['delete'] * 2
+    assert len(store.calls) == 7, 'more than three drops must still be retried'
+    assert clock.slept == [0.2, 0.5, 1, 2, 2, 2], 'the pause must grow to 2 s and stay there'
 
-    store = FlakyStore([closed()] * 3)
-    await pitr.put_object(store, 'k', b'v')
-    assert len(store.calls) == 4, 'at most 3 retries'
-
-    store = FlakyStore([closed()] * 4)
+    clock.slept.clear()
+    start = clock.now
+    store = FlakyStore([closed()] * 1000)
     with pytest.raises(botocore.exceptions.ConnectionClosedError):
         await pitr.delete_object(store, 'k')
-    assert len(store.calls) == 4, 'a persistent drop must fail after 3 retries, not go on'
+    assert 58 <= sum(clock.slept) <= 60 and clock.now - start == pytest.approx(sum(clock.slept)), 'a persistent drop must be retried up to the deadline and then fail'
 
     denied = botocore.exceptions.ClientError({'Error': {'Code': 'AccessDenied', 'Message': 'no'}}, 'PutObject')
     store = FlakyStore([denied])

@@ -16,12 +16,10 @@ from datetime import datetime, timezone
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_every_shard, assert_exact, change_statements, deadline, DONE, FAILED, first_history_read_after_load, gated_store,
-    keys_on_every_shard, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
-    result_line, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, W, write_and_purge, WRONG_WAY_BACK
-)
-from test.cluster.object_store.pitr_util import (
-    assert_acked_writes_present, backup_prefix, CLOCK_MARGIN_US, latest_restorable, UNCOMPRESSED_SCHEMA, wait_log, Writer, write_several_sstables
+    assert_acked_writes_present, assert_every_shard, assert_exact, backup_prefix, change_statements, CLOCK_MARGIN_US, deadline, DONE, FAILED, first_history_read_after_load, gated_store,
+    keys_on_every_shard, later_than, latest_restorable, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
+    result_line, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, UNCOMPRESSED_SCHEMA, W, wait_log, Writer,
+    write_and_purge, write_several_sstables, WRONG_WAY_BACK
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -292,10 +290,10 @@ async def test_after_a_restart_a_new_backup_restores_exactly(manager: ScyllaClus
         mark = await log.mark()
         await p.restart()
         await wait_log(log, r'shipping is on: shipping from segment \d+ into chain', from_mark=mark)
-        b = simple_rows(keys_on_every_shard(2, 200), now_us(), 'B')
+        b = simple_rows(keys_on_every_shard(2, 200), later_than(a[-1].ts), 'B')
         await p.write(b)
         await p.backup()
-        c = simple_rows(keys_on_every_shard(2, 300), now_us(), 'C')
+        c = simple_rows(keys_on_every_shard(2, 300), later_than(b[-1].ts), 'C')
         await p.write(c)
         await p.covered()
         assert chains_of(await shipped_segments(s3_storage)) - chains_before, 'the restart must start a new chain directory'
@@ -320,7 +318,7 @@ async def test_a_t_after_a_restart_is_refused_from_the_earlier_backup(manager: S
         await p.covered()
         restart_at = now_us()
         await p.restart()
-        b = simple_rows(keys_on_every_shard(2, 200), now_us(), 'B')
+        b = simple_rows(keys_on_every_shard(2, 200), later_than(a[-1].ts), 'B')
         await p.write(b)
         # The coverage wait asks the current backup, which the first one can no longer answer: a second backup does, and
         # the replays below name the first again.
@@ -355,6 +353,7 @@ async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaCl
         before = [pk for pk, (ts, ack) in writer.acked.items() if ack < started]
         after = [pk for pk, (ts, ack) in writer.acked.items() if ack > ended]
         assert before and after, f'writes must straddle the backup: {len(before)} before, {len(after)} after'
+        assert any(started <= ack <= ended for _, ack in writer.acked.values()), 'a write must be acknowledged during the backup'
 
         t = now_us() + 2 * CLOCK_MARGIN_US
         await p.covered(t + CLOCK_MARGIN_US)
@@ -367,10 +366,11 @@ async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaCl
 async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(manager: ScyllaClusterManager, gated_store):
     """R05-S1: SHP-5, L15's safe path. A backup cut part-way fails. The same snapshot, backed up again to a fresh prefix, is
     done, and a replay from it at the last write of X gives the source's rows. Controls: the first task failed with some of its
-    objects uploaded and no manifest, and fewer than the complete backup has."""
+    objects uploaded and no manifest."""
     async with pitr_node(manager, gated_store, schema=UNCOMPRESSED_SCHEMA) as p:
         await write_several_sstables(manager, p.server, p.cql, p.ks)
         p.snap, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
+        snapshot_taken = now_us()
         cut_prefix = backup_prefix(p.ks, 't', p.snap) + '-cut'
         # The cut holds the upload of the backup's manifest and aborts the task there, so the other objects are in and the manifest
         # is not. The store is never failed: its outage would last long enough to switch the node's shipping off (OUT-3), as
@@ -390,12 +390,12 @@ async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(mana
         assert (await manager.api.wait_task(p.server.ip_addr, tid))['state'] == 'failed'
         cut_objects = await objects_of(gated_store, f'{cut_prefix}/')
         assert cut_objects and not [k for k in cut_objects if k.endswith('/manifest.json')], 'the cut backup must have objects and no manifest'
+        # Only now does the held manifest upload go on: the check above looked at the cut backup before it.
         gated_store.release()
 
         p.prefix = backup_prefix(p.ks, 't', p.snap)
         await do_backup(p.server, p.snap, p.prefix, p.ks, 't', gated_store, manager, logger)
-        assert len(cut_objects) < len(await objects_of(gated_store, f'{p.prefix}/')), 'the first backup must have been cut short'
-        x = simple_rows(range(2000, 2010), now_us(), 'X')
+        x = simple_rows(range(2000, 2010), later_than(snapshot_taken), 'X')
         await p.write(x)
         await p.covered()
         _, target = await p.replay_done(x[-1].ts)

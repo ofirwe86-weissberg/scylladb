@@ -15,7 +15,7 @@ import time
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    keys_on_every_shard, needs_phase, now_us, objects_of, pitr_node, report_stalls, segment_keys, SEGMENT_KEY_RE, SHARDS, SHIPPING_PREFIX, W,
+    keys_on_every_shard, needs_phase, now_us, objects_of, pitr_node, report_stalls, segment_keys, SHARDS, SHIPPING_PREFIX, W,
     wait_log
 )
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -59,30 +59,34 @@ async def wait_shipped_on_every_shard(manager, p, seconds=SHIP_WINDOW_SECONDS, p
     await wait_for(shipped, time.time() + seconds, label=f'a segment shipped by each shard within {seconds} s')
 
 
-async def stays_unshipped(manager, p, seconds=SHIP_WINDOW_SECONDS, pulse=False):
-    """Nothing is shipped during a fixed window. The product's seal and upload cadence is the only clock there is for an absence,
-    so this is the one place a test waits out a window; it fails the moment anything appears."""
+async def anything_in_bucket(p):
+    """Every object in the bucket, whatever its key, except the folder placeholders the mock store lists."""
+    return {k for k in await objects_of(p.storage, '') if not k.endswith('/')}
+
+
+async def stays_unshipped(manager, p, seconds=SHIP_WINDOW_SECONDS, pulse=False, whole_bucket=False):
+    """Nothing is shipped during a fixed window, by the node's directory or with whole_bucket anywhere in the bucket. The product's
+    seal and upload cadence is the only clock there is for an absence, so this is the one place a test waits out a window; it fails
+    the moment anything appears. With pulse, every shard is written to at each poll."""
     end = time.time() + seconds
     while time.time() < end:
         if pulse:
             await p.pulse()
-        assert not await objects_shipped_by(manager, p), 'the node shipped something'
+        found = await anything_in_bucket(p) if whole_bucket else await objects_shipped_by(manager, p)
+        assert not found, f'the node shipped something: {sorted(found)[:3]}'
         await asyncio.sleep(0.5)
 
 
 @needs_phase('ep.3')
 async def test_nothing_is_shipped_when_off(manager: ScyllaClusterManager, s3_storage):
-    """R01-P2: SHP-1. A node with no shipping endpoint logs that shipping is off and, whatever it writes, ships nothing.
-    Control: a node with shipping on, given the same writes, ships a segment from each shard within 10 s."""
-    async with pitr_node(manager, s3_storage, **SMALL_SEGMENTS) as on:
-        await fill_segments(manager, on)
-        await wait_shipped_on_every_shard(manager, on)
-
+    """R01-P2: SHP-1. A node with no shipping endpoint logs that shipping is off and, whatever it writes and however long it waits,
+    puts nothing in the bucket. The node is alone in its cluster: a second node would switch shipping off by itself. The control
+    is R28-P1, where the same writes with shipping on reach the bucket from each shard."""
     async with pitr_node(manager, s3_storage, shipping=False, **SMALL_SEGMENTS) as off:
         log = await manager.server_open_log(server_id=off.server.server_id)
         await wait_log(log, OFF_LINE + 'pitr_endpoint and pitr_bucket are unset')
         await fill_segments(manager, off)
-        assert not await objects_shipped_by(manager, off), 'a node with shipping off shipped'
+        await stays_unshipped(manager, off, pulse=True, whole_bucket=True)
 
 
 @needs_phase('ep.3')
@@ -109,6 +113,7 @@ async def test_a_seal_interval_outside_the_range_keeps_shipping_off(manager: Scy
 
 @needs_phase('ep.3')
 async def test_seal_interval_defaults_to_60(manager: ScyllaClusterManager, s3_storage):
+    """R28-P3: LVL-1. A node that doesn't set the seal interval reports 60 in system.config."""
     async with pitr_node(manager, s3_storage, shipping=False) as p:
         rows = await p.cql.run_async("SELECT value FROM system.config WHERE name = 'pitr_seal_interval_in_seconds'")
         assert [r.value for r in rows] == ['60']
@@ -135,5 +140,7 @@ async def test_a_long_seal_interval_does_not_seal_a_partly_filled_segment(manage
     """Control for R28-P4: with a 3600 s interval, the same writes and pulses ship nothing over 10 s. It is a test of its own
     because a second node in the cluster would switch shipping off (single node only)."""
     async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=3600) as p:
+        log = await manager.server_open_log(server_id=p.server.server_id)
+        await wait_log(log, r'pitr - Point-in-time recovery shipping is on: ')
         await p.write(one_kib_per_shard())
         await stays_unshipped(manager, p, pulse=True)
