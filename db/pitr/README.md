@@ -14,8 +14,9 @@ keyspaces. It does not protect against node or disk loss.
 
 **Status: experimental, not for production.** A restore of one table to T
 runs end to end, but some refusals this README lists aren't built, so some
-restores report `done` on wrong data (limits 1, 11, 16, 17 and 19). A full
-re-review of the restore path is open (#92). See
+restores report `done` on wrong data (limits 1, 16, 17 and 19). A restore
+from encrypted segments hasn't been tested (limit 11). A full re-review of
+the restore path is open (#92). See
 [Implementation status](#implementation-status-2026-11-08).
 
 ## How it works
@@ -185,7 +186,8 @@ aws s3 cp s3://my-pitr-bucket/backups/ks/t/snap1/schema.cql .
 #    compaction = {..., 'enabled': 'false'}. Then:
 cqlsh -f schema.cql
 
-# 4. Replay to T.
+# 4. Replay to T. Wait until shipping has reached T first: about
+#    pitr_seal_interval_in_seconds plus a few seconds after T (see below).
 curl -X POST "http://localhost:10000/storage_service/pitr/replay_to\
 ?endpoint=https://s3.us-east-1.amazonaws.com:443&bucket=my-pitr-bucket\
 &prefix=backups/ks/t/snap1&keyspace=ks&table=t_restored&snapshot=snap1\
@@ -193,6 +195,8 @@ curl -X POST "http://localhost:10000/storage_service/pitr/replay_to\
 # -> "<task id>"
 
 # 5. Wait for the task. On success, keep the result line from the node log.
+#    A refusal fails the task with the reason as its error text. On
+#    t_past_coverage, T isn't restorable yet (see below).
 nodetool tasks wait <task id>
 
 # 6. Check ks.t_restored, then turn compaction on for it: restate the
@@ -204,6 +208,26 @@ If you disabled compaction with `nodetool disableautocompaction ks t_restored`
 instead, turn it back on with `nodetool enableautocompaction ks t_restored`.
 That flag is runtime state and a node restart clears it. Replay accepts
 either form.
+
+**When T is restorable.** A write can be restored once its segment is
+sealed and shipped, about S + U + 1 s after it (see [RPO](#rpo)). With the
+default S of 60 s, wait about a minute and a few seconds past T before
+step 4. There is no status report to ask yet (#14). Before then the replay
+is refused, and the task's error reads:
+
+```
+Point-in-time replay of ks.t_restored refused: t_past_coverage: T is
+2026-11-04T14:05:00.000000Z, and shipping from this node has only reached
+<covered-through>, a lag of <lag>. Retry with a T at or below that time.
+(shard <n>)
+```
+
+The covered-through time is that of the shard that lags most. This check
+runs before the mark, so the target stays empty and can be reused: wait and
+call the replay again with the same T, or call it now with a T at or below
+the time the refusal names. If covered-through doesn't move between
+retries, a shard gets no writes or shipping has stopped (limits 10, 21 and
+22): check the node log.
 
 T is UTC in ISO-8601, ending in an upper-case `Z`, with at most six fractional digits:
 `YYYY-MM-DDThh:mm:ss[.ffffff]Z`. Missing digits below the second count as zero.
@@ -350,10 +374,13 @@ more.
 14. The status report will show no limits, and no per-table protection. A
     `TRUNCATE` or schema change since a listed backup isn't shown either.
     After a restart, its covered-through time is the new chain's.
-15. A table created as a target but never replayed into is empty, and status
-    doesn't list it. Status lists a target `incomplete` from the moment
-    replay passes its checks until `done`. In CQL an unfinished target looks
-    like any table.
+15. A table created as a target but never replayed into is empty, and
+    nothing records it as a target. Once replay passes its checks it writes
+    a `started` mark, and the target is `incomplete` until the mark says
+    `done`. In CQL an unfinished target looks like any table. Today only the
+    task's status, the node log (each mark it writes) and a second replay
+    into it, refused as `target_already_replayed` with the mark's phase,
+    show it. The status report will list it once it is built (#14).
 16. There is no `TRUNCATE` refusal yet. A restore to a T after a
     `TRUNCATE` of the source reports `done` with the truncated rows back.
     Don't restore to such a T. Use the normal backup restore to get the
@@ -395,10 +422,13 @@ more.
     mixed into the result. Don't write to the target before `done`.
 27. The backup's `manifest.json` is read whole into memory on shard 0, up
     to 32 MiB. A backup with very many sstables needs that much free memory.
-28. No automatic cleanup after a failed replay. The target stays, listed
-    `incomplete`. Drop it and restore under a new name.
-29. One restore at a time. No dry run, and no alerting: ask the status
-    report.
+28. No automatic cleanup after a failed replay. The target stays, with its
+    `started` mark: the task's error text says why the run failed, and a
+    second replay into it is refused as `target_already_replayed`. Drop it
+    and restore under a new name.
+29. One restore at a time. No dry run, and no alerting: the task's status
+    and the node log are the only signals until the status report is built
+    (#14).
 30. A large write can be stored across more than one segment. If it is
     incomplete in the history, it isn't applied, and the result gives an
     upper bound on how many there were. Any acknowledged one is still in
