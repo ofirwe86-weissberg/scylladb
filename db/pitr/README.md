@@ -222,8 +222,9 @@ RPO ≤ S + U + 1 s
   flushes on sooner, even at low load.
 - **U** is the time from a seal until the segment and its ledger entry are in
   the store. While uploads keep up, it is about the segment's used bytes
-  divided by the shard's upload rate, plus store latency. Measured: under
-  about 1.4 s against a local store (see below).
+  divided by the shard's upload rate, plus store latency. Against a local
+  store it was at most about 1.4 s (see below); the shipper doesn't log the
+  seal, so this is derived, not measured directly (#116).
 - **1 s** is the coverage margin subtracted from every capture.
 
 The seal syncs the segment, so the periodic commitlog sync doesn't add to the
@@ -248,14 +249,16 @@ describe surviving node loss, which this feature does not cover.
 
 The copy-ready time runs from the replay call to `done`. It is made of:
 1. loading the backup's sstables from the store;
-2. fetching the shipped segments, of every table on the node, for the whole
-   chain: from the chain's start, the node's last boot. The backup's bound is
-   applied to each entry after the fetch (#117);
+2. fetching the shipped segments, of every table on the node, of the whole
+   chain the backup names: from where shipping started at the node start the
+   backup was taken in, to the chain's last entry, past T if the chain goes
+   on past it. The backup's bound and T are applied to each entry after the
+   fetch (#117);
 3. replaying them into the target, and the final flush.
 
-Step 2 depends on how much the whole node wrote since its last restart, not
-on the table's size or the backup's age, so a small table on a busy node pays
-for all of the node's writes. Taking backups more often doesn't shorten it
+Step 2 depends on how much the whole node wrote in the backup's chain, before
+and after T, not on the table's size or the backup's age, so a small table on
+a busy node pays for all of the node's writes. Taking backups more often doesn't shorten it
 today; #117 would make it.
 
 ### Measured run
@@ -271,12 +274,12 @@ more.
 | Hardware | aarch64 VM, 8 vCPU, 15.6 GB; one node, `--smp 2`, `--memory 2G` |
 | Store | local mock S3, no network latency or bandwidth limit |
 | Data size | 200 MB backup, then 300 s of writes (78k rows of 1 KB) |
-| Write rate | 264 KB/s, on every shard |
+| Write rate | 264 KB/s in total, spread over both shards |
 | Seal interval | 60 s, and 10 s for the lag |
-| Upload, seal to ledger entry (U) | under about 1.4 s |
-| Lag, now minus covered-through | S = 10 s: median 6.6 s, max 8.3 s. S = 60 s: median 31 s, max 56.8 s |
-| RPO after `kill -9` at a random point, S = 60 s | 15.7 s, 28.7 s and 60.1 s: the kill's point in the seal cycle plus 1.2 to 2.4 s. No acknowledged write older than L was missing |
-| RTO, release build | 7.6 to 7.8 s: checks 0.2 s, loading the backup 0.5 s, fetching and replaying 360 MB in 18 segments 6.9 to 7.1 s, flush 0.1 s |
+| Upload, seal to ledger entry (U) | at most about 1.4 s in 6 kills, derived as RPO − kill phase − 1 s (#116) |
+| Lag, now minus covered-through (release) | S = 10 s: median 6.6 s, highest sample 8.3 s. S = 60 s: median 31 s, highest sample 56.8 s. Sampled every 5 s, so the peak, about S + U + 1 s, falls between samples |
+| RPO after `kill -9` at a random point, S = 60 s (release) | 15.7 s, 28.7 s and 60.1 s: the kill's point in the seal cycle plus 1.7 to 2.4 s. No acknowledged write older than L was missing |
+| RTO, release build | 7.6 to 7.8 s: checks 0.2 s, loading the backup 0.5 s, fetching and replaying 360 MB in 18 segments 6.8 to 7.1 s, flush 0.1 s |
 | RTO, dev build | 12.0 to 12.5 s |
 
 ## Limits
