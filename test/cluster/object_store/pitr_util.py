@@ -1080,14 +1080,14 @@ class Pitr:
         assert incomplete is not None or not required, 'status must exist to show `incomplete`'
         assert incomplete is None or (self.ks, target) in incomplete, f'{target} must be listed incomplete: {incomplete}'
 
-    async def refused(self, t, reasons, watched=(), target=None, loaded_ok=False) -> tuple[Outcome, str]:
+    async def refused(self, t, reasons, watched=(), target=None, loaded_ok=False, storage=None) -> tuple[Outcome, str]:
         """Checks the refusal rules: failed, with one of the reasons and a message, the source and `watched` unchanged, and
         nothing loaded unless the refusal may come after the load (`loaded_ok`), in which case the target is `incomplete`."""
         reasons = {reasons} if isinstance(reasons, str) else set(reasons)
         tables = [self.cf, *watched]
         before = {w: await read_all(self.cql, self.ks, w) for w in tables}
-        outcome, target = await self.replay(t, target)
-        assert outcome.state == FAILED, f'replay to {iso(t)} must be refused: {outcome}'
+        outcome, target = await self.replay(t, target, storage)
+        assert outcome.state == FAILED, f'replay to {t if isinstance(t, str) else iso(t)} must be refused: {outcome}'
         assert outcome.reason in reasons, f'expected a reason in {reasons}: {outcome}'
         assert outcome.message.strip() not in ('', outcome.reason), f'a refusal states the reason and next action: {outcome}'
         for w, rows in before.items():
