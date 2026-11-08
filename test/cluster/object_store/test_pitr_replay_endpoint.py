@@ -31,16 +31,21 @@ logger = logging.getLogger(__name__)
 RF_1 = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': false}"
 TABLETS_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': true}"
 T = '2026-11-04T14:05:00.000000Z'
+LOG_LEVELS = 'pitr_replay_to=debug:sstables_loader=info:api=info:compaction_manager=debug'
 
 
-async def one_server(manager, object_storage, shipping=False):
+async def one_server(manager, object_storage, shipping=False, seal_seconds=1, loggers=LOG_LEVELS, cmdline_extra=()):
     """One node, with the object store configured. With shipping on, a backup it takes carries the
-    point-in-time bound a replay needs; with it off, the backup has none."""
+    point-in-time bound a replay needs; with it off, the backup has none.
+
+    The seal interval, the log levels and extra command-line options are arguments because the
+    measured run (#21) needs the product's own seal interval and the shipper's debug lines, while
+    every test here wants a seal every second and nothing else."""
     cfg = {'object_storage_endpoints': object_storage.create_endpoint_conf(), 'task_ttl_in_seconds': 300}
     if shipping:
         cfg |= {'pitr_endpoint': object_storage.address, 'pitr_bucket': object_storage.bucket_name,
-                'pitr_prefix': 'pitr-log', 'pitr_seal_interval_in_seconds': 1}
-    cmd = ['--logger-log-level', 'pitr_replay_to=debug:sstables_loader=info:api=info:compaction_manager=debug']
+                'pitr_prefix': 'pitr-log', 'pitr_seal_interval_in_seconds': seal_seconds}
+    cmd = ['--logger-log-level', loggers, *cmdline_extra]
     return await manager.server_add(config=cfg, cmdline=cmd)
 
 
@@ -56,16 +61,20 @@ async def replay(manager, server, object_storage, ks, table, snapshot, prefix, t
     return status
 
 
-async def backup_with_a_pitr_bound(manager, server, object_storage, ks, rows, schema_flag_only=False):
+async def backup_with_a_pitr_bound(manager, server, object_storage, ks, rows, schema_flag_only=False, seed=None):
     """A backup of ks.source taken with shipping on, so that it carries a pitr bound, and the
     target created from it: what every replay that gets past the checks needs.
 
     With schema_flag_only, the target turns compaction off the way the README tells a user to,
-    through its own schema, and nodetool is not called at all."""
+    through its own schema, and nodetool is not called at all. `seed` fills the source instead of
+    `rows`, for a backup too large to insert in one gather (#21)."""
     cql = manager.get_cql()
     await cql.run_async(f"CREATE TABLE {ks}.source (pk text primary key, value text);")
-    await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.source (pk, value) VALUES ('{k}', '{v}');")
-                           for k, v in rows.items()))
+    if seed is not None:
+        await seed()
+    else:
+        await asyncio.gather(*(cql.run_async(f"INSERT INTO {ks}.source (pk, value) VALUES ('{k}', '{v}');")
+                               for k, v in rows.items()))
     snap_name, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
     prefix = f'source/{snap_name}'
     await do_backup(server, snap_name, prefix, ks, 'source', object_storage, manager, logger)
