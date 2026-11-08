@@ -147,6 +147,8 @@ RESULT_MARK = 'is done: restored from backup'
 PAST_COVERAGE_WORDS = ['lag']
 # P68 (PM-67): the refusal on a done table says where the result was written.
 RESULT_LOGGED_WORDS = ['log']
+# A shipped segment's object key is <prefix>/<host id>/<shard>/<chain>/segments/<file name>.
+SEGMENT_KEY_RE = re.compile(r'/(\d+)/([^/]+)/segments/(\S+)$')
 
 
 @dataclass

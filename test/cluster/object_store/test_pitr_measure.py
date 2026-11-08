@@ -28,7 +28,7 @@ from pathlib import Path
 
 import pytest
 
-from test.cluster.object_store.pitr_util import CLOCK_MARGIN_US, SHARDS, assert_every_shard, iso, now_us, objects_of, restart, shipped_bytes
+from test.cluster.object_store.pitr_util import CLOCK_MARGIN_US, SHARDS, assert_every_shard, iso, now_us, objects_of, restart, SEGMENT_KEY_RE, shipped_bytes
 from test.cluster.object_store.test_pitr_replay_endpoint import (LOG_LEVELS, RF_1, backup_with_a_pitr_bound, coverage_reached, make_pulse,
                                                                  one_key_per_shard, one_server, start_replay, succeeded, wait_for_coverage)
 from test.cluster.util import new_test_keyspace
@@ -525,7 +525,6 @@ async def test_measure_rto(manager: ScyllaClusterManager, s3_storage, tmp_path):
 # (ledger_entry.cc, segment_key() over chain_key_prefix()), so the fetch lines say which shard's
 # history the bytes came from without the product having to log it.
 FETCHED_RE = re.compile(r'fetched (\S+) to \S+, (\d+) bytes')
-SEGMENT_KEY_RE = re.compile(r'/(\d+)/([^/]+)/segments/(\S+)$')
 
 
 async def _phases(log, mark, ks, target, total) -> dict:

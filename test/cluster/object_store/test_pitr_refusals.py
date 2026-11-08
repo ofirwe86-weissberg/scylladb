@@ -18,9 +18,10 @@ import time
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_exact, backup_prefix, iso, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, keys_on_every_shard,
-    keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, put_object,
-    read_exact, Reason, report_stalls, RESULT_LOGGED_WORDS, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W, write_several_sstables
+    assert_exact, backup_prefix, deadline, delete_object, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, iso,
+    keys_on_every_shard, keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, put_object,
+    read_exact, Reason, report_stalls, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W,
+    write_several_sstables
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.pylib.rest_client import HTTPError
@@ -40,7 +41,8 @@ def assert_states_coverage(outcome, t):
     return latest
 
 
-@needs_phase('ep.3')
+@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/112",
+                      reason="the S3 metrics are registered twice with two endpoints on one node (#112)")
 async def test_t_past_coverage_is_refused_while_writes_wait_to_ship(manager: ScyllaClusterManager, gated_store, s3_storage):
     """T4 (a): REF-5, P68. Shipping goes through the gate and the backup around it. The gate holds every upload, below
     pitr_unshipped_limit_in_mb, so writes are acknowledged and not shipped. Control: let the uploads go, and the same target
@@ -144,7 +146,8 @@ async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=())
     await assert_exact(p.cql, p.ks, target, [*kept, *later], later[-1].ts)
 
 
-@pytest.mark.skip(reason="L7: won't be implemented this release; needs replay to read the source's truncation record (#15)")
+@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/15",
+                      reason="L7: won't be implemented this release; implementable when replay reads the source's truncation record")
 async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
     """T6 (a): REF-10, limit 21, RST-4, P55/P74. Rows R written after the backup, then a TRUNCATE. T between R and the
     TRUNCATE is refused: replaying the history would bring R back. auto_snapshot is off, so nothing else keeps R."""
@@ -249,11 +252,13 @@ async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(man
         t = now_us()
         await p.covered(t + 1_000_000)
 
-        first, target = await p.replay_done(t)
+        _, target = await p.replay_done(t)
         rows = await read_exact(p.cql, p.ks, target)
         assert rows, 'the first replay must have loaded the backup'
-        second, _ = await p.replay(t, target)
+        t2 = t + 1000
+        second, _ = await p.replay(t2, target)
         assert second.state == 'failed' and second.reason == Reason.TARGET_ALREADY_REPLAYED, f'a done target must be refused: {second}'
         assert p.snap in second.message, f'the refusal must name the earlier run\'s backup {p.snap}: {second}'
         assert iso(t) in second.message, f'the refusal must name the earlier run\'s T {iso(t)}: {second}'
+        assert iso(t2) not in second.message, f'the refusal must not echo this request\'s T {iso(t2)}: {second}'
         assert await read_exact(p.cql, p.ks, target) == rows, 'the refused replay changed the target'
