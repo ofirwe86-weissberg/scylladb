@@ -19,6 +19,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import subprocess
@@ -28,8 +29,8 @@ from pathlib import Path
 import pytest
 
 from test.cluster.object_store.pitr_util import CLOCK_MARGIN_US, SHARDS, assert_every_shard, iso, now_us, objects_of, restart, shipped_bytes
-from test.cluster.object_store.test_pitr_replay_endpoint import (LOG_LEVELS, RF_1, backup_with_a_pitr_bound, coverage_reached, make_pulse, one_server,
-                                                                 start_replay, succeeded, wait_for_coverage)
+from test.cluster.object_store.test_pitr_replay_endpoint import (LOG_LEVELS, RF_1, backup_with_a_pitr_bound, coverage_reached, make_pulse,
+                                                                 one_key_per_shard, one_server, start_replay, succeeded, wait_for_coverage)
 from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 
@@ -54,6 +55,8 @@ RATE_KBPS = env_int('PITR_MEASURE_RATE_KBPS', 256)     # the write load, in KB/s
 REPS = env_int('PITR_MEASURE_REPS', 1)                 # restores timed per RTO run; stage 1 uses 3
 MEMORY = os.environ.get('PITR_MEASURE_MEMORY', '2G')   # per node; see node_memory() on why
 LAG_SLACK_S = env_int('PITR_MEASURE_LAG_SLACK_S', 60)  # how far above the seal interval a lag may go before the run is called broken
+KILLS = env_int('PITR_MEASURE_KILLS', 1)               # kills, restarts and restores the loss run takes in a row
+SEED = env_int('PITR_MEASURE_SEED', 20261108)          # the delay before each kill is drawn from this, so a number can be reproduced
 
 ROW_BYTES = 1024                 # one row of payload, the size the plan measures at
 TICK_SECONDS = 0.1               # the load's pacing tick
@@ -120,7 +123,7 @@ async def measure_server(manager, object_storage, seal_s):
     """The node every run measures: shipping on, the seal interval under test, the shipper at debug
     so the upload of each segment can be timed, and the memory node_memory() explains."""
     return await one_server(manager, object_storage, shipping=True, seal_seconds=seal_s,
-                            loggers=f'{LOG_LEVELS}:pitr=debug', cmdline_extra=['-m', node_memory()])
+                            loggers=f'{LOG_LEVELS}:pitr=debug:pitr_chain_check=debug', cmdline_extra=['-m', node_memory()])
 
 
 def build_mode(exe: str) -> str:
@@ -217,7 +220,14 @@ class steady_load:
         try:
             await asyncio.wait_for(asyncio.shield(self._task), timeout)
         except asyncio.TimeoutError:
-            logger.warning('the load did not stop within %ss, its last writes are left pending', timeout)
+            # A write left pending on a dead connection would otherwise outlive the test and write
+            # into a keyspace the next run has dropped.
+            logger.warning('the load did not stop within %ss, cancelling its last writes', timeout)
+            self._task.cancel()
+            try:
+                await self._task
+            except (asyncio.CancelledError, Exception) as e:
+                logger.info('the cancelled load ended with %r', e)
         self.stopped_us = now_us()
         if not expect_failure:
             assert self.failure is None, f'the load failed: {self.failure}'
@@ -249,6 +259,27 @@ async def fresh_target(cql, ks, name):
     await cql.run_async(f"CREATE TABLE {ks}.{name} (pk text primary key, value text) "
                         "WITH compaction = {'class': 'SizeTieredCompactionStrategy', 'enabled': 'false'};")
     return name
+
+
+class pulser:
+    """A write on every shard, through whichever connection is current.
+
+    make_pulse() holds the connection it was made with, and the loss run kills the node and
+    reconnects, so its pulse has to be re-bound after every restart. Coverage is the lowest of the
+    shards', so one idle shard would hold the whole node at 1970 (P62)."""
+
+    def __init__(self, cql, ks, keys):
+        self.cql, self._ks, self._keys = cql, ks, keys
+
+    async def __call__(self):
+        await asyncio.gather(*(self.cql.run_async(f'INSERT INTO {self._ks}.pulse (pk) VALUES ({pk});') for pk in self._keys))
+
+
+async def make_pulser(cql, ks) -> pulser:
+    await cql.run_async(f'CREATE TABLE {ks}.pulse (pk int primary key);')
+    keys = sorted(await one_key_per_shard(cql, f'{ks}.pulse', [str(pk) for pk in range(32)]))
+    logger.info('the pulse writes %s, one key per shard', keys)
+    return pulser(cql, ks, keys)
 
 
 async def shipping_timeline(log, from_mark) -> dict:
@@ -313,58 +344,127 @@ async def test_measure_lag(manager: ScyllaClusterManager, s3_storage, tmp_path, 
         f"the lag at seal={seal_s}s reached {result['lag_seconds']['max']}s, above the seal interval plus {LAG_SLACK_S}s: {result}"
 
 
-async def test_measure_loss(manager: ScyllaClusterManager, s3_storage, tmp_path):
-    """What a kill -9 costs: the writes acknowledged after the latest restorable point L, and the
-    promise that every write acknowledged below L comes back. Effective RPO = kill time - L."""
-    seal_s = SEAL_S[0]
-    server = await measure_server(manager, s3_storage, seal_s)
-    cql = manager.get_cql()
+async def measure_one_kill(manager, server, s3_storage, seal_s, index, rng, cql):
+    """One kill -9 and the restore after it: the load runs, the history catches up with part of it,
+    the kill lands at a random point of the seal cycle, and what the restore gives back is counted.
+    Returns what was measured and the connection the restart left.
+
+    Each kill takes a backup of its own, in a keyspace of its own: a restart starts a new chain,
+    and coverage for a backup taken before the restart stops at the chain that was live then, so a
+    second kill measured against the first kill's backup would wait for a coverage advance that
+    never comes (seen at KILLS=3; see the report on #21).
+
+    The delay before the kill is what makes the figure an RPO rather than its minimum. The seal
+    timer is periodic (pitr_shipper.cc, arm_periodic), and the load starts right after a coverage
+    advance, so a kill taken without a delay always lands just after an entry and reports about the
+    upload time alone; the real range is up to one seal interval above that. The delay is drawn
+    from the seed the run records, so a surprising number can be reproduced."""
     async with new_test_keyspace(manager, RF_1) as ks:
-        # The target turns compaction off through its own schema: the node is killed in the middle
-        # of this run, and the API's disable_autocompaction does not survive a restart, so a target
-        # set up that way would be refused after the kill.
-        snap, prefix = await backup_with_a_pitr_bound(manager, server, s3_storage, ks, {'0': 'zero'}, schema_flag_only=True)
-        pulse = await make_pulse(cql, ks)
-        await wait_for_coverage(manager, server, s3_storage, ks, 'target', snap, prefix, pulse, now_us())
-        load = steady_load(cql, ks, 'source').start()
-        end = time.monotonic() + LOAD_S
-        while time.monotonic() < end:
-            await asyncio.sleep(LAG_SAMPLE_SECONDS)
-            await pulse()
-        # The kill has to come after the history has covered part of the load, or every
-        # acknowledged write would sit above L and the run would measure nothing: at S=60 the
-        # first entry covering the load's writes lands a seal interval after they were made. The
-        # load keeps running while this waits, so the kill is still mid-load.
-        first_ack = min(ts for ts, _ in load.acked.values())
-        await wait_for_coverage(manager, server, s3_storage, ks, 'target', snap, prefix, pulse, first_ack + CLOCK_MARGIN_US)
-        kill_us = now_us()
-        cql = await restart(manager, server, kill=True)
-        # The load dies with the node, which is the event being measured: its failure is expected.
-        await load.stop(expect_failure=True)
+        return await _one_kill_in(manager, server, s3_storage, ks, seal_s, index, rng, cql)
 
+
+async def _one_kill_in(manager, server, s3_storage, ks, seal_s, index, rng, cql):
+    """The body of one kill, inside the keyspace it measures in. ks.target is only ever the probe
+    the coverage reading is refused on, and the restore goes into a table of its own; both turn
+    compaction off through their schema, because the API's disable_autocompaction does not survive
+    the restart."""
+    snap, prefix = await backup_with_a_pitr_bound(manager, server, s3_storage, ks, {'0': 'zero'}, schema_flag_only=True)
+    pulse = await make_pulser(cql, ks)
+    await wait_for_coverage(manager, server, s3_storage, ks, 'target', snap, prefix, pulse, now_us())
+    load = steady_load(cql, ks, 'source').start()
+    end = time.monotonic() + LOAD_S
+    while time.monotonic() < end:
+        await asyncio.sleep(LAG_SAMPLE_SECONDS)
+        await pulse()
+    # The history has to cover part of the load, or every acknowledged write would sit above L and
+    # the restore would be measured against nothing.
+    first_ack = min(ts for ts, _ in load.acked.values())
+    last_covered = await wait_for_coverage(manager, server, s3_storage, ks, 'target', snap, prefix, pulse, first_ack + CLOCK_MARGIN_US)
+    advanced_at = now_us()
+
+    delay = rng.uniform(0, seal_s)
+    logger.info('kill %s waits %.1fs into the seal cycle before the kill', index, delay)
+    deadline = time.monotonic() + delay
+    while True:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            break
+        await asyncio.sleep(min(1.0, left))
+        await pulse()
         covered = await coverage_reached(manager, server, s3_storage, ks, 'target', snap, prefix)
-        assert covered <= kill_us, f'the history covers {iso(covered)}, past the kill at {iso(kill_us)}'
-        tid = await start_replay(manager, server, s3_storage, ks, 'target', snap, prefix, iso(covered))
-        succeeded(await manager.api.wait_task(server.ip_addr, tid))
+        if covered > last_covered:
+            last_covered, advanced_at = covered, now_us()
+    kill_us = now_us()
+    cql = await restart(manager, server, kill=True)
+    pulse.cql = cql
+    # The load dies with the node, which is the event being measured: its failure is expected.
+    await load.stop(expect_failure=True)
 
-        rows = await cql.run_async(f'SELECT pk, WRITETIME(value) AS wt FROM {ks}.target')
-        present = {r.pk: r.wt for r in rows}
-        # Mirrors assert_acked_writes_present(): a write acknowledged within the clock margin of L
-        # may be either present or absent, so only the ones clearly below L are required.
-        required = {pk: ts for pk, (ts, ack) in load.acked.items() if ts <= covered and ack + CLOCK_MARGIN_US < covered}
-        missing = sorted(pk for pk, ts in required.items() if present.get(pk) != ts)
-        lost = sorted(pk for pk, (ts, _) in load.acked.items() if ts > covered and pk not in present)
-        result = report('loss', tmp_path, {
-            'seal_s': seal_s, 'scylla_exe': await manager.server_get_exe(server.server_id),
+    covered = await coverage_reached(manager, server, s3_storage, ks, 'target', snap, prefix)
+    assert covered <= kill_us, f'the history covers {iso(covered)}, past the kill at {iso(kill_us)}'
+    target = await fresh_target(cql, ks, f'loss_{index}')
+    tid = await start_replay(manager, server, s3_storage, ks, target, snap, prefix, iso(covered))
+    succeeded(await manager.api.wait_task(server.ip_addr, tid))
+
+    rows = await cql.run_async(f'SELECT pk, WRITETIME(value) AS wt FROM {ks}.{target}')
+    present = {r.pk: r.wt for r in rows}
+    # Mirrors assert_acked_writes_present(): a write acknowledged within the clock margin of L may
+    # be either present or absent, so only the ones clearly below L are required.
+    required = {pk: ts for pk, (ts, ack) in load.acked.items() if ts <= covered and ack + CLOCK_MARGIN_US < covered}
+    missing = sorted(pk for pk, ts in required.items() if present.get(pk) != ts)
+    # What the user loses: acknowledged before the kill, written above L, so the T filter leaves it
+    # out of every restore. Bounded by the kill, so a write the driver got through afterwards is
+    # not counted as lost.
+    after_l = sorted(pk for pk, (ts, ack) in load.acked.items() if ts > covered and ack <= kill_us)
+    above_l = sorted(pk for pk, wt in present.items() if wt > covered)
+    return {'kill': index, 'delay_before_kill_seconds': round(delay, 3),
+            'kill_phase_seconds': round((kill_us - advanced_at) / 1e6, 3),
             'kill_at': iso(kill_us), 'restorable_at': iso(covered),
             'effective_rpo_seconds': round((kill_us - covered) / 1e6, 3),
-            'acked_rows': len(load.acked), 'required_below_l': len(required),
-            'missing_below_l': len(missing), 'lost_above_l': len(lost),
-            'load': load.stats()})
-        assert required, f'no acknowledged write fell below L, so the run measured nothing: {result}'
-        # The one real assert of this file: a restore that lost a write it had acknowledged below L
-        # is wrong data, not a slow number.
-        assert not missing, f"{len(missing)} acknowledged writes below L are missing: {missing[:10]} ({result['restorable_at']})"
+            'acked_rows': len(load.acked), 'restored_rows': len(present),
+            'required_more_than_margin_below_l': len(required),
+            'missing_more_than_margin_below_l': len(missing), 'missing_sample': missing[:10],
+            'acked_after_l': len(after_l), 'rows_above_l_in_the_restore': len(above_l),
+            'above_l_sample': above_l[:10], 'load': load.stats()}, cql
+
+
+async def test_measure_loss(manager: ScyllaClusterManager, s3_storage, tmp_path):
+    """What a kill -9 costs: the writes acknowledged before the kill but above the latest
+    restorable point L, and the promise that every write acknowledged more than the clock margin
+    below L comes back. Effective RPO = kill time - L.
+
+    PITR_MEASURE_KILLS kills in a row, each with its own delay into the seal cycle, its own backup
+    and its own restore target, because one draw from a cycle says little about the range."""
+    seal_s = SEAL_S[0]
+    rng = random.Random(SEED)
+    server = await measure_server(manager, s3_storage, seal_s)
+    cql = manager.get_cql()
+    kills = []
+    for index in range(KILLS):
+        one, cql = await measure_one_kill(manager, server, s3_storage, seal_s, index, rng, cql)
+        kills.append(one)
+        logger.info('kill %s measured %s', index, one)
+    rpos = [k['effective_rpo_seconds'] for k in kills]
+    result = report('loss', tmp_path, {
+        'seal_s': seal_s, 'scylla_exe': await manager.server_get_exe(server.server_id), 'seed': SEED,
+        'effective_rpo_seconds': {'min': min(rpos), 'p50': percentile(rpos, 0.5), 'max': max(rpos), 'count': len(rpos)},
+        'kills': kills,
+        'note': 'one node, killed and restarted once per kill, with a backup of its own per kill. The delay before '
+                'each kill is uniform over [0, S) from the recorded seed, so the RPO samples the seal cycle instead '
+                'of its minimum; the kill phase is the time since the last coverage advance a probe saw, polled about '
+                'once a second, so it is accurate to about that'})
+
+    for k in result['kills']:
+        assert k['required_more_than_margin_below_l'], \
+            f'no write was acknowledged more than the clock margin before L, so kill {k["kill"]} measured nothing: {k}'
+        # The one real assert of this file: a restore that lost a write it had acknowledged well
+        # below L is wrong data, not a slow number.
+        assert not k['missing_more_than_margin_below_l'], \
+            f'{k["missing_more_than_margin_below_l"]} writes acknowledged more than the clock margin before L are missing: ' \
+            f'{k["missing_sample"]} (L={k["restorable_at"]})'
+        # Free, and the other half of the promise: T filters out everything above L.
+        assert not k['rows_above_l_in_the_restore'], \
+            f'{k["rows_above_l_in_the_restore"]} restored rows were written above L: {k["above_l_sample"]} (L={k["restorable_at"]})'
 
 
 async def test_measure_rto(manager: ScyllaClusterManager, s3_storage, tmp_path):
@@ -415,8 +515,17 @@ async def test_measure_rto(manager: ScyllaClusterManager, s3_storage, tmp_path):
                                           'shipping': await shipping_timeline(log, shipping_mark),
                                           'shipped_bytes_total': await shipped_bytes(s3_storage)})
         assert all(r['total_seconds'] > 0 for r in result['reps']), result
-        # A restore of nothing would give a fine RTO and mean nothing.
-        assert restored >= len(load.acked), f'the restore holds {restored} rows, fewer than the {len(load.acked)} the load acknowledged'
+        # A restore of nothing would give a fine RTO and mean nothing. The seed keys and the load's
+        # keys are disjoint and nothing is deleted, so the count is exact rather than a lower bound.
+        assert restored == backup_rows + len(load.acked), \
+            f'the restore holds {restored} rows, not the {backup_rows} of the backup plus the {len(load.acked)} the load acknowledged'
+
+
+# A shipped segment's object key is <prefix>/<host id>/<shard>/<chain>/segments/<file name>
+# (ledger_entry.cc, segment_key() over chain_key_prefix()), so the fetch lines say which shard's
+# history the bytes came from without the product having to log it.
+FETCHED_RE = re.compile(r'fetched (\S+) to \S+, (\d+) bytes')
+SEGMENT_KEY_RE = re.compile(r'/(\d+)/([^/]+)/segments/(\S+)$')
 
 
 async def _phases(log, mark, ks, target, total) -> dict:
@@ -424,9 +533,10 @@ async def _phases(log, mark, ks, target, total) -> dict:
 
     The phases the log actually marks are: the checks (the call until the run reports it started),
     the load of the backup's sstables, and the replay of the history. The fetch of each segment is
-    interleaved with the replay of the one before it, so it is reported as a count and a byte
+    interleaved with the replay of the one before it, so it is reported per segment and as a byte
     total, not as a phase of its own; the flush and the durable mark sit between the last segment
-    and the result line."""
+    and the result line. The chain lines and the result line are copied in as they are: they are
+    what says how much of the fetched history predates the backup's bound."""
     async def at(expr, last=False):
         hits = await log.grep(expr, from_mark=mark)
         if not hits:
@@ -437,17 +547,33 @@ async def _phases(log, mark, ks, target, total) -> dict:
     loaded = await at(r"backup '.*' loaded")
     replayed = await at(r'replayed \d+ segment\(s\) of shard', last=True)
     done = await at(rf'Point-in-time replay of {ks}\.{target} to t=.* is done:')
-    fetches = [(int(m.group(1))) for _, m in await log.grep(r'fetched .* (\d+) bytes', from_mark=mark)]
+
+    fetched = []
+    for line, _ in await log.grep(r'fetched \S+ to \S+, \d+ bytes', from_mark=mark):
+        hit = FETCHED_RE.search(line)
+        key = SEGMENT_KEY_RE.search(hit.group(1))
+        fetched.append({'shard': int(key.group(1)) if key else None,
+                        'chain': key.group(2) if key else None,
+                        'segment': key.group(3) if key else hit.group(1),
+                        'bytes': int(hit.group(2))})
+    chains = [line[line.index('chain '):].strip() for line, _ in await log.grep(r'chain .* holds \d+ entries and \d+ segments', from_mark=mark)]
+    result_lines = [line[line.index('Point-in-time replay'):].strip()
+                    for line, _ in await log.grep(rf'Point-in-time replay of {ks}\.{target} to t=.* is done:', from_mark=mark)]
+    below_bound = re.search(r'(\d+) entry/entries below the backup\'s bound', result_lines[0]) if result_lines else None
 
     def gap(a, b):
         return round(b - a, 3) if a is not None and b is not None else None
 
     start_to_done = gap(started, done)
-    return {'phase_seconds': {# The checks run before the log's first mark, so what they cost is the
-                              # rest of the client-side total.
-                              'checks': None if start_to_done is None else round(total - start_to_done, 3),
+    return {'phase_seconds': {# The REST call, the checks and the task-manager wait all sit outside
+                              # the node's own start-to-done, so what is left of the client total
+                              # is the three together.
+                              'checks_and_rest_roundtrip': None if start_to_done is None else round(total - start_to_done, 3),
                               'load': gap(started, loaded), 'replay_with_fetch': gap(loaded, replayed),
                               'flush_and_mark': gap(replayed, done), 'start_to_done': start_to_done},
-            'segments_fetched': len(fetches), 'fetched_bytes': sum(fetches),
+            'segments_fetched': len(fetched), 'fetched_bytes': sum(f['bytes'] for f in fetched),
+            'fetched_segments': fetched, 'chains': chains,
+            'entries_below_the_backup_bound': int(below_bound.group(1)) if below_bound else None,
+            'result_line': result_lines[0] if result_lines else None,
             'missing_marks': [name for name, value in (('started', started), ('loaded', loaded),
                                                        ('replayed', replayed), ('done', done)) if value is None]}
