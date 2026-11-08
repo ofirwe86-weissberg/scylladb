@@ -13,7 +13,8 @@
 // The store is a fake object_storage_client holding the entry objects a
 // shipper would have written. It serves a download of an object it holds, says
 // an object it does not hold is absent, and can fail the read of an object it
-// does hold, which is how a store error is told from the end of a chain.
+// does hold, which is how a store error is told from the end of a chain. A
+// miss is reported as S3 or GCS report it, or as an error that does not say.
 
 // Defines the test entry point; must come before anything that pulls in
 // seastar's own testing main.
@@ -47,7 +48,9 @@
 #include "sstables/object_storage_client.hh"
 #include "test/lib/tmpdir.hh"
 #include "utils/crc.hh"
+#include "utils/exceptions.hh"
 #include "utils/memory_data_sink.hh"
+#include "utils/s3/aws_error.hh"
 #include "utils/upload_progress.hh"
 
 using namespace db::pitr;
@@ -99,24 +102,88 @@ public:
     }
 };
 
+// How a read of an object the store holds fails. The S3 and GCS kinds are
+// errors of the same types a miss is reported with, but not a miss.
+enum class read_failure {
+    unclassified,
+    s3_http_not_found,
+    s3_access_denied,
+    gcs_io_error,
+};
+
 // Fails the read instead of serving it, which is what a store under an outage
 // does to an object it holds.
 class failing_source_impl final : public data_source_impl {
     std::string _name;
+    read_failure _failure;
 
 public:
-    explicit failing_source_impl(std::string name)
-        : _name(std::move(name)) {
+    failing_source_impl(std::string name, read_failure failure)
+        : _name(std::move(name))
+        , _failure(failure) {
     }
     future<temporary_buffer<char>> get() override {
+        const auto what = fmt::format("fake store: reading {} failed", _name);
+        switch (_failure) {
+        case read_failure::unclassified:
+            break;
+        case read_failure::s3_http_not_found:
+            return make_exception_future<temporary_buffer<char>>(
+                    aws::aws_exception(aws::aws_error(aws::aws_error_type::HTTP_NOT_FOUND, std::string(what), utils::http::retryable::no)));
+        case read_failure::s3_access_denied:
+            return make_exception_future<temporary_buffer<char>>(
+                    aws::aws_exception(aws::aws_error(aws::aws_error_type::ACCESS_DENIED, std::string(what), utils::http::retryable::no)));
+        case read_failure::gcs_io_error:
+            return make_exception_future<temporary_buffer<char>>(storage_io_error(EIO, what));
+        }
+        return make_exception_future<temporary_buffer<char>>(store_error(what));
+    }
+};
+
+// How the store reports the download of an object it does not hold.
+enum class miss_report {
+    // A store error that does not say why, which only the store's answer to
+    // object_exists() can tell from an outage.
+    unclassified,
+    // What S3 answers a GET of an absent key.
+    s3_no_such_key,
+    // What the GCS client turns a 404 into.
+    gcs_not_found,
+};
+
+// Fails the read the way the store reports an object it does not hold.
+class missing_source_impl final : public data_source_impl {
+    std::string _name;
+    miss_report _report;
+
+public:
+    missing_source_impl(std::string name, miss_report report)
+        : _name(std::move(name))
+        , _report(report) {
+    }
+    future<temporary_buffer<char>> get() override {
+        switch (_report) {
+        case miss_report::unclassified:
+            break;
+        case miss_report::s3_no_such_key:
+            return make_exception_future<temporary_buffer<char>>(aws::aws_exception(
+                    aws::aws_error(aws::aws_error_type::NO_SUCH_KEY, fmt::format("fake store: no key {}", _name), utils::http::retryable::no)));
+        case miss_report::gcs_not_found:
+            return make_exception_future<temporary_buffer<char>>(storage_io_error(ENOENT, fmt::format("fake store: no object {}", _name)));
+        }
         return make_exception_future<temporary_buffer<char>>(store_error(fmt::format("fake store: reading {} failed", _name)));
     }
 };
 
 struct fake_store {
     std::map<std::string, std::string> objects;
+    miss_report misses = miss_report::unclassified;
+    // Objects a shipper appends right after a read found them absent, before
+    // the reader can ask the store about them: the race of #131.
+    std::map<std::string, std::string> appended_after_miss;
     // Objects the store holds but will not serve.
     std::set<std::string> fail_reads;
+    read_failure fail_kind = read_failure::unclassified;
     // Every key a download was made for, in order.
     std::vector<std::string> reads;
     // Every key the store was asked to confirm, which is how the check tells a
@@ -151,11 +218,14 @@ public:
             _store.on_read(key);
         }
         if (_store.fail_reads.contains(key)) {
-            return data_source(std::make_unique<failing_source_impl>(std::move(key)));
+            return data_source(std::make_unique<failing_source_impl>(std::move(key), _store.fail_kind));
         }
         auto it = _store.objects.find(key);
         if (it == _store.objects.end()) {
-            return data_source(std::make_unique<failing_source_impl>(std::move(key)));
+            if (auto appended = _store.appended_after_miss.extract(key)) {
+                _store.objects.insert(std::move(appended));
+            }
+            return data_source(std::make_unique<missing_source_impl>(std::move(key), _store.misses));
         }
         return data_source(std::make_unique<string_source_impl>(it->second));
     }
@@ -704,6 +774,101 @@ SEASTAR_TEST_CASE(test_a_failing_read_is_not_the_end_of_the_chain) {
     BOOST_REQUIRE_MESSAGE(threw, "a failing read was not reported to the caller");
     // The store was asked, which is what told the error from an absent object.
     BOOST_REQUIRE(std::ranges::find(store.exists_calls, std::string(key)) != store.exists_calls.end());
+}
+
+// #131: only the store's own "absent" ends the chain without asking it again.
+// A failing read of an object it holds, reported with the same exception type
+// as a miss, is still checked with object_exists() and reaches the caller.
+template <typename Error>
+static future<> check_failing_read_is_rethrown(read_failure failure) {
+    fake_store store;
+    store.misses = miss_report::s3_no_such_key;
+    store_chain(store, 3);
+    const auto key = std::string(entry_object_key(test_chain_key(), 1));
+    store.fail_reads.insert(key);
+    store.fail_kind = failure;
+    bool threw = false;
+    try {
+        [[maybe_unused]] const auto result = co_await check(store, covered_us_of(0));
+    } catch (const Error&) {
+        threw = true;
+    }
+    BOOST_REQUIRE_MESSAGE(threw, "a failing read was not reported to the caller");
+    BOOST_REQUIRE(std::ranges::find(store.exists_calls, key) != store.exists_calls.end());
+}
+
+// A 404 that carries no NoSuchKey code is left to object_exists() on purpose.
+SEASTAR_TEST_CASE(test_an_s3_not_found_without_no_such_key_is_not_the_end_of_the_chain) {
+    return check_failing_read_is_rethrown<aws::aws_exception>(read_failure::s3_http_not_found);
+}
+
+SEASTAR_TEST_CASE(test_an_s3_access_denied_read_is_not_the_end_of_the_chain) {
+    return check_failing_read_is_rethrown<aws::aws_exception>(read_failure::s3_access_denied);
+}
+
+SEASTAR_TEST_CASE(test_a_gcs_io_error_read_is_not_the_end_of_the_chain) {
+    return check_failing_read_is_rethrown<storage_io_error>(read_failure::gcs_io_error);
+}
+
+// #131: the shipper appends the entry one past the chain's end between the
+// read that finds it absent and any question about it. A store that says the
+// key is absent has answered, so the chain ends there and is not an error.
+static future<> check_entry_appended_after_its_probe_ends_the_chain(miss_report misses) {
+    fake_store store;
+    store.misses = misses;
+    store_chain(store, 3);
+    const auto key = std::string(entry_object_key(test_chain_key(), 3));
+    const auto body = encode(make_entry(3));
+    store.appended_after_miss[key] = std::string(reinterpret_cast<const char*>(body.data()), body.size());
+    const auto result = co_await check(store, covered_us_of(2));
+    const auto& chain = accepted(result);
+    BOOST_REQUIRE_EQUAL(chain.entries_read, 3);
+    BOOST_REQUIRE_EQUAL(chain.segments.size(), 3);
+    BOOST_REQUIRE_EQUAL(chain.covered_through_us, covered_us_of(2));
+    // The race did happen: the entry is in the store now.
+    BOOST_REQUIRE(store.objects.contains(key));
+    BOOST_REQUIRE(std::ranges::find(store.exists_calls, key) == store.exists_calls.end());
+}
+
+SEASTAR_TEST_CASE(test_an_entry_appended_after_its_s3_probe_ends_the_chain) {
+    return check_entry_appended_after_its_probe_ends_the_chain(miss_report::s3_no_such_key);
+}
+
+SEASTAR_TEST_CASE(test_an_entry_appended_after_its_gcs_probe_ends_the_chain) {
+    return check_entry_appended_after_its_probe_ends_the_chain(miss_report::gcs_not_found);
+}
+
+// #131: ending the chain at the probe proves only what the entries read cover,
+// so a T the appended entry would have covered is refused, not replayed short.
+SEASTAR_TEST_CASE(test_a_t_past_an_entry_appended_after_its_probe_is_refused) {
+    fake_store store;
+    store.misses = miss_report::s3_no_such_key;
+    store_chain(store, 3);
+    const auto key = std::string(entry_object_key(test_chain_key(), 3));
+    const auto body = encode(make_entry(3));
+    store.appended_after_miss[key] = std::string(reinterpret_cast<const char*>(body.data()), body.size());
+    const auto result = co_await check(store, covered_us_of(3));
+    const auto& r = refused(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE(r.interval.has_value());
+    BOOST_REQUIRE_EQUAL(r.interval->through_us, covered_us_of(2));
+}
+
+// #131: an entry missing inside the chain, reported as an absent key, still
+// ends the chain before it, so a T that only the entries above it cover is
+// refused.
+SEASTAR_TEST_CASE(test_an_entry_missing_inside_the_chain_refuses_a_t_past_it) {
+    fake_store store;
+    store.misses = miss_report::s3_no_such_key;
+    store_entry(store, make_entry(0), 0);
+    store_entry(store, make_entry(1), 1);
+    store_entry(store, make_entry(3), 3);
+    store_entry(store, make_entry(4), 4);
+    const auto result = co_await check(store, covered_us_of(4));
+    const auto& r = refused(result, refusal_reason::t_past_coverage);
+    BOOST_REQUIRE(r.interval.has_value());
+    BOOST_REQUIRE_EQUAL(r.interval->through_us, covered_us_of(1));
+    // Nothing above the hole was read, so nothing above it is trusted.
+    BOOST_REQUIRE(std::ranges::find(store.reads, std::string(entry_object_key(test_chain_key(), 3))) == store.reads.end());
 }
 
 SEASTAR_TEST_CASE(test_a_long_chain_is_walked_and_yields) {
