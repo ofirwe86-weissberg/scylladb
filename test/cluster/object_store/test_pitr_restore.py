@@ -18,9 +18,9 @@ from datetime import datetime, timezone
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    assert_every_shard, assert_exact, change_statements, collection_edge_statements, create_target, deadline, DONE, expected_at, FAILED,
+    assert_every_shard, assert_exact, change_statements, collection_edge_statements, create_target, deadline, DEADLINE_SECONDS, DONE, expected_at, FAILED,
     first_history_read_after_load, gated_store, iso, keys_on_every_shard, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of,
-    PURGEABLE_OPTIONS, read_exact, Reason, report_stalls, result_line, run_nodetool, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX,
+    PURGEABLE_OPTIONS, read_exact, Reason, report_stalls, result_line, RESULT_MARK, run_nodetool, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX,
     simple_rows, STEP_US, TABLE_SCHEMA, W, write_and_purge, WRONG_WAY_BACK
 )
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
@@ -106,8 +106,8 @@ async def test_deleted_row_stays_deleted(manager: ScyllaClusterManager, s3_stora
 async def compaction_asked_during_replay(manager, gated_store, compaction):
     """B is in the backup, deleted after it, then written with a timestamp older than the delete, so the delete hides it. The
     replay is held after it read the backup and before it read the history, and the target is compacted or made compactable.
-    A compaction that purged the tombstone mid-run would let the older write land. Returns the outcome, the target and the
-    rows seen, and whether the compaction request itself was refused."""
+    A compaction that purged the tombstone mid-run would let the older write land. Returns `(outcome, refused)`: how the replay
+    ended, and the exception if the compaction request itself was refused, else None."""
     b = 2
     async with pitr_node(manager, gated_store, schema=PURGEABLE_SCHEMA) as p:
         await p.write(simple_rows([1, b], old_ts()))
@@ -293,8 +293,8 @@ async def shipped_segments(storage):
 
 @needs_phase('ep.3')
 async def test_writes_on_every_shard_come_back_from_the_shipped_history(manager: ScyllaClusterManager, s3_storage):
-    """R01-P1: SHP-1. 16 rows on each shard are written after the backup and reach the target only through the shipped history.
-    Control: a second target at the seed's timestamp holds the seed and none of the rows."""
+    """R01-P1: SHP-1. 8 keys on each shard are written after the backup and reach the target only through the shipped history.
+    Control: a second target one microsecond below the rows' timestamp (after the backup) holds the seed and none of the rows."""
     # Not from 100: seed_statements also writes pk + 100 for each seed key.
     pks = keys_on_every_shard(8, 1000)
     async with pitr_node(manager, s3_storage) as p:
@@ -309,8 +309,8 @@ async def test_writes_on_every_shard_come_back_from_the_shipped_history(manager:
         _, target = await p.replay_done(rows[-1].ts)
         await assert_exact(p.cql, p.ks, target, seed + rows, rows[-1].ts)
         await assert_every_shard(p.cql, p.ks, target, pks)
-        _, seed_only = await p.replay_done(seed_ts)
-        await assert_exact(p.cql, p.ks, seed_only, seed, seed_ts)
+        _, seed_only = await p.replay_done(rows[-1].ts - 1)
+        await assert_exact(p.cql, p.ks, seed_only, seed + rows, rows[-1].ts - 1)
         assert not await pks_of(p.cql, p.ks, seed_only) & set(pks), 'the control target holds rows written after the backup'
 
 
@@ -337,7 +337,9 @@ async def test_keys_owned_by_every_shard_read_back_from_the_target(manager: Scyl
 async def test_the_readme_quick_start_run_literally_gives_an_exact_copy(manager: ScyllaClusterManager, s3_storage):
     """R06-P3: RST-1, PM-82. README Quick start, step by step: nodetool snapshot and backup, a write X, the target from the
     backup's schema.cql, curl to replay_to, `nodetool tasks wait`, then compaction turned on. The README has no way to wait for
-    coverage, so the test uses the helper's probe for that step. Control: the same T through the helper gives the same rows."""
+    coverage, so the test uses the helper's probe for that step. Two steps stand in for the literal ones: `create_target` does the
+    README's edit of schema.cql in Python, and `curl` is the host's, run as a subprocess. Control: the same T through the helper
+    gives the same rows."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
         seed = seed_statements(pks, old_ts())
@@ -360,7 +362,7 @@ async def test_the_readme_quick_start_run_literally_gives_an_exact_copy(manager:
         assert curl.returncode == 0, f'curl failed: {out} {err}'
         task_id = out.decode().strip().strip('"')
         assert re.fullmatch(r'[0-9a-f-]{36}', task_id), f'replay_to must return a task id: {out}'
-        await run_nodetool(manager, p.server, ['nodetool', 'tasks', 'wait', task_id])
+        await asyncio.wait_for(run_nodetool(manager, p.server, ['nodetool', 'tasks', 'wait', task_id]), DEADLINE_SECONDS)
         task = await manager.api.get_task_status(p.server.ip_addr, task_id)
         assert task['state'] == DONE, f'the replay must end done: {task}'
 
@@ -375,13 +377,20 @@ async def test_the_readme_quick_start_run_literally_gives_an_exact_copy(manager:
 @needs_phase('ep.3')
 async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(manager: ScyllaClusterManager, s3_storage):
     """R06-S1: L14's boundary. Every kind of change is written on every shard before the backup, and they are in the shipped history
-    too, so the replay applies them a second time on top of the backup. The target must still equal the answer at T. Control: the
+    too, so the replay applies them a second time on top of the backup. Among them is a write issued after a newer one but with an
+    older timestamp, so a replay that let the last applied write win would show it. The target must equal the answer at T, and the
+    result line must count more applied cells than the post-backup writes hold, which shows the pre-backup writes were replayed
+    (if the replay stops starting from the beginning of the chain, this fails and the test needs another form). Control: the
     changes' segments are in the bucket before the backup."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
         before_writes = await shipped_segments(s3_storage)
         seed = seed_statements(pks, old_ts())
         changes, ts = change_statements(pks, now_us())
+        newer, stale = ts['last'] + STEP_US, ts['insert']
+        out_of_order = [W(newer, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 60, 'newer') USING TIMESTAMP {{ts}}") for pk in pks] + \
+                       [W(stale, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 60, 'stale') USING TIMESTAMP {{ts}}") for pk in pks]
+        changes = changes + out_of_order
         await p.write(seed + changes)
         k0 = await segments_shipped_after_the_writes(p, before_writes)
         assert k0, 'the pre-backup writes must be in the shipped history'
@@ -392,30 +401,38 @@ async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(ma
 
         _, target = await p.replay_done(z[-1].ts)
         await assert_exact(p.cql, p.ks, target, seed + changes + z, z[-1].ts)
+        assert {r.v for r in await p.cql.run_async(f'SELECT v FROM {p.ks}.{target} WHERE ck = 60 ALLOW FILTERING')} == {'newer'}
+        line = await result_for(p, target)
+        applied = count_in_result(line, 'cell(s)')
+        assert applied is not None and applied > len(z), f'the pre-backup writes must be replayed too ({len(z)} post-backup writes): {line}'
 
 
 @needs_phase('ep.3')
-@pytest.mark.parametrize('delta', [-1, 0, 1], ids=['t_minus_1', 't', 't_plus_1'])
-async def test_every_cell_kind_is_kept_at_t_and_dropped_one_microsecond_before(manager: ScyllaClusterManager, s3_storage, delta):
-    """R07-P1: RST-2. Every kind of change (regular, static, map, set, deletes of cell, row, range and partition, a TTL cell) at
-    its own timestamp. T is the timestamp of the regular-column overwrite, and the replay is to T-1, T or T+1. Control: the answers
-    at T-1 and at T differ, so the setup has something at T to tell them apart."""
+async def test_every_cell_kind_is_kept_at_t_and_dropped_one_microsecond_before(manager: ScyllaClusterManager, s3_storage):
+    """R07-P1: RST-2. Every kind of change (regular, static, map, set, deletes of cell, row, range and partition, a batch, a tie, a
+    TTL cell) at its own timestamp. For each one, replays to its timestamp T and to T-1 are exact. Control: the answers at T-1 and
+    T differ for every stage but the tie (an insert and its delete at one timestamp show nothing), so each stage is seen. T-1 of
+    the map overwrite is left out: README limit 4's collection edge."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
         seed = seed_statements(pks, old_ts())
         await p.write(seed)
         await p.backup()
         changes, ts = change_statements(pks, now_us())
-        t = ts['update']
-        ttl = [W(t, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 50, 'ttl') USING TTL 3600 AND TIMESTAMP {{ts}}") for pk in pks]
+        ttl = [W(ts['update'], f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 50, 'ttl') USING TTL 3600 AND TIMESTAMP {{ts}}") for pk in pks]
         history = changes + ttl
         await p.write(history)
         await p.covered()
 
-        assert await expected_at(p.cql, p.ks, seed + history, t - 1) != await expected_at(p.cql, p.ks, seed + history, t), \
-            'the answers at T-1 and T must differ'
-        _, target = await p.replay_done(t + delta)
-        await assert_exact(p.cql, p.ks, target, seed + history, t + delta)
+        for stage, t in ts.items():
+            for t_replay in (t - 1, t):
+                if stage == 'map_overwrite' and t_replay == t - 1:
+                    continue
+                _, target = await p.replay_done(t_replay)
+                await assert_exact(p.cql, p.ks, target, seed + history, t_replay)
+            if stage != 'tie':
+                assert await expected_at(p.cql, p.ks, seed + history, t - 1) != await expected_at(p.cql, p.ks, seed + history, t), \
+                    f'stage {stage}: the answers at T-1 and T must differ'
 
 
 @needs_phase('ep.3')
@@ -471,8 +488,8 @@ async def test_a_shipped_write_after_t_is_not_restored(manager: ScyllaClusterMan
 @needs_phase('ep.3')
 async def test_seeded_random_writes_and_deletes_match_the_computed_answer(manager: ScyllaClusterManager, s3_storage):
     """R07-P4: RST-2. 200 random statements (inserts, updates, map and set elements, row, range and partition deletes, TTL cells, a
-    static column) over 16 keys at random timestamps, written out of timestamp order. Five replays, to a statement's timestamp
-    or one microsecond either side of it, each equal the answer computed on a reference table. The seed is fixed and logged. The
+    static column) over 16 keys at random timestamps, written out of timestamp order. Up to five replays (equal times collapse), to a
+    statement's timestamp or one microsecond either side of it, each equal the answer computed on a reference table. The seed is fixed and logged. The
     statements avoid README limit 4's edge forms: no collection overwrite or empty, and no batch."""
     seed_value = 20261108
     rng = random.Random(seed_value)
@@ -517,10 +534,22 @@ async def test_seeded_random_writes_and_deletes_match_the_computed_answer(manage
         assert len(set(answers)) > 1, 'the five answers are all equal, so the setup does not tell the times apart'
 
 
+def count_in_result(line, phrase):
+    """The number in front of `phrase` in the result line, or None if the line doesn't have it."""
+    m = re.search(rf'(\d+) {re.escape(phrase)}', line or '')
+    return int(m[1]) if m else None
+
+
 def not_verified_count(line):
     # The result line says `N cell(s) could not be verified`.
-    m = re.search(r'(\d+) cell\(s\) could not be verified', line)
-    return int(m[1]) if m else 0
+    return count_in_result(line, 'cell(s) could not be verified')
+
+
+async def result_for(p, target):
+    """The `done` line of the replay into this target, from the node's log."""
+    log = await p.manager.server_open_log(server_id=p.server.server_id)
+    found = [line for line, _ in await log.grep(re.escape(RESULT_MARK)) if f'{p.ks}.{target} ' in line]
+    return found[-1] if found else None
 
 
 @needs_phase('ep.3')
@@ -540,30 +569,40 @@ async def test_at_a_collection_edge_t_the_result_counts_the_collection_as_not_ve
         for t in (edge - 1, edge + 1):
             _, target = await p.replay_done(t)
             await assert_exact(p.cql, p.ks, target, seed + changes, t)
-            assert not_verified_count(await result_line(p)) == 0, f'T={t}: a collection counted as not verified one microsecond off the edge'
-        await p.replay_done(edge)
-        line = await result_line(p)
+            line = await result_for(p, target)
+            assert not_verified_count(line) == 0, f'T={t}: a collection counted as not verified one microsecond off the edge: {line}'
+        _, target = await p.replay_done(edge)
+        line = await result_for(p, target)
+        assert not_verified_count(line) is not None, f'the result line must carry the not-verified count: {line}'
         assert not_verified_count(line) >= 1, f'the result at the edge T must count a collection as not verified: {line}'
 
 
 @needs_phase('ep.3')
 async def test_a_delete_within_gc_grace_stays_deleted_after_the_source_compacts(manager: ScyllaClusterManager, s3_storage):
-    """R08-S1: L13's boundary. Partitions are written and deleted before the backup, with the default gc_grace, then the source is
-    flushed and compacted: the rows are gone and the tombstones kept, so the backup holds only the tombstones and the shipped
-    history holds the older inserts. The target must not have the rows back. Controls: the source's data shows tombstones and no
-    rows for the deleted keys, and a never-deleted row written with them is in the target."""
+    """R08-S1: L13's boundary. Partitions are deleted at ts2 and only then written at an older ts1, so only a delete that is kept,
+    with timestamps respected, hides them. The source is flushed and compacted: the rows are gone and the tombstones kept (default
+    gc_grace, and tombstone_gc `timeout`, as `repair` purges at once on a keyspace with one replica). The backup holds the
+    tombstones and the shipped history holds both writes. The target must not have the rows back. Controls: the source's data
+    shows tombstones and no rows for the deleted keys, and a never-deleted row written with them is in the target. While the
+    replay starts from the beginning of the chain (L14), the history's own delete also hides the rows, so this test cannot tell
+    a lost backup tombstone from a kept one."""
     gone, kept = keys_on_every_shard(1, 1000), keys_on_every_shard(1, 2000)
-    async with pitr_node(manager, s3_storage) as p:
+    async with pitr_node(manager, s3_storage, schema=f"{TABLE_SCHEMA} WITH tombstone_gc = {{'mode': 'timeout'}}") as p:
         ts1 = old_ts()
         before_writes = await shipped_segments(s3_storage)
-        inserts = simple_rows(gone + kept, ts1)
         deletes = [W(ts1 + STEP_US, f'DELETE FROM {{t}} USING TIMESTAMP {{ts}} WHERE pk = {pk}') for pk in gone]
-        await p.write(inserts + deletes)
+        inserts = simple_rows(gone + kept, ts1)
+        await p.write(deletes + inserts)
         await manager.api.keyspace_flush(p.server.ip_addr, p.ks, p.cf)
-        await manager.api.keyspace_compaction(p.server.ip_addr, p.ks, p.cf)
-        fragments = await p.cql.run_async(f'SELECT pk, mutation_fragment_kind FROM MUTATION_FRAGMENTS({p.ks}.{p.cf})')
-        assert not [f for f in fragments if f.pk in gone and f.mutation_fragment_kind == 'clustering row'], 'the deleted rows must be compacted away'
-        assert {f.pk for f in fragments if f.mutation_fragment_kind == 'partition start'} >= set(gone), 'the tombstones must be kept'
+        async def compacted():
+            # The row cache keeps listing a shadowed row after the sstables lost it, so it is dropped before the read.
+            await manager.api.keyspace_compaction(p.server.ip_addr, p.ks, p.cf)
+            await manager.api.drop_sstable_caches(p.server.ip_addr)
+            fragments = await p.cql.run_async(f'SELECT pk, mutation_fragment_kind FROM MUTATION_FRAGMENTS({p.ks}.{p.cf})')
+            rows = {f.pk for f in fragments if f.mutation_fragment_kind == 'clustering row'}
+            tombstoned = {f.pk for f in fragments if f.mutation_fragment_kind == 'partition start'}
+            return True if not rows & set(gone) and tombstoned >= set(gone) else None
+        await wait_for(compacted, deadline(), label='the deleted rows compacted away with their tombstones kept')
         await segments_shipped_after_the_writes(p, before_writes)
         await p.backup()
         x = simple_rows(keys_on_every_shard(1, 3000), now_us(), 'X')
@@ -574,4 +613,4 @@ async def test_a_delete_within_gc_grace_stays_deleted_after_the_source_compacts(
         seen = await pks_of(p.cql, p.ks, target)
         assert not seen & set(gone), f'deleted rows came back: {sorted(seen & set(gone))}'
         assert set(kept) <= seen, 'the never-deleted rows must be in the target'
-        await assert_exact(p.cql, p.ks, target, inserts + deletes + x, x[-1].ts)
+        await assert_exact(p.cql, p.ks, target, deletes + inserts + x, x[-1].ts)

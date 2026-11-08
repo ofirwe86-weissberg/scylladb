@@ -15,7 +15,7 @@ import logging
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
     assert_acked_writes_present, assert_exact, deadline, FAILED, FAR_FUTURE_US, first_history_read_after_load, gated_store,
     latest_restorable, needs_phase, now_us, old_ts, pitr_node, read_all, read_exact, Reason, report_stalls, RESULT_LOGGED_WORDS,
-    SEAL_SECONDS, simple_rows, TABLE_SCHEMA, Writer
+    objects_of, SEAL_SECONDS, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, TABLE_SCHEMA, Writer
 )
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for
@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 SEEDED = range(4)
 # What the README measured for the time to upload a sealed segment (U, at most 1.4 s there), with room for a slow host.
-U_ALLOWANCE_US = 5_000_000
+U_ALLOWANCE_US = 3_000_000
 
 
 @needs_phase('ep.3')
@@ -38,6 +38,11 @@ async def test_kill_never_gives_done_missing_acked_writes(manager: ScyllaCluster
         await writer.wait_acked(50)
         before_kill = await p.covered()
         await writer.wait_acked(len(writer.acked) + 50)
+
+        async def segments():
+            return {k for k in await objects_of(s3_storage, SHIPPING_PREFIX) if SEGMENT_KEY_RE.search(k)}
+        segments_before = await segments()
+        last_ack = max(ack for _, ack in writer.acked.values())
         await p.restart(kill=True)
         writer.stopping = True
         await asyncio.wait_for(writer.task, 120)
@@ -50,8 +55,14 @@ async def test_kill_never_gives_done_missing_acked_writes(manager: ScyllaCluster
         _, target = await p.replay_done(latest)
         required = await assert_acked_writes_present(p.cql, p.ks, target, [writer], latest, SEEDED)
         assert required, 'no acknowledged write was covered, so this proves nothing'
-        last_ack = max(ack for _, ack in writer.acked.values())
         bound = (SEAL_SECONDS + 1) * 1_000_000 + U_ALLOWANCE_US
+        # The loss is measured from the last write acknowledged before the kill. Whether the restarted node ships the killed node's
+        # leftover segments, which would hide a loss, is logged: the chains and the segments that appeared across the restart.
+        segments_after = await segments()
+        logger.info(f'R27-S1: loss {(last_ack - latest) / 1e6:.2f} s (bound {bound / 1e6:.1f} s); latest - before_kill = {(latest - before_kill) / 1e6:.2f} s; '
+                    f'chains before {sorted({SEGMENT_KEY_RE.search(k).group(2) for k in segments_before})}, '
+                    f'after {sorted({SEGMENT_KEY_RE.search(k).group(2) for k in segments_after})}; '
+                    f'{len(segments_after - segments_before)} segments appeared after the restart, {len(segments_before - segments_after)} vanished')
         assert last_ack - latest <= bound, f'the loss at the kill is {(last_ack - latest) / 1e6:.1f} s, over S + U + 1 s = {bound / 1e6:.1f} s'
         await p.refused(latest + 1, Reason.T_PAST_COVERAGE)
 
