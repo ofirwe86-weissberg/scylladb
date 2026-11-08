@@ -20,6 +20,7 @@
 #include <seastar/core/sstring.hh>
 
 #include "db/pitr/bound_file.hh"
+#include "db/pitr/chain_check.hh"
 #include "db/pitr/refusal.hh"
 #include "db/pitr/replay_target.hh"
 #include "mutation/timestamp.hh"
@@ -124,6 +125,9 @@ struct replay_start {
     // T, microseconds since the UNIX epoch, UTC.
     api::timestamp_type t = 0;
     bound_file bound;
+    // Every shard's chain, checked and proved to cover T, with the segments the
+    // replay reads in ledger order.
+    checked_history history;
     // The backup's sstables and the table it came from: a shared snapshot tag
     // makes the names the only record of what was loaded.
     utils::chunked_vector<sstring> toc_names;
@@ -137,19 +141,22 @@ struct replay_start {
 // then writes the `started` mark: T parses, a store location was given and is
 // known, the target exists, no replay is running into it, no mark exists for
 // it, its auto-compaction is off, it is empty, the backup's manifest names the
-// call's snapshot, it carries a bound file the strict reader accepts, and the
-// target's schema matches the backup's. The mark comes before the state of the
-// table, because a marked target is answered with "drop it" whatever state a
-// run left it in. The cheap local checks come first, so
+// call's snapshot, it carries a bound file the strict reader accepts, the
+// target's schema matches the backup's, this node has a shipping location to
+// read the history from, and every chain the bound names holds together and
+// covers T. The chain checks come last and still before the mark, so a T above
+// coverage can be retried on the same target. The mark comes before the
+// state of the table, because a marked target is answered with "drop it"
+// whatever state a run left it in. The cheap local checks come first, so
 // a plainly wrong call never reaches the store, and the mark is written last,
 // so a refusal leaves the node as it was.
 //
 // Runs on shard 0: `in_flight` is that shard's, so two calls on one target meet
 // there whichever shards they arrived on.
 // A refusal is the answer to a question about the call; a store or disk error is
-// an exception, since it says nothing about the backup. Reads three objects,
-// yields per read and per manifest entry, and needs every reference to outlive
-// the call.
+// an exception, since it says nothing about the backup. Reads the backup's three
+// files and every ledger entry of every chain it names, yields per read, per
+// manifest entry and per entry, and needs every reference to outlive the call.
 future<std::expected<replay_start, refusal>> start_replay_to(sharded<replica::database>& db, sstables::storage_manager& sm, replay_in_flight& in_flight,
         std::filesystem::path state_dir, const replay_to_params&, seastar::abort_source& as);
 

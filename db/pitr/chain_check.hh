@@ -14,6 +14,7 @@
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 
+#include "db/pitr/bound_file.hh"
 #include "db/pitr/ledger_entry.hh"
 #include "db/pitr/refusal.hh"
 #include "db/pitr/replay_reader.hh"
@@ -77,5 +78,35 @@ struct checked_chain {
 // per entry, keeps the lists chunked, and needs `client` and `as` to outlive it.
 future<std::expected<checked_chain, refusal>> check_chain(
         sstables::object_storage_client& client, sstring bucket, sstring key_prefix, chain_bound bound, int64_t target_time_us, seastar::abort_source& as);
+
+// Every chain one backup names, checked.
+struct checked_history {
+    // One per shard of the bound file, in its order, so an index is the shard.
+    utils::chunked_vector<checked_chain> chains;
+    // The lowest coverage among them, which is what the node as a whole covers:
+    // a write of any shard can be the one missing above it.
+    int64_t covered_through_us = 0;
+};
+
+// Runs `check_chain()` for every shard of the bound file and returns what a
+// restore to `target_time_us` may replay, or the one refusal that answers the
+// call. Nothing is fetched and nothing is written here, so a refusal leaves the
+// node untouched and the user can retry with a corrected T.
+//
+// Which refusal, when shards disagree: a shard whose records are missing or
+// damaged, or whose backup predates its shipping, is refused at once, because
+// no T makes it readable. When shards only lag, the one covering least is the
+// one reported, since it is what bounds T, and its interval runs from the
+// backup's capture time rather than the chain's start.
+//
+// A shard the bound file records without a chain is refused as records missing:
+// the bound names it, so it was writing when the backup was taken, and nothing
+// says it shipped (PM-50).
+//
+// Yields through `check_chain()`, once per ledger entry of every shard. Holds
+// every chain's segment list, which grows with the chain, so a long chain costs
+// what the restore is about to fetch (#18).
+future<std::expected<checked_history, refusal>> check_bound_chains(sstables::object_storage_client& client, sstring bucket, sstring key_prefix,
+        const bound_file& bound, int64_t target_time_us, seastar::abort_source& as);
 
 } // namespace db::pitr

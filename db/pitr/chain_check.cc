@@ -8,6 +8,7 @@
 
 #include "db/pitr/chain_check.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <exception>
 #include <optional>
@@ -243,6 +244,57 @@ future<std::expected<checked_chain, refusal>> check_chain(
     check_log.debug("chain {} holds {} entries and {} segments, and covers through {}, at or above T {}", chain_key_prefix(chain), result.entries_read,
             result.segments.size(), covered_through_us, target_time_us);
     co_return std::move(result);
+}
+
+future<std::expected<checked_history, refusal>> check_bound_chains(
+        sstables::object_storage_client& client, sstring bucket, sstring key_prefix, const bound_file& bound, int64_t target_time_us, abort_source& as) {
+    checked_history history;
+    // The shard covering least among those that lag, held while the rest are
+    // checked: a shard that refuses for good outranks one a lower T would fix.
+    std::optional<refusal> lagging;
+    for (const auto& shard : bound.shards) {
+        as.check();
+        if (!shard.chain) {
+            check_log.warn("the backup's bound records no chain for shard {}", shard.shard);
+            co_return std::unexpected(refusal{
+                    .reason = refusal_reason::protection_records_missing,
+                    .message = "A shard of the node the backup was taken from shipped no protection records, so what it covers cannot be proved. Restore from "
+                               "a later backup.",
+                    .detail = seastar::format("shard {}: the backup's bound records no chain", shard.shard),
+            });
+        }
+        auto checked = co_await check_chain(client, bucket, key_prefix,
+                chain_bound{
+                        .host_id = shard.chain->host_id,
+                        .shard = shard.shard,
+                        .boot_epoch_us = shard.chain->boot_epoch_us,
+                        .chain_start_us = shard.chain->chain_start_us,
+                        .chain = shard.chain->chain,
+                        .bound_segment_id = shard.bound.id,
+                },
+                target_time_us, as);
+        if (!checked) {
+            if (checked.error().reason != refusal_reason::t_past_coverage) {
+                co_return std::unexpected(std::move(checked.error()));
+            }
+            if (!lagging || checked.error().interval->through_us < lagging->interval->through_us) {
+                lagging = std::move(checked.error());
+            }
+            continue;
+        }
+        history.covered_through_us = history.chains.empty() ? checked->covered_through_us : std::min(history.covered_through_us, checked->covered_through_us);
+        history.chains.push_back(std::move(*checked));
+    }
+    if (lagging) {
+        // Below the capture time this backup holds nothing to restore to, so
+        // the interval the user is offered starts there and not at the chain.
+        lagging->interval->from_us = std::max(lagging->interval->from_us, bound.capture_time_us);
+        check_log.warn("T {} is past what the backup's chains cover: {}", target_time_us, *lagging);
+        co_return std::unexpected(std::move(*lagging));
+    }
+    check_log.info(
+            "the backup's {} chain(s) hold together and cover through {}, at or above T {}", history.chains.size(), history.covered_through_us, target_time_us);
+    co_return std::move(history);
 }
 
 } // namespace db::pitr
