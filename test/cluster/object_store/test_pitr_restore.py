@@ -20,6 +20,10 @@ from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtur
     keys_on_every_shard, needs_phase, now_us, objects_of, old_ts, pitr_node, pks_of, PURGEABLE_OPTIONS, read_exact, Reason, report_stalls,
     result_line, seed_statements, SEGMENT_KEY_RE, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, W, write_and_purge, WRONG_WAY_BACK
 )
+from test.cluster.object_store.pitr_util import (
+    assert_acked_writes_present, backup_prefix, CLOCK_MARGIN_US, latest_restorable, UNCOMPRESSED_SCHEMA, wait_log, Writer, write_several_sstables
+)
+from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for
 
@@ -258,3 +262,147 @@ async def test_after_a_truncate_a_restart_and_a_new_backup_restore_exactly(manag
         seen = await pks_of(p.cql, p.ks, target)
         assert not seen & set(r_pks), f'truncated rows came back: {seen & set(r_pks)}'
         await assert_exact(p.cql, p.ks, target, s + u, u[-1].ts)
+
+
+def chains_of(keys):
+    return {SEGMENT_KEY_RE.search(k).group(2) for k in keys}
+
+
+async def shipped_segments(storage):
+    return {k for k in await objects_of(storage, SHIPPING_PREFIX) if SEGMENT_KEY_RE.search(k)}
+
+
+@needs_phase('ep.3')
+async def test_after_a_restart_a_new_backup_restores_exactly(manager: ScyllaClusterManager, s3_storage):
+    """R01-S1: SHP-1, L10's safe path. A is written, the node restarts, B is written, and a new backup is taken, then C. The
+    replay from the new backup to C's last write gives the seed, A, B and C. Controls: the node logs that shipping starts a new
+    chain after the restart, and a chain directory the first run didn't have appears in the bucket."""
+    pks = keys_on_every_shard(2)
+    async with pitr_node(manager, s3_storage) as p:
+        seed = seed_statements(pks, old_ts())
+        await p.write(seed)
+        await p.backup()
+        a = simple_rows(keys_on_every_shard(2, 100), now_us(), 'A')
+        await p.write(a)
+        await p.covered()
+        chains_before = chains_of(await shipped_segments(s3_storage))
+        assert chains_before, 'the first run must have shipped a chain'
+
+        log = await manager.server_open_log(server_id=p.server.server_id)
+        mark = await log.mark()
+        await p.restart()
+        await wait_log(log, r'shipping is on: shipping from segment \d+ into chain', from_mark=mark)
+        b = simple_rows(keys_on_every_shard(2, 200), now_us(), 'B')
+        await p.write(b)
+        await p.backup()
+        c = simple_rows(keys_on_every_shard(2, 300), now_us(), 'C')
+        await p.write(c)
+        await p.covered()
+        assert chains_of(await shipped_segments(s3_storage)) - chains_before, 'the restart must start a new chain directory'
+
+        _, target = await p.replay_done(c[-1].ts)
+        await assert_exact(p.cql, p.ks, target, seed + a + b + c, c[-1].ts)
+
+
+@needs_phase('ep.3')
+async def test_a_t_after_a_restart_is_refused_from_the_earlier_backup(manager: ScyllaClusterManager, s3_storage):
+    """R01-S2: SHP-1, L10's boundary. A is written and covered, then the node restarts and B is written. A T at B's last write,
+    from the backup taken before the restart, is refused as past coverage, the latest restorable time it states is before the
+    restart, and no target is loaded. Control: A's last write from the same backup is done and exact."""
+    pks = keys_on_every_shard(2)
+    async with pitr_node(manager, s3_storage) as p:
+        seed = seed_statements(pks, old_ts())
+        await p.write(seed)
+        await p.backup()
+        first, first_prefix = p.snap, p.prefix
+        a = simple_rows(keys_on_every_shard(2, 100), now_us(), 'A')
+        await p.write(a)
+        await p.covered()
+        restart_at = now_us()
+        await p.restart()
+        b = simple_rows(keys_on_every_shard(2, 200), now_us(), 'B')
+        await p.write(b)
+        # The coverage wait asks the current backup, which the first one can no longer answer: a second backup does, and
+        # the replays below name the first again.
+        await p.backup()
+        await p.covered()
+        p.snap, p.prefix = first, first_prefix
+
+        t = b[-1].ts
+        outcome, _ = await p.refused(t, Reason.T_PAST_COVERAGE)
+        latest = latest_restorable(outcome, t)
+        assert latest < restart_at, f'the earlier backup must not be covered past the restart: {outcome}'
+
+        _, target = await p.replay_done(a[-1].ts)
+        await assert_exact(p.cql, p.ks, target, seed + a, a[-1].ts)
+
+
+@needs_phase('ep.3')
+async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaClusterManager, s3_storage):
+    """R05-P1: SHP-5. A writer runs on both shards while the backup is taken. Every write acknowledged before T, with a margin,
+    is in the restore at T, whether it landed before or after the snapshot. Control: the writer had acknowledged writes before
+    the backup started and went on acknowledging after it ended, so writes straddle the snapshot."""
+    seeded = list(range(4))
+    async with pitr_node(manager, s3_storage) as p:
+        await p.write(simple_rows(seeded, old_ts()))
+        writer = Writer(p.cql, p.ks, 't').start()
+        await writer.wait_acked(20)
+        started = now_us()
+        await p.backup()
+        ended = now_us()
+        await writer.wait_acked(len(writer.acked) + 20)
+        await writer.stop()
+        before = [pk for pk, (ts, ack) in writer.acked.items() if ack < started]
+        after = [pk for pk, (ts, ack) in writer.acked.items() if ack > ended]
+        assert before and after, f'writes must straddle the backup: {len(before)} before, {len(after)} after'
+
+        t = now_us() + 2 * CLOCK_MARGIN_US
+        await p.covered(t + CLOCK_MARGIN_US)
+        _, target = await p.replay_done(t)
+        required = await assert_acked_writes_present(p.cql, p.ks, target, [writer], t, seeded)
+        assert set(before) <= set(required) and set(after) <= set(required), 'the writes around the snapshot must all be required'
+
+
+@needs_phase('ep.3')
+async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(manager: ScyllaClusterManager, gated_store):
+    """R05-S1: SHP-5, L15's safe path. A backup cut part-way fails. The same snapshot, backed up again to a fresh prefix, is
+    done, and a replay from it at the last write of X gives the source's rows. Control: the first task failed with some but not
+    all of the snapshot's bytes uploaded."""
+    async with pitr_node(manager, gated_store, schema=UNCOMPRESSED_SCHEMA) as p:
+        await write_several_sstables(manager, p.server, p.cql, p.ks)
+        size = await manager.api.get_table_disk_space_used(p.server.ip_addr, p.ks, 't')
+        p.snap, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
+        cut_prefix = backup_prefix(p.ks, 't', p.snap) + '-cut'
+        # The cut is made by holding the sixth upload of the backup and failing the store there. A byte budget would be spent by
+        # the node's own segment uploads, which go through the same endpoint, and the long outage would switch shipping off.
+        uploads = []
+
+        def sixth_backup_upload(method, path):
+            if method in ('PUT', 'POST') and f'/{cut_prefix}/' in path:
+                uploads.append(path)
+                return len(uploads) == 6
+            return False
+        gated_store.hold_when(sixth_backup_upload)
+        tid = await manager.api.backup(p.server.ip_addr, p.ks, 't', p.snap, gated_store.address, gated_store.bucket_name, cut_prefix)
+
+        async def held():
+            return True if gated_store.holding.is_set() else None
+        await wait_for(held, deadline())
+        gated_store.fail()
+        try:
+            await manager.api.abort_task(p.server.ip_addr, tid)
+        except Exception as e:
+            logger.info(f'The task had already ended: {e}')
+        assert (await manager.api.wait_task(p.server.ip_addr, tid))['state'] == 'failed'
+        uploaded = sum(o.size for o in (await objects_of(gated_store, f'{cut_prefix}/')).values())
+        assert 0 < uploaded < size, f'the upload must be part-way: {uploaded} of {size} bytes'
+        gated_store.recover()
+
+        p.prefix = backup_prefix(p.ks, 't', p.snap)
+        await do_backup(p.server, p.snap, p.prefix, p.ks, 't', gated_store, manager, logger)
+        x = simple_rows(range(2000, 2010), now_us(), 'X')
+        await p.write(x)
+        await p.covered()
+        _, target = await p.replay_done(x[-1].ts)
+        rows = await read_exact(p.cql, p.ks, target)
+        assert rows and rows == await read_exact(p.cql, p.ks, 't'), 'the restore must hold every row of the source'
