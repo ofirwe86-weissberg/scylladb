@@ -46,7 +46,7 @@ logger = logging.getLogger(__name__)
 #   15-bc   the refusals 15-b and 15-c, with the P68 messages
 #   12-2.2  the upload-finished marker of a backup
 # Add a piece here when it lands, to enable the tests that need it.
-LANDED_PHASES: tuple[str, ...] = ()
+LANDED_PHASES: tuple[str, ...] = ('ep.3',)
 
 # Each test must fail on a build without the change, so PITR_RUN_SKIPPED=1 runs every test as if its pieces had landed. With
 # PITR_DEADLINE_SECONDS=10 as well, a poll of an endpoint that doesn't exist gives up quickly. Neither is for normal runs.
@@ -656,6 +656,10 @@ def _objects(storage, prefix):
 
 async def objects_of(storage, prefix) -> dict:
     return await asyncio.to_thread(_objects, storage, prefix)
+
+
+async def shipped_bytes(storage) -> int:
+    return sum(o.size for o in (await objects_of(storage, SHIPPING_PREFIX)).values())
 
 
 async def get_object(storage, key) -> bytes:
