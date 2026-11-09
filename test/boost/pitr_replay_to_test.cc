@@ -139,6 +139,18 @@ BOOST_AUTO_TEST_CASE(every_refusal_reason_has_a_code_of_its_own) {
     }
 }
 
+// A compaction let in mid-run fails the run under a code of its own, in the same
+// `<code>: message (detail)` form as every refusal, so it reads apart (#111).
+BOOST_AUTO_TEST_CASE(a_compaction_during_the_run_formats_with_its_own_code) {
+    replay_to_params params{.keyspace = "ks", .table = "target"};
+    auto r = compaction_during_replay_refusal(params, "history was replayed");
+    BOOST_REQUIRE_EQUAL(r.code(), "target_compaction_during_replay");
+    auto text = fmt::format("{}", r);
+    BOOST_REQUIRE_MESSAGE(text.starts_with("target_compaction_during_replay: "), text);
+    BOOST_REQUIRE_MESSAGE(text.find("while the history was replayed") != std::string::npos, text);
+    BOOST_REQUIRE_MESSAGE(text.ends_with(" (ks.target)"), text);
+}
+
 BOOST_AUTO_TEST_CASE(a_mark_survives_a_round_trip_through_its_codec) {
     auto state = make_state();
     BOOST_REQUIRE(decode_replay_state(encode(state)) == state);

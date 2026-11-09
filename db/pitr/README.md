@@ -114,7 +114,9 @@ snapshot. A backup without this file can't be used for PITR.
      writes with a timestamp at or below T, and applies them to the target.
    - It flushes the target and replaces the mark with a durable `done`.
    If a compaction could have run on the target during the run, the task
-   fails and never reports `done`.
+   fails and never reports `done`. Its error reads `Point-in-time replay
+   of <ks>.<target> failed: target_compaction_during_replay: ...`: `failed`
+   rather than `refused`, because the run had already started.
 5. On success the task's status says only `done`. The result line, with
    the backup loaded and the counts, goes to the node log (limit 13).
 
@@ -424,7 +426,8 @@ more.
 27. The backup's `manifest.json` is read whole into memory on shard 0, up
     to 32 MiB. A backup with very many sstables needs that much free memory.
 28. No automatic cleanup after a failed replay. The target stays, with its
-    `started` mark: the task's error text says why the run failed, and a
+    `started` mark: the task's error text says why the run failed (for a
+    compaction let in during the run, `target_compaction_during_replay`), and a
     second replay into it is refused as `target_already_replayed`. Drop it
     and restore under a new name.
 29. One restore at a time. No dry run, and no alerting: the task's status

@@ -52,6 +52,8 @@ std::string_view reason_code(refusal_reason reason) noexcept {
         return "shipped_object_missing";
     case refusal_reason::shipped_object_damaged:
         return "shipped_object_damaged";
+    case refusal_reason::target_compaction_during_replay:
+        return "target_compaction_during_replay";
     }
     return "unknown";
 }

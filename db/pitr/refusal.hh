@@ -84,10 +84,14 @@ enum class refusal_reason {
     // It is there, but what was fetched is not what its ledger entry recorded:
     // another size, or another checksum.
     shipped_object_damaged,
+    // Not a check before the run: the run lost its hold of the target's
+    // compaction part way, for example to auto-compaction being turned back
+    // on, so a tombstone may have been purged before the writes it covers.
+    target_compaction_during_replay,
 };
 
 // Every enumerator, so that a test can check each one has a code of its own.
-inline constexpr std::array<refusal_reason, 20> all_refusal_reasons{
+inline constexpr std::array<refusal_reason, 21> all_refusal_reasons{
         refusal_reason::t_invalid,
         refusal_reason::t_past_coverage,
         refusal_reason::protection_records_missing,
@@ -108,6 +112,7 @@ inline constexpr std::array<refusal_reason, 20> all_refusal_reasons{
         refusal_reason::backup_file_too_large,
         refusal_reason::shipped_object_missing,
         refusal_reason::shipped_object_damaged,
+        refusal_reason::target_compaction_during_replay,
 };
 
 std::string_view reason_code(refusal_reason) noexcept;
