@@ -18,7 +18,7 @@ restores report `done` on wrong data (limits 1, 16, 17 and 19). A deleted
 row can also come back with `done`, on default settings too (limit 38). A
 restore from encrypted segments hasn't been tested (limit 11). A full
 re-review of the restore path is open (#92). See
-[Implementation status](#implementation-status-2026-11-08).
+[Implementation status](#implementation-status-2026-11-09).
 
 ## How it works
 
@@ -411,7 +411,17 @@ more.
     restored table isn't protected until its own backup.
 22. The outage latch: once unshipped data reaches the hold limit, shipping
     releases every held segment so writes keep succeeding, and stops until
-    restart. The chain ends there.
+    restart. The chain ends there. The limit that applies can be far below
+    `pitr_unshipped_limit_in_mb`: the commitlog clamps it to 3/4 of the
+    lower of the shard's flush threshold and its share of
+    `commitlog_total_space_in_mb`, which on a shard with little memory is
+    less than one segment. The latch then trips on the first closed
+    segment that hasn't been recorded yet, with the store healthy, and a
+    restart trips it again until the shard has more memory or the
+    commitlog a larger share of it. Before the latch trips, only the
+    commitlog's line in the node log at startup names the limit that
+    applies; the latch's own reason then names it in bytes. No metric or
+    status reports it (#88, future work).
 23. Stopping the node can wait about 30 s per shard while the store client
     gives up on an S3 credential lookup (#79).
 24. A restore needs disk space for the whole node's writes since the backup,
@@ -483,7 +493,7 @@ more.
     in that chain. In the 1 GB measured run, all 1.28 million writes were
     replayed, about 80% of them already in the backup.
 
-## Implementation status (2026-11-08)
+## Implementation status (2026-11-09)
 
 **Merged on `ow/pitr/v1`:**
 - shipping of sealed segments to the configured store, with a per-shard
@@ -496,11 +506,21 @@ more.
 - the chain check of every shard before the mark (#107), the fetch of each
   segment with size and CRC checks (#113), and the replay into the target,
   the flush and the durable `done` (#114);
-- the measured-run harness (#115) and its numbers above (#118).
+- the measured-run harness (#115) and its numbers above (#118);
+- the slim-core black-box node tests (#84), see [Testing](#testing);
+- the end of a chain: a next entry the store itself reports as absent
+  (S3 `NoSuchKey`, GCS `ENOENT`) ends the chain where it is read, instead
+  of failing a replay that raced the shipper's next entry (#132, fixes
+  #131);
+- the reason code `target_compaction_during_replay` on both compaction
+  guards, so the failure can be told apart by its code (#137, #111);
+- the S3 per-client metrics labelled with the endpoint's host and port
+  when the port isn't the scheme's default, so two endpoints on one host
+  can each have a client on a shard (#136, fixes #112). The group-client
+  metrics are still labelled by host alone (#135).
 
-A restore of one table to T runs end to end, and the node test for exact
-data at T on every shard passes on the merged code. The node tests for
-deleted rows and the other end-to-end cases are in #84, still open. A
+A restore of one table to T runs end to end, and the slim-core node
+tests of the core requirements pass on the merged code (#84). A
 full-level re-review of the restore path is still open (#92) before a
 restore is called usable in production.
 
@@ -536,11 +556,34 @@ restore is called usable in production.
   its result line in the node log, the compaction hold, and a failure or
   an abort leaving the target `started`. `test_pitr_measure.py` is the
   measured run, skipped unless `PITR_MEASURE=1`.
-- The other `test_pitr_*.py` files are black-box tests that stay skipped
-  until their phase is added to `LANDED_PHASES` in `pitr_util.py`, which is
-  empty. #84, still open, replaces them with ten slim tests: deleted rows,
-  compaction during replay, T past coverage (including an idle shard),
-  damaged history, TRUNCATE, a schema change, an unfinished backup upload,
-  a kill during writes, and a durable `done` beside an `incomplete` target.
+- **Black-box node tests,** merged on 2026-11-09 (#84), in
+  `test_pitr_restore.py` (the restore, the T filter and the deleted-row
+  cases), `test_pitr_refusals.py` (the refusals and the bound file),
+  `test_pitr_shipping.py` (shipping off, and the seal interval with its
+  range) and `test_pitr_failures.py` (a `kill -9` never gives `done` with
+  an acknowledged write missing). They use only what an operator has:
+  CQL, REST, nodetool, configuration, the bucket, and starting or killing
+  the node.
+- Of the tests in those files, the 30 that cover the feature's seven core
+  requirements each ran 100 of 100, or 20 of 20 for the slower ones: the
+  kill, restart, interrupted-backup and shipping tests, with no failure.
+  The files hold further tests that ran 5 of 5 or 10 of 10 and have not
+  been reviewed or run 100 of 100. One of those is an expected failure
+  (`xfail`): the `done` result carries no warning against loading the
+  copy back into the original (limit 3), because a task has no success
+  text (#100, #102).
+- A black-box test stays skipped until every product piece it needs is
+  listed in `LANDED_PHASES` in `pitr_util.py`, which holds `ep.3`, the
+  `replay_to` endpoint. Still skipped are the idle-shard refusal, which
+  waits on a refusal that names the idle shard (see [RPO](#rpo), "An
+  idle shard"); the refusal of a `TRUNCATE` before the backup, which
+  waits on a refusal that isn't built (limit 16); the schema-change
+  refusal, which waits on that and on the status GET (limit 17, #14);
+  the refusal of a backup whose upload didn't finish, which waits on the
+  marker of #12; and `incomplete` and a durable `done` across a kill,
+  which wait on the status GET (#14). The test for a `TRUNCATE` after the
+  backup is marked on #15, and the one for a purged tombstone on #126
+  (limit 38). Most tests that take a requirement as written, ignoring
+  today's limits, aren't written yet.
 - No running node test covers the other refused table kinds, two nodes,
   encryption, `durable_writes` or the outage latch.
