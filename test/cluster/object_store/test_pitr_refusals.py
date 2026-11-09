@@ -7,7 +7,7 @@
 
 """PITR replay that must refuse, and never give `done`: T past coverage, damaged history, a TRUNCATE, a schema change and a
 backup whose upload didn't finish. Each test ends with its positive control, which flips the outcome to `done` in the same
-run, so that the refusal is shown to come from the condition and not from a broken setup. T4-T8 of docs-work/test-plan-slim.md
+run, so that the refusal is shown to come from the condition and not from a broken setup. T4-T8 of the QA test plan
 (issue #22)."""
 
 import asyncio
@@ -43,7 +43,7 @@ def assert_states_coverage(outcome, t):
 
 
 async def test_t_past_coverage_is_refused_while_writes_wait_to_ship(manager: ScyllaClusterManager, gated_store, s3_storage):
-    """T4 (a): REF-5, P68. Shipping goes through the gate and the backup around it. The gate holds every upload, below
+    """T4 (a): Shipping goes through the gate and the backup around it. The gate holds every upload, below
     pitr_unshipped_limit_in_mb, so writes are acknowledged and not shipped. Control: let the uploads go, and the same target
     gives `done` with the writes."""
     pks = keys_on_every_shard(1, 100)
@@ -66,7 +66,7 @@ async def test_t_past_coverage_is_refused_while_writes_wait_to_ship(manager: Scy
 
 @needs_phase('ep.3', '15-bc')
 async def test_t_past_coverage_is_refused_with_a_shard_idle(manager: ScyllaClusterManager, s3_storage):
-    """T4 (b): REF-5, limit 26, LVL-1, P68 (PM-64). After the backup only shard 0 is written, for 5 seal intervals. The refusal
+    """T4 (b): README limit 10. After the backup only shard 0 is written, for 5 seal intervals. The refusal
     names shard 1 and its covered-through time. Control: one write on shard 1, and the same target gives `done`."""
     on_0 = keys_on_shard(0, 5, 100)
     async with pitr_node(manager, s3_storage) as p:
@@ -101,7 +101,7 @@ DAMAGES = {
 @needs_phase('ep.3')
 @pytest.mark.parametrize('damage', DAMAGES)
 async def test_damaged_history_is_refused(manager: ScyllaClusterManager, s3_storage, damage):
-    """T5: REF-4. The largest object shipped after the backup is a segment of the history: ledger entries are at most 4096
+    """T5: The largest object shipped after the backup is a segment of the history: ledger entries are at most 4096
     bytes. A cut segment would read as a normal end, so the writes after the cut would go missing. Control: put the bytes back,
     and a new target gives `done`, exact."""
     pks = keys_on_every_shard(1, 100)
@@ -132,7 +132,7 @@ async def test_damaged_history_is_refused(manager: ScyllaClusterManager, s3_stor
 
 
 async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=()):
-    """The control of T6. P74: after a TRUNCATE, PITR needs a chain that started after it, which takes a restart, and a backup
+    """The control of T6. After a TRUNCATE, PITR needs a chain that started after it, which takes a restart, and a backup
     on that chain. Then replay gives `done`, without the truncated rows."""
     await p.restart()
     await p.backup()
@@ -145,10 +145,10 @@ async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=())
     await assert_exact(p.cql, p.ks, target, [*kept, *later], later[-1].ts)
 
 
-@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/15",
-                      reason="L7: won't be implemented this release; implementable when replay reads the source's truncation record")
+@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/143",
+                      reason="the TRUNCATE refusal is not built in this release, README limit 16")
 async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
-    """T6 (a): REF-10, limit 21, RST-4, P55/P74. Rows R written after the backup, then a TRUNCATE. T between R and the
+    """T6 (a): README limit 16. Rows R written after the backup, then a TRUNCATE. T between R and the
     TRUNCATE is refused: replaying the history would bring R back. auto_snapshot is off, so nothing else keeps R."""
     pks = keys_on_every_shard(1, 100)
     async with pitr_node(manager, s3_storage, auto_snapshot=False) as p:
@@ -166,7 +166,7 @@ async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManage
 
 @needs_phase('ep.3', '15-bc')
 async def test_truncate_before_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
-    """T6 (b): REF-10, RST-4, P55/P74. With shipping on: rows R, a TRUNCATE, the backup, then rows S. P74 refuses every T once
+    """T6 (b): README limit 16. With shipping on: rows R, a TRUNCATE, the backup, then rows S. The refusal covers every T once
     the source was truncated after its chain started. A commitlog-wide bound below the cleared writes would bring R back."""
     r_pks, s_pks = keys_on_every_shard(1, 100), keys_on_every_shard(1, 200)
     async with pitr_node(manager, s3_storage, auto_snapshot=False) as p:
@@ -183,7 +183,7 @@ async def test_truncate_before_the_backup_is_refused(manager: ScyllaClusterManag
 
 @needs_phase('ep.3', '15-bc', 'st.1')
 async def test_schema_change_since_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
-    """T7: REF-9, limit 22, PM-60. Values in column w, the backup, w dropped, more writes. Any T after the backup is refused, or
+    """T7: README limit 17. Values in column w, the backup, w dropped, more writes. Any T after the backup is refused, or
     the dropped values would come back in the copy. Control: T at the snapshot time gives `done`, exact."""
     pks = keys_on_every_shard(1, 100)
     async with pitr_node(manager, s3_storage) as p:
@@ -204,7 +204,7 @@ async def test_schema_change_since_the_backup_is_refused(manager: ScyllaClusterM
 
 @needs_phase('ep.3', '12-2.2')
 async def test_backup_with_unfinished_upload_is_refused(manager: ScyllaClusterManager, gated_store, s3_storage):
-    """T8: REF-7 (don't-cut list). The backup goes through the gate, cut after about half the snapshot's bytes, and shipping
+    """T8: The backup goes through the gate, cut after about half the snapshot's bytes, and shipping
     goes around it. A partial backup loads fewer sstables. Control: back up the same snapshot again, uncut, and a new target
     gives `done`, exact."""
     async with pitr_node(manager, s3_storage, schema=UNCOMPRESSED_SCHEMA, also=(gated_store,)) as p:
@@ -242,7 +242,7 @@ async def test_backup_with_unfinished_upload_is_refused(manager: ScyllaClusterMa
 
 @needs_phase('ep.3')
 async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(manager: ScyllaClusterManager, s3_storage):
-    """R16-P2: REF-13. A second replay into a target that is already `done` is refused, the message names the earlier run's backup
+    """R16-P2: A second replay into a target that is already `done` is refused, the message names the earlier run's backup
     and T, and the target keeps its rows. Control: the first call was `done` and the target is not empty."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
@@ -274,7 +274,7 @@ async def ready_for_replay(p, pks=None):
 
 @needs_phase('ep.3')
 async def test_a_call_missing_a_required_parameter_is_rejected_naming_it(manager: ScyllaClusterManager, s3_storage):
-    """R06-P4: RST-1. Each of the seven parameters, left out and then given empty with the other six valid, is an HTTP 400 that
+    """R06-P4: Each of the seven parameters, left out and then given empty with the other six valid, is an HTTP 400 that
     names it and starts no task. Control: the full call into the same target ends `done`, so no case marked it."""
     async with pitr_node(manager, s3_storage) as p:
         t = await ready_for_replay(p)
@@ -292,7 +292,7 @@ async def test_a_call_missing_a_required_parameter_is_rejected_naming_it(manager
 
 @needs_phase('ep.3')
 async def test_an_endpoint_the_node_does_not_know_is_refused(manager: ScyllaClusterManager, s3_storage):
-    """R06-P5: RST-1. An endpoint name the node isn't configured with is refused with its reason and name, and loads nothing.
+    """R06-P5: An endpoint name the node isn't configured with is refused with its reason and name, and loads nothing.
     Control: the configured endpoint into a fresh target ends `done`."""
     async with pitr_node(manager, s3_storage) as p:
         t = await ready_for_replay(p)
@@ -304,7 +304,7 @@ async def test_an_endpoint_the_node_does_not_know_is_refused(manager: ScyllaClus
 
 @needs_phase('ep.3')
 async def test_a_bucket_that_does_not_exist_is_refused_as_no_backup(manager: ScyllaClusterManager, s3_storage):
-    """R06-P6: RST-1. A bucket that doesn't exist is refused as a missing backup, and loads nothing. Control: the real bucket
+    """R06-P6: A bucket that doesn't exist is refused as a missing backup, and loads nothing. Control: the real bucket
     into a fresh target ends `done`."""
     async with pitr_node(manager, s3_storage) as p:
         t = await ready_for_replay(p)
@@ -316,7 +316,7 @@ async def test_a_bucket_that_does_not_exist_is_refused_as_no_backup(manager: Scy
 
 @needs_phase('ep.3')
 async def test_a_target_table_that_does_not_exist_is_refused_and_not_created(manager: ScyllaClusterManager, s3_storage):
-    """R06-P7: RST-1. A replay into a table that doesn't exist is refused naming it, and doesn't create it. Control: once the
+    """R06-P7: A replay into a table that doesn't exist is refused naming it, and doesn't create it. Control: once the
     table is created from the backup's schema.cql, the same call ends `done`."""
     async with pitr_node(manager, s3_storage) as p:
         t = await ready_for_replay(p)
@@ -341,7 +341,7 @@ async def test_a_target_table_that_does_not_exist_is_refused_and_not_created(man
     pytest.param('2026-02-30T10:00:00Z', id='feb_30'),
 ])
 async def test_an_unparsable_t_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage, t):
-    """R07-P5: RST-2. A T that isn't a UTC time of the documented form is refused as invalid before the backup is loaded, and
+    """R07-P5: A T that isn't a UTC time of the documented form is refused as invalid before the backup is loaded, and
     leaves no mark. Control: a valid T into the same target ends `done`."""
     async with pitr_node(manager, s3_storage) as p:
         valid = await ready_for_replay(p)
@@ -352,7 +352,7 @@ async def test_an_unparsable_t_is_refused_before_anything_is_loaded(manager: Scy
 
 @needs_phase('ep.3')
 async def test_a_backup_whose_bound_file_was_removed_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage):
-    """R05-P2: SHP-5. A backup without its pitr-bound.txt is refused, naming the file, and loads nothing. Control: with the file
+    """R05-P2: A backup without its pitr-bound.txt is refused, naming the file, and loads nothing. Control: with the file
     put back, a fresh target ends `done`."""
     async with pitr_node(manager, s3_storage) as p:
         t = await ready_for_replay(p)

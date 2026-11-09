@@ -266,7 +266,7 @@ class pulser:
 
     make_pulse() holds the connection it was made with, and the loss run kills the node and
     reconnects, so its pulse has to be re-bound after every restart. Coverage is the lowest of the
-    shards', so one idle shard would hold the whole node at 1970 (P62)."""
+    shards', so one idle shard would hold the whole node at 1970 (README limit 10)."""
 
     def __init__(self, cql, ks, keys):
         self.cql, self._ks, self._keys = cql, ks, keys
@@ -322,7 +322,7 @@ async def test_measure_lag(manager: ScyllaClusterManager, s3_storage, tmp_path, 
         lags, end = [], time.monotonic() + LOAD_S
         while time.monotonic() < end:
             await asyncio.sleep(LAG_SAMPLE_SECONDS)
-            # The pulse guards the P62 limit: one idle shard holds the node's coverage down, and a
+            # The pulse guards README limit 10: one idle shard holds the node's coverage down, and a
             # lag measured against it would be the idle shard's, not the load's.
             await pulse()
             covered = await coverage_reached(manager, server, s3_storage, ks, 'target', snap, prefix)

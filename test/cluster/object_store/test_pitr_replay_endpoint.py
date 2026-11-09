@@ -28,7 +28,7 @@ from test.pylib.util import wait_for
 logger = logging.getLogger(__name__)
 
 # Vnodes: a replay restores one table of one node from that node's own commitlog, which tablets do
-# not give, and a tablets target is refused (REF-1).
+# not give, and a tablets target is refused.
 RF_1 = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': false}"
 TABLETS_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': '1'} AND tablets = {'enabled': true}"
 T = '2026-11-04T14:05:00.000000Z'
@@ -135,7 +135,7 @@ async def make_pulse(cql, ks):
 
     Coverage is the lowest of the shards', each shard's moves only when that shard seals a segment
     it has written to, and it starts at 0: one idle shard holds the whole node at 1970 and refuses
-    every replay (P62). A table of its own, so the source a replay reads holds exactly the rows the
+    every replay (README limit 10). A table of its own, so the source a replay reads holds exactly the rows the
     test wrote."""
     await cql.run_async(f"CREATE TABLE {ks}.pulse (pk int primary key);")
     keys = sorted(await one_key_per_shard(cql, f'{ks}.pulse', [str(pk) for pk in range(32)]))

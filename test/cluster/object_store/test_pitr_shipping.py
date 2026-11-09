@@ -79,7 +79,7 @@ async def stays_unshipped(manager, p, seconds=SHIP_WINDOW_SECONDS, pulse=False, 
 
 @needs_phase('ep.3')
 async def test_nothing_is_shipped_when_off(manager: ScyllaClusterManager, s3_storage):
-    """R01-P2: SHP-1. A node with no shipping endpoint logs that shipping is off and, whatever it writes and however long it waits,
+    """R01-P2: A node with no shipping endpoint logs that shipping is off and, whatever it writes and however long it waits,
     puts nothing in the bucket. The node is alone in its cluster: a second node would switch shipping off by itself. The control
     is R28-P1, where the same writes with shipping on reach the bucket from each shard."""
     async with pitr_node(manager, s3_storage, shipping=False, **SMALL_SEGMENTS) as off:
@@ -92,7 +92,7 @@ async def test_nothing_is_shipped_when_off(manager: ScyllaClusterManager, s3_sto
 @needs_phase('ep.3')
 @pytest.mark.parametrize('seal', [1, 3600])
 async def test_a_seal_interval_inside_the_range_ships(manager: ScyllaClusterManager, s3_storage, seal):
-    """R28-P1: LVL-1. A seal interval at either end of 1..3600 s ships: segments closed by rollover reach the bucket from each
+    """R28-P1: A seal interval at either end of 1..3600 s ships: segments closed by rollover reach the bucket from each
     shard within 10 s, even where the timer is an hour (the segments are 1 MiB, so rollover closes them). Control for R28-P2."""
     async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=seal, **SMALL_SEGMENTS) as p:
         await fill_segments(manager, p)
@@ -102,7 +102,7 @@ async def test_a_seal_interval_inside_the_range_ships(manager: ScyllaClusterMana
 @needs_phase('ep.3')
 @pytest.mark.parametrize('seal', [0, 3601])
 async def test_a_seal_interval_outside_the_range_keeps_shipping_off(manager: ScyllaClusterManager, s3_storage, seal):
-    """R28-P2: LVL-1. A seal interval outside 1..3600 s is logged as the cause, the node starts with shipping off, and writes
+    """R28-P2: A seal interval outside 1..3600 s is logged as the cause, the node starts with shipping off, and writes
     ship nothing. R28-P1 is the control: the same writes ship with the interval inside the range."""
     async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=seal, **SMALL_SEGMENTS) as p:
         log = await manager.server_open_log(server_id=p.server.server_id)
@@ -113,7 +113,7 @@ async def test_a_seal_interval_outside_the_range_keeps_shipping_off(manager: Scy
 
 @needs_phase('ep.3')
 async def test_seal_interval_defaults_to_60(manager: ScyllaClusterManager, s3_storage):
-    """R28-P3: LVL-1. A node that doesn't set the seal interval reports 60 in system.config."""
+    """R28-P3: A node that doesn't set the seal interval reports 60 in system.config."""
     async with pitr_node(manager, s3_storage, shipping=False) as p:
         rows = await p.cql.run_async("SELECT value FROM system.config WHERE name = 'pitr_seal_interval_in_seconds'")
         assert [r.value for r in rows] == ['60']
@@ -127,7 +127,7 @@ def one_kib_per_shard():
 
 @needs_phase('ep.3')
 async def test_the_timer_seals_a_partly_filled_segment(manager: ScyllaClusterManager, s3_storage):
-    """R28-P4: LVL-1. With the default segment size and a 1 s seal interval, one 1 KiB write on each shard, then a small write on
+    """R28-P4: With the default segment size and a 1 s seal interval, one 1 KiB write on each shard, then a small write on
     each shard at every poll (a shard seals when a write finds the segment due), puts a segment in the bucket within 5 s, so
     the timer and not a rollover closed it. The control is the next test."""
     async with pitr_node(manager, s3_storage) as p:

@@ -7,7 +7,7 @@
 
 """What the test_pitr_*.py tests share: the adapter to the feature's surface, setup, statements and a store that can fail.
 
-The tests are black box, written from docs-work/requirements-must.md and the slim plan, docs-work/test-plan-slim.md (issue #22).
+The tests are black box, written from the PITR requirements and the QA test plan (issue #22; the rest of it: #143).
 They use only what an operator has: CQL, REST, nodetool, configuration, the bucket, and starting or killing the node.
 
 Each test is skipped until the product pieces it needs have landed: add them to LANDED_PHASES to enable it. A skipped test proves nothing.
@@ -42,10 +42,10 @@ from test.pylib.util import unique_name, wait_for
 
 logger = logging.getLogger(__name__)
 
-# The product pieces the tests wait for (docs-work/test-plan-slim.md, section 2):
+# The product pieces the tests wait for:
 #   ep.3    the replay_to endpoint fetches and replays the history and ends in a minimal `done` (with ep.1 and ep.2 before it)
 #   st.1    the status GET (#14)
-#   15-bc   the refusals 15-b and 15-c, with the P68 messages
+#   15-bc   the refusals 15-b and 15-c, with their messages
 #   12-2.2  the upload-finished marker of a backup
 # Add a piece here when it lands, to enable the tests that need it.
 LANDED_PHASES: tuple[str, ...] = ('ep.3',)
@@ -64,8 +64,14 @@ def needs_phase(*phases: str):
     missing = [p for p in phases if not landed(p)]
     if not missing:
         return lambda test: test
-    return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/22",
-                                reason=f"PITR pieces {', '.join(missing)} haven't landed")
+    # skip_bug needs a literal link (test/pylib_test/test_skip_bug_links.py), so the first missing piece picks the branch. The
+    # unbuilt refusals and the backup marker have no product issue of their own: #143 stands in for them.
+    reason = f"PITR pieces {', '.join(missing)} aren't built in this release"
+    if missing[0] == 'st.1':
+        return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/14", reason=reason)
+    if missing[0] in ('15-bc', '12-2.2'):
+        return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/143", reason=reason)
+    return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/22", reason=reason)
 
 
 @pytest.fixture(autouse=True)
@@ -137,17 +143,17 @@ class Reason:
 
 
 KNOWN_REASONS = tuple(v for k, v in vars(Reason).items() if not k.startswith('_'))
-# The history between the backup and T is damaged or has a gap (REF-4).
+# The history between the backup and T is damaged or has a gap.
 HISTORY_DAMAGED = {Reason.RECORDS_MISSING, Reason.RECORDS_DAMAGED, Reason.SEGMENT_MISSING, Reason.SEGMENT_DAMAGED}
 
-# RTN-1, verbatim: requirements-must.md.
+# The wrong-way-back warning, verbatim, as the README gives it.
 WRONG_WAY_BACK = ("Don't load this copy's files into the original unless it's been truncated: "
                   "later deletes in the original still win, and rows stay missing with no error.")
 # The line the node logs when a replay ends in `done` (db/pitr/replay_to.cc, format_replay_result). Tasks carry no success text
 # (#100), so the log is where the result is.
 RESULT_MARK = 'is done: restored from backup'
 PAST_COVERAGE_WORDS = ['lag']
-# P68 (PM-67): the refusal on a done table says where the result was written.
+# The refusal on a done table says where the result was written.
 RESULT_LOGGED_WORDS = ['log']
 # A shipped segment's object key is <prefix>/<host id>/<shard>/<chain>/segments/<file name>.
 SEGMENT_KEY_RE = re.compile(r'/(\d+)/([^/]+)/segments/(\S+)$')
@@ -165,7 +171,7 @@ class Outcome:
 
 @dataclass
 class Status:
-    """The node's PITR status (STA-1 as changed by P68): shipping state, covered-through, usable backups, `incomplete` tables."""
+    """The node's PITR status: shipping state, covered-through, usable backups, `incomplete` tables."""
     state: str
     break_cause: str | None
     covered_through_us: int | None
@@ -267,7 +273,7 @@ def target_statement(schema_cql: str, ks: str, target: str) -> str:
 VNODES_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'enabled': false}"
 PURGEABLE_OPTIONS = "WITH gc_grace_seconds = 0 AND tombstone_gc = {'mode': 'immediate'}"
 DEADLINE_SECONDS = int(os.environ.get('PITR_DEADLINE_SECONDS', 300))
-# The VM's clock steps by up to about 150 ms (docs-work/baseline.md:115-116), so a comparison between a time
+# The VM's clock steps by up to about 150 ms (measured on the dev VM), so a comparison between a time
 # measured here and one reported by the node has this margin.
 CLOCK_MARGIN_US = 1_000_000
 STEP_US = 1000
@@ -295,7 +301,7 @@ def iso_times(text: str) -> list[int]:
 
 
 def latest_restorable(outcome: Outcome, t: int) -> int:
-    """The latest restorable time a REF-5 refusal of T states: the latest time in its message below T. The message may
+    """The latest restorable time a refusal of a T past coverage states: the latest time in its message below T. The message may
     repeat T, which is never restorable, so T and anything after it don't count."""
     below = [x for x in iso_times(outcome.message) if x < t]
     assert below, f'a refusal past coverage must state the latest restorable time: {outcome}'
@@ -563,7 +569,7 @@ def change_statements(pks, base) -> tuple[list, dict[str, int]]:
 
 
 def collection_edge_statements(pks, seed_ts, base) -> tuple[list, list, dict[str, int]]:
-    """The cases limit 3 names, one row each. ck 0: a collection overwrite. ck 1: an empty overwrite. ck 2: a delete batched with an
+    """The cases README limit 4 names, one row each. ck 0: a collection overwrite. ck 1: an empty overwrite. ck 2: a delete batched with an
     element 1 microsecond later. ck 3 and ck 4: a batch that overwrites its own cell, and its own collection element."""
     ts = {'overwrite': base + 1000, 'empty': base + 2000, 'delete': base + 3000, 'added': base + 3001, 'low': base + 4000, 'high': base + 5000}
     seed, changes = [], []
@@ -697,7 +703,7 @@ async def run_status_commands(manager, server, commands):
 
 
 async def assert_acked_writes_present(cql, ks, table, writers, t, seeded) -> dict[int, int]:
-    """The promise in SHP-7: no T gives done while missing writes acknowledged before coverage. A write
+    """The promise: no T gives done while missing writes acknowledged before coverage. A write
     acknowledged after coverage, or never, may be present or absent. Returns the writes that had to be there."""
     rows = await cql.run_async(f'SELECT pk, WRITETIME(v) AS writetime_v FROM {ks}.{table}')
     present = {r.pk: r.writetime_v for r in rows}
@@ -1089,7 +1095,7 @@ class Pitr:
         return status.incomplete
 
     async def assert_nothing_loaded(self, target):
-        """P52: replay loads the backup itself, so a refusal after the load leaves rows. Nothing loaded means the target
+        """Replay loads the backup itself, so a refusal after the load leaves rows. Nothing loaded means the target
         reads empty, and status doesn't list it `incomplete`."""
         assert await read_all(self.cql, self.ks, target) == [], f'a refusal must leave {target} empty'
         incomplete = await self.incomplete()
@@ -1119,7 +1125,7 @@ class Pitr:
         return outcome, target
 
     async def pulse(self):
-        """One write on every shard, to a table of its own, so that every shard's coverage moves. P62: an idle shard stops it."""
+        """One write on every shard, to a table of its own, so that every shard's coverage moves. An idle shard stops it (README limit 10)."""
         if not self._pulse_pks:
             await self.cql.run_async(f'CREATE TABLE IF NOT EXISTS {self.ks}.pulse (pk int PRIMARY KEY, v bigint)')
             self._pulse_pks = keys_on_every_shard(1, 10_000)
