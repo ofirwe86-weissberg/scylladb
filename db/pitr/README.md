@@ -14,10 +14,10 @@ against node or disk loss.
 
 **Status: experimental, not for production.** A restore of one table to T
 runs end to end, but some refusals this README lists aren't built, so some
-restores report `done` on wrong data (limits 1, 16, 17 and 19). A deleted
-row can also come back with `done`, on default settings too (limit 38). A
-restore from encrypted segments hasn't been tested (limit 11). A full
-re-review of the restore path is open (#92). See
+restores report `done` on wrong data (limits 1, 16, 17, 19 and 34). A
+deleted row can also come back with `done`, on default settings too
+(limit 38). A restore from encrypted segments hasn't been tested
+(limit 11). A full re-review of the restore path is open (#92). See
 [Implementation status](#implementation-status-2026-11-09).
 
 ## How it works
@@ -472,16 +472,17 @@ more.
     rule that clears only unfinished multipart uploads is safe.
 34. Most damage to a segment on the node's own disk, before it is shipped,
     is found only at restore, which then refuses times past the damage: a
-    size other than the recorded one, a file cut or unreadable, a zeroed,
-    foreign or wrong-segment header, and a sector whose checksum doesn't
-    match. One kind isn't detected: an all-zero sector inside the used
-    bytes of a segment whose header is intact. The read skips the
-    checksum of an all-zero sector, so the restore can end that segment
-    early, leave a hole with the entries after it still applied, or apply
-    a mutation assembled across the hole, and still report `done` (#150).
-    The upload CRC doesn't catch it, because it is computed over the
-    bytes as uploaded, damage included. It is rare: it takes a zeroed
-    4 KiB sector within a segment's used bytes.
+    size other than the recorded one, a file cut, a file that can't be
+    opened (but see limit 39), a zeroed, foreign or wrong-segment header,
+    and a sector whose checksum doesn't match. One kind isn't detected:
+    an all-zero sector inside the used bytes of a segment whose header is
+    intact. The read skips the checksum of an all-zero sector, so the
+    restore can end that segment early, leave a hole with the entries
+    after it still applied, or apply a mutation assembled across the
+    hole, and still report `done` (#150). The upload CRC doesn't catch
+    it, because it is computed over the bytes as uploaded, damage
+    included. It is rare: it takes a zeroed 4 KiB sector within a
+    segment's used bytes.
 35. A lower seal interval gives fresher protection, but memtable flushes
     come sooner, even at low load.
 36. The order of `fsync` calls before `done` will not be covered by the
@@ -511,7 +512,10 @@ more.
     compacting reader that may purge any collectable tombstone, which the
     target's disabled compaction (limit 25) doesn't cover, so a tombstone
     still in the backup can be dropped as it is loaded and an older write
-    replayed over it brings the row back. On protected tables, set
+    replayed over it brings the row back. That reader also needs
+    `enable_compacting_data_for_streaming_and_repair`, which is on by
+    default. It purges by the target's own `tombstone_gc`, so the safe
+    path below covers this trigger as well. On protected tables, set
     `tombstone_gc = {'mode': 'timeout'}` and keep `gc_grace_seconds` at
     its default of 10 days. What matters is how far the backup's replay
     start can lag behind the backup, not the backup interval alone: the
@@ -529,9 +533,12 @@ more.
     The reader reads the copy through `commitlog::read_log_file`, which
     opens it through the commitlog's own error handler
     (`commit_error_handler`), so a read error on that copy raises the
-    commitlog's disk-error signal and the node acts on it under its
-    commit failure policy (#149). Fixing it needs the commitlog read path
-    to take an error handler of its own.
+    commitlog's disk-error signal, and the node shuts down its client and
+    inter-node transport until an operator intervenes (#149).
+    `commit_failure_policy` doesn't change this: the option is unused,
+    and the signal is always wired to the isolation path. Any I/O error
+    other than a missing or already-existing file does it. Fixing it
+    needs the commitlog read path to take an error handler of its own.
 
 ## Implementation status (2026-11-09)
 
