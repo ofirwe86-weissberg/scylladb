@@ -565,8 +565,8 @@ restore is called usable in production.
   CQL, REST, nodetool, configuration, the bucket, and starting or killing
   the node.
 - Of the tests in those files, the 30 that cover the feature's seven core
-  requirements each ran 100 of 100, or 20 of 20 for the slower ones,
-  which kill or restart the node or interrupt a backup, with no failure.
+  requirements each ran 100 of 100, or 20 of 20 for the slower ones: the
+  kill, restart, interrupted-backup and shipping tests, with no failure.
   The files hold further tests that ran 5 of 5 or 10 of 10 and have not
   been reviewed or run 100 of 100. One of those is an expected failure
   (`xfail`): the `done` result carries no warning against loading the
@@ -574,15 +574,16 @@ restore is called usable in production.
   text (#100, #102).
 - A black-box test stays skipped until every product piece it needs is
   listed in `LANDED_PHASES` in `pitr_util.py`, which holds `ep.3`, the
-  `replay_to` endpoint. Still skipped are the idle-shard refusal and the
-  refusal of a `TRUNCATE` before the backup, which wait on refusals that
-  aren't built (limit 16); the schema-change refusal, which waits on
-  those and on the status GET (limit 17, #14); the refusal of a backup
-  whose upload didn't finish, which waits on the marker of #12; and
-  `incomplete` and a durable `done` across a kill, which wait on the
-  status GET (#14). The test for a `TRUNCATE` after the backup is marked
-  on #15, and the one for a purged tombstone on #126 (limit 38). Most
-  tests that take a requirement as written, ignoring today's limits,
-  aren't written yet.
+  `replay_to` endpoint. Still skipped are the idle-shard refusal, which
+  waits on a refusal that names the idle shard (see [RPO](#rpo), "An
+  idle shard"); the refusal of a `TRUNCATE` before the backup, which
+  waits on a refusal that isn't built (limit 16); the schema-change
+  refusal, which waits on that and on the status GET (limit 17, #14);
+  the refusal of a backup whose upload didn't finish, which waits on the
+  marker of #12; and `incomplete` and a durable `done` across a kill,
+  which wait on the status GET (#14). The test for a `TRUNCATE` after the
+  backup is marked on #15, and the one for a purged tombstone on #126
+  (limit 38). Most tests that take a requirement as written, ignoring
+  today's limits, aren't written yet.
 - No running node test covers the other refused table kinds, two nodes,
   encryption, `durable_writes` or the outage latch.
