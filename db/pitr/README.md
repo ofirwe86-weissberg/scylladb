@@ -17,10 +17,11 @@ runs end to end. It is exact, or refuses, for an ordinary table (no
 counters, views, indexes or CDC; `durable_writes` on) on one node (RF 1,
 vnodes), with no `TRUNCATE`, schema change or bulk load (refresh,
 load-and-stream) on the source since the backup, a T at or after the
-backup's snapshot time, the table's own backup, server-side timestamps (or
-`tombstone_gc` mode `timeout`, with
-`enable_tombstone_gc_for_streaming_and_repair` off), and a T not exactly
-on a non-frozen collection or UDT change; TTL isn't rewound (limit 6).
+backup's snapshot time, the table's own backup, server-side timestamps or
+`tombstone_gc` mode `timeout` (with the default 10-day
+`gc_grace_seconds`), and `enable_tombstone_gc_for_streaming_and_repair`
+off, and a T not exactly on a non-frozen collection or UDT change; TTL
+isn't rewound (limit 6).
 Outside that it can report `done` on wrong data (limits 1, 4, 7, 8, 9, 12,
 16, 17, 19, 31 and 38); a rare undetected zeroed disk sector (limit 34)
 can do so even inside it. Encrypted segments are untested (limit 11). The
@@ -578,7 +579,7 @@ A restore of one table to T runs end to end, and the slim-core node
 tests of the core requirements pass on the merged code (#84). The
 full-level re-review of the restore path (#92) is done: its README
 findings are limits 34, 38 and 39, and the rest are filed as issues
-(#148-#152).
+(#148, #151, #152, and notes on #88 and #110).
 
 **Not built yet:**
 - the table-kind, `durable_writes` and one-node/RF refusals (#15);
