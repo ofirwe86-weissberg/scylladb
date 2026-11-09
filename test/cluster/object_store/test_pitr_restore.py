@@ -165,11 +165,11 @@ async def test_a_major_compaction_asked_during_the_replay_never_gives_done_with_
 @needs_phase('ep.3')
 async def test_enabling_compaction_during_the_replay_fails_the_restore(manager: ScyllaClusterManager, gated_store):
     """R08-P3: RST-3. Auto-compaction is enabled on the target while the replay is held. The restore must fail and never report
-    done, the deleted row stays out, and the message names the compaction. The refusal has no reason code of its own yet (#111),
-    so the reason isn't asserted (decision D2, provisional)."""
+    done, the deleted row stays out, the reason is `target_compaction_during_replay` (#111) and the message names the compaction."""
     outcome, refused = await compaction_asked_during_replay(manager, gated_store, 'alter_compaction_enabled')
     assert refused is None, f'the ALTER must go through, or the test shows nothing: {refused}'
     assert outcome.state == FAILED, f'enabling compaction during the run must fail it: {outcome}'
+    assert outcome.reason == Reason.TARGET_COMPACTION_DURING_REPLAY, f'the failure carries its own reason code: {outcome}'
     assert 'compaction' in outcome.message.lower(), f'the failure must name the compaction: {outcome}'
 
 

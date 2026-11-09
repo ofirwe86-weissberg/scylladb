@@ -118,6 +118,7 @@ class Reason:
     TARGET_NOT_EMPTY = 'target_not_empty'
     TARGET_SCHEMA_DIFFERS = 'target_schema_differs'
     TARGET_AUTO_COMPACTION = 'target_auto_compaction_enabled'
+    TARGET_COMPACTION_DURING_REPLAY = 'target_compaction_during_replay'
     TARGET_ALREADY_REPLAYED = 'target_already_replayed'
     BACKUP_FILE_MISSING = 'backup_file_missing'
     BOUND_FILE_DAMAGED = 'bound_file_damaged'
@@ -129,8 +130,7 @@ class Reason:
     SEGMENT_MISSING = 'shipped_object_missing'
     SEGMENT_DAMAGED = 'shipped_object_damaged'
     # Proposed: no real code exists yet for these. They need 15-b/c (TRUNCATE, schema change) and 12-2.2 (upload unfinished),
-    # which aren't built (their tests are untouched). Change the spelling here when the piece lands and names its code. A compaction during a replay has no
-    # code either: T3 accepts any real one.
+    # which aren't built (their tests are untouched). Change the spelling here when the piece lands and names its code.
     TRUNCATED = 'source_truncated'
     SCHEMA_CHANGED = 'source_schema_changed'
     BACKUP_UNFINISHED = 'backup_upload_unfinished'

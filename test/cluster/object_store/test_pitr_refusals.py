@@ -42,8 +42,6 @@ def assert_states_coverage(outcome, t):
     return latest
 
 
-@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/112",
-                      reason="the S3 metrics are registered twice with two endpoints on one node (#112)")
 async def test_t_past_coverage_is_refused_while_writes_wait_to_ship(manager: ScyllaClusterManager, gated_store, s3_storage):
     """T4 (a): REF-5, P68. Shipping goes through the gate and the backup around it. The gate holds every upload, below
     pitr_unshipped_limit_in_mb, so writes are acknowledged and not shipped. Control: let the uploads go, and the same target
