@@ -29,7 +29,7 @@ U_ALLOWANCE_US = 3_000_000
 
 @needs_phase('ep.3')
 async def test_kill_never_gives_done_missing_acked_writes(manager: ScyllaClusterManager, s3_storage):
-    """T9: SHP-7, REF-5. A writer on both shards records each acknowledgement, and the node is killed under it. The latest
+    """T9: A writer on both shards records each acknowledgement, and the node is killed under it. The latest
     restorable time L comes from a refusal. Replay to L has every acknowledged write at or below L, and L + 1 is refused."""
     async with pitr_node(manager, s3_storage) as p:
         await p.write(simple_rows(SEEDED, old_ts()))
@@ -81,7 +81,7 @@ async def replay_setup(p):
 
 @needs_phase('ep.3', 'st.1')
 async def test_unfinished_replay_shows_incomplete_across_a_kill(manager: ScyllaClusterManager, gated_store):
-    """T10 (a): RST-12, limit 12, STA-1. The replay is held after it read the backup and before it read the history, and the
+    """T10 (a): The replay is held after it read the backup and before it read the history, and the
     node is killed there. Status lists the target `incomplete` before and after the restart, and other tables read the same."""
     async with pitr_node(manager, gated_store) as p:
         t, _ = await replay_setup(p)
@@ -107,7 +107,7 @@ async def test_unfinished_replay_shows_incomplete_across_a_kill(manager: ScyllaC
 
 @needs_phase('ep.3', 'st.1')
 async def test_done_is_durable_across_a_kill(manager: ScyllaClusterManager, s3_storage):
-    """T10 (b): RST-12, RST-7, limits 12 and 28, REF-13, STA-1, P68. The node is killed right after `done`. The target reads as
+    """T10 (b): The node is killed right after `done`. The target reads as
     before, isn't `incomplete`, and a second replay on it is refused, saying where the result was logged."""
     async with pitr_node(manager, s3_storage) as p:
         t, writes = await replay_setup(p)

@@ -38,7 +38,7 @@ PURGEABLE_SCHEMA = f'{TABLE_SCHEMA} {PURGEABLE_OPTIONS}'
 
 @needs_phase('ep.3')
 async def test_restore_is_exact_at_t_on_every_shard(manager: ScyllaClusterManager, s3_storage):
-    """T1: RST-1, RST-2, limit 26, RTN-1, P52. Every kind of change on every shard, writes 1 microsecond either side of T on one
+    """T1: Every kind of change on every shard, writes 1 microsecond either side of T on one
     cell and on different cells, one write near the largest mutation, then writes above T. Table u has the same keys."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
@@ -77,22 +77,22 @@ async def test_restore_is_exact_at_t_on_every_shard(manager: ScyllaClusterManage
 
 @(lambda test: test) if RUN_SKIPPED else pytest.mark.skip_bug(
     link='https://github.com/ofirwe86-weissberg/scylladb/issues/100',
-    reason='the result warning is a stated limit (README limit 3)')
+    reason='the result warning is a stated limit (README limits 3 and 13)')
 @needs_phase('ep.3')
 async def test_done_result_carries_the_wrong_way_back_warning(manager: ScyllaClusterManager, s3_storage):
-    """RTN-1, verbatim, in the result. A stated limit today (#100)."""
+    """The wrong-way-back warning, verbatim, in the result. A stated limit today (#100)."""
     async with pitr_node(manager, s3_storage) as p:
         await p.write(simple_rows([1], old_ts()))
         await p.backup()
         t = now_us()
         await p.covered(t + 1_000_000)
         outcome, _ = await p.replay_done(t)
-        assert WRONG_WAY_BACK in outcome.result_text, f'the result must carry RTN-1 verbatim: {outcome}'
+        assert WRONG_WAY_BACK in outcome.result_text, f'the result must carry the warning verbatim: {outcome}'
 
 
 @needs_phase('ep.3')
 async def test_deleted_row_stays_deleted(manager: ScyllaClusterManager, s3_storage):
-    """T2: RST-3. Row A is purged, with its tombstone, before the backup. Row B is in the backup and deleted after it at D, and
+    """T2: Row A is purged, with its tombstone, before the backup. Row B is in the backup and deleted after it at D, and
     row C is deleted at D2 > T. C is the control: it shows the test can see a row."""
     a, b, c = 1, 2, 3
     async with pitr_node(manager, s3_storage, schema=PURGEABLE_SCHEMA) as p:
@@ -157,7 +157,7 @@ async def compaction_asked_during_replay(manager, gated_store, compaction):
 
 @needs_phase('ep.3')
 async def test_a_major_compaction_asked_during_the_replay_never_gives_done_with_a_row_back(manager: ScyllaClusterManager, gated_store):
-    """R08-P2: RST-6, RST-3, P52. A `nodetool compact` of the target while the replay is held. The request may be refused or the
+    """R08-P2: A `nodetool compact` of the target while the replay is held. The request may be refused or the
     run may fail: either way the deleted row stays out and `done` is never reported after a compaction ran."""
     outcome, _ = await compaction_asked_during_replay(manager, gated_store, 'nodetool_compact')
     if outcome.state == FAILED:
@@ -166,7 +166,7 @@ async def test_a_major_compaction_asked_during_the_replay_never_gives_done_with_
 
 @needs_phase('ep.3')
 async def test_enabling_compaction_during_the_replay_fails_the_restore(manager: ScyllaClusterManager, gated_store):
-    """R08-P3: RST-3. Auto-compaction is enabled on the target while the replay is held. The restore must fail and never report
+    """R08-P3: Auto-compaction is enabled on the target while the replay is held. The restore must fail and never report
     done, the deleted row stays out, the reason is `target_compaction_during_replay` (#111) and the message names the compaction."""
     outcome, refused = await compaction_asked_during_replay(manager, gated_store, 'alter_compaction_enabled')
     assert refused is None, f'the ALTER must go through, or the test shows nothing: {refused}'
@@ -177,7 +177,7 @@ async def test_enabling_compaction_during_the_replay_fails_the_restore(manager: 
 
 @needs_phase('ep.3')
 async def test_restore_reports_done_and_leaves_the_source_untouched(manager: ScyllaClusterManager, s3_storage):
-    """R06-P1: RST-1. Rows Y are written on every shard after the backup. Then one Y partition is deleted at a timestamp above T
+    """R06-P1: Rows Y are written on every shard after the backup. Then one Y partition is deleted at a timestamp above T
     and the delete, with its tombstone, is purged from the source. A replay that wrote into the source would bring that partition
     back, as last-write-wins hides nothing. The restore ends `done`, the target holds all of Y, and the source is as it was."""
     pks = keys_on_every_shard(4)
@@ -212,7 +212,7 @@ async def test_restore_reports_done_and_leaves_the_source_untouched(manager: Scy
 
 @needs_phase('ep.3')
 async def test_a_t_between_two_backups_restores_exactly_from_the_earlier_one(manager: ScyllaClusterManager, s3_storage):
-    """R21-S1: L3's safe path. T is after backup 1 and before backup 2, so the restore names backup 1. It holds the seed and A
+    """R21-S1: T is after backup 1 and before backup 2, so the restore names backup 1. It holds the seed and A
     and not B. The backup-2 control shows only that B is reachable from backup 2, so the absence of B comes from naming backup 1."""
     pks = keys_on_every_shard(2)
     async with pitr_node(manager, s3_storage) as p:
@@ -244,7 +244,7 @@ async def test_a_t_between_two_backups_restores_exactly_from_the_earlier_one(man
 
 @needs_phase('ep.3')
 async def test_after_a_truncate_a_restart_and_a_new_backup_restore_exactly(manager: ScyllaClusterManager, s3_storage):
-    """R18-S1: L7's safe path (README 16). R is written and shipped, then the table is truncated. After a restart, a new backup
+    """R18-S1: the safe path of README limit 16. R is written and shipped, then the table is truncated. After a restart, a new backup
     and a replay from it give S and U and no R. Controls: R's segments reach the bucket before the truncate, and the restart
     starts a new chain directory while the old chain's segments stay."""
     r_pks, s_pks, u_pks = keys_on_every_shard(2, 100), keys_on_every_shard(2, 200), keys_on_every_shard(2, 300)
@@ -298,7 +298,7 @@ async def shipped_segments(storage):
 
 @needs_phase('ep.3')
 async def test_writes_on_every_shard_come_back_from_the_shipped_history(manager: ScyllaClusterManager, s3_storage):
-    """R01-P1: SHP-1. 8 keys on each shard are written after the backup and reach the target only through the shipped history.
+    """R01-P1: 8 keys on each shard are written after the backup and reach the target only through the shipped history.
     Control: a second target one microsecond below the rows' timestamp (after the backup) holds the seed and none of the rows."""
     # Not from 100: seed_statements also writes pk + 100 for each seed key.
     pks = keys_on_every_shard(8, 1000)
@@ -321,7 +321,7 @@ async def test_writes_on_every_shard_come_back_from_the_shipped_history(manager:
 
 @needs_phase('ep.3')
 async def test_keys_owned_by_every_shard_read_back_from_the_target(manager: ScyllaClusterManager, s3_storage):
-    """R06-P2: RST-1. 16 keys per shard are in the backup and 16 more per shard are written after it, so the replay has to apply
+    """R06-P2: 16 keys per shard are in the backup and 16 more per shard are written after it, so the replay has to apply
     each to the shard that owns it. A key applied to the wrong shard reads as missing."""
     seed_pks, after_pks = keys_on_every_shard(16), keys_on_every_shard(16, 1000)
     async with pitr_node(manager, s3_storage) as p:
@@ -340,7 +340,7 @@ async def test_keys_owned_by_every_shard_read_back_from_the_target(manager: Scyl
 
 @needs_phase('ep.3')
 async def test_the_readme_quick_start_run_literally_gives_an_exact_copy(manager: ScyllaClusterManager, s3_storage):
-    """R06-P3: RST-1, PM-82. README Quick start, step by step: nodetool snapshot and backup, a write X, the target from the
+    """R06-P3: README Quick start, step by step: nodetool snapshot and backup, a write X, the target from the
     backup's schema.cql, curl to replay_to, `nodetool tasks wait`, then compaction turned on. The README has no way to wait for
     coverage, so the test uses the helper's probe for that step. Two steps stand in for the literal ones: `create_target` does the
     README's edit of schema.cql in Python, and `curl` is the host's, run as a subprocess. Control: the same T through the helper
@@ -381,7 +381,7 @@ async def test_the_readme_quick_start_run_literally_gives_an_exact_copy(manager:
 
 @needs_phase('ep.3')
 async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(manager: ScyllaClusterManager, s3_storage):
-    """R06-S1: L14's boundary. Every kind of change is written on every shard before the backup, and they are in the shipped history
+    """R06-S1: Every kind of change is written on every shard before the backup, and they are in the shipped history
     too, so the replay applies them a second time on top of the backup. Among them is a write issued after a newer one but with an
     older timestamp, so a replay that let the last applied write win would show it. The target must equal the answer at T, and the
     result line must count more applied writes than the post-backup ones, which shows the pre-backup writes were replayed. They
@@ -416,7 +416,7 @@ async def test_writes_before_the_backup_replayed_again_leave_the_target_exact(ma
 
 @needs_phase('ep.3')
 async def test_every_cell_kind_is_kept_at_t_and_dropped_one_microsecond_before(manager: ScyllaClusterManager, s3_storage):
-    """R07-P1: RST-2. Every kind of change (regular, static, map, set, deletes of cell, row, range and partition, a batch, a tie, a
+    """R07-P1: Every kind of change (regular, static, map, set, deletes of cell, row, range and partition, a batch, a tie, a
     TTL cell) at its own timestamp. For each one, replays to its timestamp T and to T-1 are exact. Control: the answers at T-1 and
     T differ for every stage but the tie (an insert and its delete at one timestamp show nothing), so each stage is seen. T-1 of
     the map overwrite is left out: README limit 4's collection edge."""
@@ -445,7 +445,7 @@ async def test_every_cell_kind_is_kept_at_t_and_dropped_one_microsecond_before(m
 @needs_phase('ep.3')
 @pytest.mark.parametrize('kind', ['row', 'range', 'partition'])
 async def test_a_delete_at_exactly_t_lands(manager: ScyllaClusterManager, s3_storage, kind):
-    """R07-P2: RST-2. Rows on every shard are written after the backup and then deleted at ts1. A replay to ts1 has the delete
+    """R07-P2: Rows on every shard are written after the backup and then deleted at ts1. A replay to ts1 has the delete
     applied and the rows gone. Control: a replay to ts1-1 still has them."""
     pks = keys_on_every_shard(2, 1000)
     where = {'row': 'ck = 1', 'range': 'ck >= 1 AND ck < 3', 'partition': None}[kind]
@@ -472,7 +472,7 @@ async def test_a_delete_at_exactly_t_lands(manager: ScyllaClusterManager, s3_sto
 
 @needs_phase('ep.3')
 async def test_a_shipped_write_after_t_is_not_restored(manager: ScyllaClusterManager, s3_storage):
-    """R07-P3: RST-2. A is written at ta and B at tb above it, both after the backup and both shipped. A replay to ta has A and
+    """R07-P3: A is written at ta and B at tb above it, both after the backup and both shipped. A replay to ta has A and
     not B. Control: a replay to tb holds B, so B was in the shipped history."""
     a_pks, b_pks = keys_on_every_shard(2, 1000), keys_on_every_shard(2, 2000)
     async with pitr_node(manager, s3_storage) as p:
@@ -494,7 +494,7 @@ async def test_a_shipped_write_after_t_is_not_restored(manager: ScyllaClusterMan
 
 @needs_phase('ep.3')
 async def test_seeded_random_writes_and_deletes_match_the_computed_answer(manager: ScyllaClusterManager, s3_storage):
-    """R07-P4: RST-2. 200 random statements (inserts, updates, map and set elements, row, range and partition deletes, TTL cells, a
+    """R07-P4: 200 random statements (inserts, updates, map and set elements, row, range and partition deletes, TTL cells, a
     static column) over 16 keys at random timestamps, written out of timestamp order. Up to five replays (equal times collapse), to a
     statement's timestamp or one microsecond either side of it, each equal the answer computed on a reference table. The seed is fixed and logged. The
     statements avoid README limit 4's edge forms: no collection overwrite or empty, and no batch."""
@@ -586,7 +586,7 @@ async def test_at_a_collection_edge_t_the_result_counts_the_collection_as_not_ve
 
 @needs_phase('ep.3')
 async def test_a_delete_within_gc_grace_stays_deleted_after_the_source_compacts(manager: ScyllaClusterManager, s3_storage):
-    """R08-S1: L13's boundary. Partitions are deleted at ts2 and only then written at an older ts1, so only a delete that is kept,
+    """R08-S1: Partitions are deleted at ts2 and only then written at an older ts1, so only a delete that is kept,
     with timestamps respected, hides them. The source is flushed and compacted: the rows are gone and the tombstones kept (default
     gc_grace, and tombstone_gc `timeout`, as `repair` purges at once on a keyspace with one replica). The backup holds the
     tombstones and the shipped history holds both writes. The target must not have the rows back. Controls: the source's data
@@ -630,7 +630,7 @@ def chains_of(keys):
 
 @needs_phase('ep.3')
 async def test_after_a_restart_a_new_backup_restores_exactly(manager: ScyllaClusterManager, s3_storage):
-    """R01-S1: SHP-1, L10's safe path. A is written, the node restarts, B is written, and a new backup is taken, then C. The
+    """R01-S1: A is written, the node restarts, B is written, and a new backup is taken, then C. The
     replay from the new backup to C's last write gives the seed, A, B and C. Controls: the node logs that shipping starts a new
     chain after the restart, and a chain directory the first run didn't have appears in the bucket."""
     pks = keys_on_every_shard(2)
@@ -662,7 +662,7 @@ async def test_after_a_restart_a_new_backup_restores_exactly(manager: ScyllaClus
 
 @needs_phase('ep.3')
 async def test_a_t_after_a_restart_is_refused_from_the_earlier_backup(manager: ScyllaClusterManager, s3_storage):
-    """R01-S2: SHP-1, L10's boundary. A is written and covered, then the node restarts and B is written. A T at B's last write,
+    """R01-S2: A is written and covered, then the node restarts and B is written. A T at B's last write,
     from the backup taken before the restart, is refused as past coverage, the latest restorable time it states is before the
     restart, and no target is loaded. Control: A's last write from the same backup is done and exact."""
     pks = keys_on_every_shard(2)
@@ -695,7 +695,7 @@ async def test_a_t_after_a_restart_is_refused_from_the_earlier_backup(manager: S
 
 @needs_phase('ep.3')
 async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaClusterManager, s3_storage):
-    """R05-P1: SHP-5. A writer runs on both shards while the backup is taken. Every write acknowledged before T, with a margin,
+    """R05-P1: A writer runs on both shards while the backup is taken. Every write acknowledged before T, with a margin,
     is in the restore at T, whether it landed before or after the snapshot. Control: the writer had acknowledged writes before
     the backup started and went on acknowledging after it ended, so writes straddle the snapshot."""
     seeded = list(range(4))
@@ -722,7 +722,7 @@ async def test_writes_racing_the_backup_snapshot_all_come_back(manager: ScyllaCl
 
 @needs_phase('ep.3')
 async def test_a_backup_run_again_after_an_interrupted_one_restores_exactly(manager: ScyllaClusterManager, gated_store):
-    """R05-S1: SHP-5, L15's safe path. A backup cut part-way fails. The same snapshot, backed up again to a fresh prefix, is
+    """R05-S1: A backup cut part-way fails. The same snapshot, backed up again to a fresh prefix, is
     done, and a replay from it at the last write of X gives the source's rows. Controls: the first task failed with some of its
     objects uploaded and no manifest."""
     async with pitr_node(manager, gated_store, schema=UNCOMPRESSED_SCHEMA) as p:
