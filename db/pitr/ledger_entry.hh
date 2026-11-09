@@ -84,7 +84,7 @@ struct segment_entry {
     //
     // Restore needs it per entry: it is what tells the reader which entry
     // crosses T, so it can stop there instead of fetching and replaying every
-    // segment up to `head`, which on a long chain can be weeks past T.
+    // segment up to the chain's end, which on a long chain can be weeks past T.
     int64_t covered_through_us = 0;
     // Microseconds since the UNIX epoch, UTC, when this chain started, never
     // negative. It should match the `<chain_start_us>` in the entry's own key,
@@ -131,7 +131,7 @@ constexpr uint16_t ledger_format_version_1 = 1;
 //   12  the kind's own fields
 //   last 4 bytes: `utils::crc32` over everything before them
 //
-// Every ledger object has it, including `head`, so any reader can tell what it
+// Every ledger object has it, whatever its kind, so any reader can tell what it
 // is holding and whether it may read on, whoever wrote it.
 //
 // What keeps an old reader safe from a new kind: anything a reader must not
@@ -141,12 +141,11 @@ constexpr uint16_t ledger_format_version_1 = 1;
 // it and refuses it as an unknown kind rather than reading past it.
 constexpr size_t common_header_size = 12;
 
-// Kinds. A kind number is never reused, and `head` has one now even though its
-// fields arrive with the next piece, so no later kind can take the number.
+// Kinds. A kind number is never reused. 1 is the only kind written today.
 constexpr uint8_t object_kind_segment_entry = 1;
-// Reserved now; **`head`'s fields are not frozen yet.** Only its kind number
-// and the common header above are settled, and the piece that writes it is a
-// second freeze point.
+// Reserved and never written: the number was taken for a `head` object that the
+// design dropped, a restore probing `<sequence>.entry` keys instead. It stays
+// spent so no later kind can take it.
 constexpr uint8_t object_kind_head = 2;
 // 3 and up are unassigned; events (TRUNCATE, schema) take the next numbers.
 
@@ -187,8 +186,7 @@ constexpr size_t max_file_name_size = 255;
 //     is skipped alone;
 //   - a ledger object is copied as bytes and never re-encoded, so extension
 //     data written by a newer node survives an older node handling the object;
-//   - `head` takes the same area under the same rules when its fields are
-//     frozen.
+//   - a later kind takes the same area under the same rules.
 //
 // There is no fixed maximum entry size: decode requires the exact size
 // `124 + name_size + extension_size` and the general `max_ledger_object_size`
@@ -240,10 +238,12 @@ segment_entry decode_segment_entry(bytes_view);
 // Object keys.
 //
 //   entries:  <prefix>/<host_id>/<shard>/<chain>/<sequence>.entry
-//   head:     <prefix>/<host_id>/<shard>/<chain>/head
 //   segments: <prefix>/<host_id>/<shard>/<chain>/segments/<file_name>
 //
 // where <chain> is `<boot_epoch_us>-<chain_start_us>-<chain_uuid>`.
+//
+// A chain has no index object: a restore finds its end by probing
+// `<sequence>.entry` from 0 until a key is missing.
 //
 // Everything is under the chain, because sequences restart at 0 in a new chain
 // and a restart or an outage starts one: a flat layout would have the new
@@ -277,8 +277,8 @@ constexpr const char* entry_key_suffix = ".entry";
 constexpr const char* head_key_name = "head";
 constexpr const char* segments_key_component = "segments";
 
-// The chain a restore walks: one directory holding its entries, its `head` and
-// its segments. The prefix must not be empty, must not start or end in '/' and
+// The chain a restore walks: one directory holding its entries and its
+// segments. The prefix must not be empty, must not start or end in '/' and
 // must hold no empty, '.' or '..' component; neither time may be negative, as
 // it would not sort.
 struct chain_key_parts {
@@ -299,8 +299,8 @@ sstring chain_key_prefix(const chain_key_parts&);
 
 sstring entry_object_key(const chain_key_parts&, uint64_t sequence);
 
-// The one mutable object per chain: the last sequence and the covered-through
-// time. Buckets with object lock are therefore unsupported.
+// Nothing writes or reads this key: the chain carries no mutable object, so
+// this builder and its parser below have no caller left (#140).
 sstring head_object_key(const chain_key_parts&);
 
 sstring segment_object_key(const chain_key_parts&, std::string_view file_name);

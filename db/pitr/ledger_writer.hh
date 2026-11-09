@@ -65,12 +65,13 @@ struct ledger_retry_policy {
 // The caller guarantees what nothing here can check: an entry is written only
 // after its segment's upload was reported a success, and a chain's entries are
 // written in sequence order, one at a time. A write that gives up breaks the
-// chain - it ends at the last entry written, and shipping continues under a new
-// chain id. Giving up is `ledger_format_error` (a caller bug: an entry or
-// prefix no writer may produce, thrown before any store call), the policy
-// callback throwing, or an abort for a reason other than shutdown. A shutdown
-// abort needs no chain break here: the restart is itself the break, recorded
-// by the next boot, which starts a new chain.
+// chain - it ends at the last entry written, and the shipper stops shipping
+// until the node is restarted, the next boot starting a new chain. Giving up is
+// `ledger_format_error` (a caller bug: an entry or prefix no writer may
+// produce, thrown before any store call), the policy callback throwing, or an
+// abort for a reason other than shutdown. A shutdown abort needs no chain break
+// here: the restart is itself the break, recorded by the next boot, which starts
+// a new chain.
 future<> write_entry(sstables::object_storage_client& client, sstring bucket, sstring key_prefix, segment_entry entry, ledger_retry_policy policy,
         seastar::abort_source& as);
 
