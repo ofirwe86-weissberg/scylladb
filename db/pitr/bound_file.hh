@@ -69,8 +69,8 @@ struct shard_bound {
     // Where replay starts: at or below every write the snapshot's sstables do
     // not hold. See table::snapshot_sstables().
     db::replay_position bound;
-    // `none` when the shard had no chain, which is every shard until the
-    // shipper is wired in (#8, piece 2b).
+    // `none` when the shard had no chain at capture time, because PITR was off
+    // or the shipper had not started shipping on it yet.
     std::optional<shard_chain> chain;
 
     bool operator==(const shard_bound&) const = default;
