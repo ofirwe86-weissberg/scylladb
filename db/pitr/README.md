@@ -21,10 +21,10 @@ backup's snapshot time, the table's own backup, server-side timestamps or
 `tombstone_gc` mode `timeout` (with the default 10-day
 `gc_grace_seconds`), and `enable_tombstone_gc_for_streaming_and_repair`
 off, and a T not exactly on a non-frozen collection or UDT change; TTL
-isn't rewound (limit 6).
-Outside that it can report `done` on wrong data (limits 1, 4, 7, 8, 9, 12,
-16, 17, 19, 31 and 38); a rare undetected zeroed disk sector (limit 34)
-can do so even inside it. Encrypted segments are untested (limit 11). The
+isn't rewound (limit 6). Outside that it can report `done` on wrong data
+(limits 1, 4, 7, 8, 9, 12, 16, 17, 19, 31 and 38); a rare undetected
+zeroed disk sector (limit 34) can do so even inside it. Encrypted
+segments are untested (limit 11). The
 restore-path re-review (#92) is done; its README findings are limits 34,
 38 and 39. See
 [Implementation status](#implementation-status-2026-11-09).
