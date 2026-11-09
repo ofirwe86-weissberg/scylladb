@@ -418,9 +418,10 @@ more.
     less than one segment. The latch then trips on the first closed
     segment that hasn't been recorded yet, with the store healthy, and a
     restart trips it again until the shard has more memory or the
-    commitlog a larger share of it. Only the commitlog's line in the node
-    log at startup names the limit that applies; no metric or status
-    reports it (#88, future work).
+    commitlog a larger share of it. Before the latch trips, only the
+    commitlog's line in the node log at startup names the limit that
+    applies; the latch's own reason then names it in bytes. No metric or
+    status reports it (#88, future work).
 23. Stopping the node can wait about 30 s per shard while the store client
     gives up on an S3 credential lookup (#79).
 24. A restore needs disk space for the whole node's writes since the backup,
@@ -555,21 +556,28 @@ restore is called usable in production.
   its result line in the node log, the compaction hold, and a failure or
   an abort leaving the target `started`. `test_pitr_measure.py` is the
   measured run, skipped unless `PITR_MEASURE=1`.
-- **Black-box node tests,** 30 of them, merged on 2026-11-09 (#84), over
-  the feature's seven core requirements. They use only what an operator
-  has: CQL, REST, nodetool, configuration, the bucket, and starting or
-  killing the node. `test_pitr_restore.py` holds the restore, the T
-  filter and the deleted-row cases, `test_pitr_refusals.py` the refusals
-  and the bound file, `test_pitr_shipping.py` shipping off and the seal
-  interval with its range, and `test_pitr_failures.py` that a `kill -9`
-  never gives `done` with an acknowledged write missing. Each test ran
-  100 of 100, or 20 of 20 for the kill, restart and shipping tests, with
-  no failure.
-- Each black-box test stays skipped until every product piece it needs is
+- **Black-box node tests,** merged on 2026-11-09 (#84), in
+  `test_pitr_restore.py` (the restore, the T filter and the deleted-row
+  cases), `test_pitr_refusals.py` (the refusals and the bound file),
+  `test_pitr_shipping.py` (shipping off, and the seal interval with its
+  range) and `test_pitr_failures.py` (a `kill -9` never gives `done` with
+  an acknowledged write missing). They use only what an operator has:
+  CQL, REST, nodetool, configuration, the bucket, and starting or killing
+  the node.
+- Of the tests in those files, the 30 that cover the feature's seven core
+  requirements each ran 100 of 100, or 20 of 20 for the slower ones,
+  which kill or restart the node or interrupt a backup, with no failure.
+  The files hold further tests that ran 5 of 5 or 10 of 10 and have not
+  been reviewed or run 100 of 100. One of those is an expected failure
+  (`xfail`): the `done` result carries no warning against loading the
+  copy back into the original (limit 3), because a task has no success
+  text (#100, #102).
+- A black-box test stays skipped until every product piece it needs is
   listed in `LANDED_PHASES` in `pitr_util.py`, which holds `ep.3`, the
-  `replay_to` endpoint. Still skipped are the idle-shard refusal, the
-  refusal of a `TRUNCATE` before the backup and the schema-change
-  refusal, which wait on the refusals of #15; the refusal of a backup
+  `replay_to` endpoint. Still skipped are the idle-shard refusal and the
+  refusal of a `TRUNCATE` before the backup, which wait on refusals that
+  aren't built (limit 16); the schema-change refusal, which waits on
+  those and on the status GET (limit 17, #14); the refusal of a backup
   whose upload didn't finish, which waits on the marker of #12; and
   `incomplete` and a durable `done` across a kill, which wait on the
   status GET (#14). The test for a `TRUNCATE` after the backup is marked
