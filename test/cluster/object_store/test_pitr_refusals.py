@@ -7,7 +7,7 @@
 
 """PITR replay that must refuse, and never give `done`: T past coverage, damaged history, a TRUNCATE, a schema change and a
 backup whose upload didn't finish. Each test ends with its positive control, which flips the outcome to `done` in the same
-run, so that the refusal is shown to come from the condition and not from a broken setup. T4-T8 of docs-work/test-plan-slim.md
+run, so that the refusal is shown to come from the condition and not from a broken setup. T4-T8 of the QA test plan
 (issue #22)."""
 
 import asyncio
@@ -145,8 +145,8 @@ async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=())
     await assert_exact(p.cql, p.ks, target, [*kept, *later], later[-1].ts)
 
 
-@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/15",
-                      reason="L7: won't be implemented this release; implementable when replay reads the source's truncation record")
+@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/143",
+                      reason="the TRUNCATE refusal is not built in this release, README limit 16")
 async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
     """T6 (a): REF-10, limit 21, RST-4, P55/P74. Rows R written after the backup, then a TRUNCATE. T between R and the
     TRUNCATE is refused: replaying the history would bring R back. auto_snapshot is off, so nothing else keeps R."""

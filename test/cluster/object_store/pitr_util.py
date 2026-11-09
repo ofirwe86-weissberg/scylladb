@@ -7,7 +7,7 @@
 
 """What the test_pitr_*.py tests share: the adapter to the feature's surface, setup, statements and a store that can fail.
 
-The tests are black box, written from docs-work/requirements-must.md and the slim plan, docs-work/test-plan-slim.md (issue #22).
+The tests are black box, written from the PITR requirements and the QA test plan (issue #22; the rest of it: #143).
 They use only what an operator has: CQL, REST, nodetool, configuration, the bucket, and starting or killing the node.
 
 Each test is skipped until the product pieces it needs have landed: add them to LANDED_PHASES to enable it. A skipped test proves nothing.
@@ -42,13 +42,22 @@ from test.pylib.util import unique_name, wait_for
 
 logger = logging.getLogger(__name__)
 
-# The product pieces the tests wait for (docs-work/test-plan-slim.md, section 2):
+# The product pieces the tests wait for:
 #   ep.3    the replay_to endpoint fetches and replays the history and ends in a minimal `done` (with ep.1 and ep.2 before it)
 #   st.1    the status GET (#14)
 #   15-bc   the refusals 15-b and 15-c, with the P68 messages
 #   12-2.2  the upload-finished marker of a backup
 # Add a piece here when it lands, to enable the tests that need it.
 LANDED_PHASES: tuple[str, ...] = ('ep.3',)
+
+# The issue that tracks each piece that hasn't landed, which a skipped test links to.
+ISSUES_URL = 'https://github.com/ofirwe86-weissberg/scylladb/issues/'
+PHASE_ISSUES = {
+    'ep.3': ISSUES_URL + '22',
+    'st.1': ISSUES_URL + '14',
+    '15-bc': ISSUES_URL + '143',
+    '12-2.2': ISSUES_URL + '143',
+}
 
 # Each test must fail on a build without the change, so PITR_RUN_SKIPPED=1 runs every test as if its pieces had landed. With
 # PITR_DEADLINE_SECONDS=10 as well, a poll of an endpoint that doesn't exist gives up quickly. Neither is for normal runs.
@@ -64,8 +73,9 @@ def needs_phase(*phases: str):
     missing = [p for p in phases if not landed(p)]
     if not missing:
         return lambda test: test
-    return pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/22",
-                                reason=f"PITR pieces {', '.join(missing)} haven't landed")
+    # The first missing piece names the issue that tracks it.
+    return pytest.mark.skip_bug(link=PHASE_ISSUES[missing[0]],
+                                reason=f"PITR pieces {', '.join(missing)} aren't built in this release")
 
 
 @pytest.fixture(autouse=True)
@@ -267,7 +277,7 @@ def target_statement(schema_cql: str, ks: str, target: str) -> str:
 VNODES_KS = "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 1} AND tablets = {'enabled': false}"
 PURGEABLE_OPTIONS = "WITH gc_grace_seconds = 0 AND tombstone_gc = {'mode': 'immediate'}"
 DEADLINE_SECONDS = int(os.environ.get('PITR_DEADLINE_SECONDS', 300))
-# The VM's clock steps by up to about 150 ms (docs-work/baseline.md:115-116), so a comparison between a time
+# The VM's clock steps by up to about 150 ms (measured on the dev VM), so a comparison between a time
 # measured here and one reported by the node has this margin.
 CLOCK_MARGIN_US = 1_000_000
 STEP_US = 1000

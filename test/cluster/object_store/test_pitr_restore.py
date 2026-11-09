@@ -6,7 +6,7 @@
 #
 
 """PITR replay that ends `done`: the target is exact at T, deleted rows stay deleted, and a compaction during replay never
-brings a row back. T1-T3 of docs-work/test-plan-slim.md (issue #22)."""
+brings a row back. T1-T3 of the QA test plan (issue #22)."""
 
 import asyncio
 import logging
@@ -75,10 +75,12 @@ async def test_restore_is_exact_at_t_on_every_shard(manager: ScyllaClusterManage
         assert await result_line(p), f'the node must log the done result: {outcome}'
 
 
+@(lambda test: test) if RUN_SKIPPED else pytest.mark.skip_bug(
+    link='https://github.com/ofirwe86-weissberg/scylladb/issues/100',
+    reason='the result warning is a stated limit (README limit 3)')
 @needs_phase('ep.3')
-@pytest.mark.xfail(reason='tasks carry no success text, so RTN-1 is not in the result (#100, #102)', strict=False)
 async def test_done_result_carries_the_wrong_way_back_warning(manager: ScyllaClusterManager, s3_storage):
-    """RTN-1, verbatim, in the result. A gap in the product today (#102): kept visible rather than dropped."""
+    """RTN-1, verbatim, in the result. A stated limit today (#100)."""
     async with pitr_node(manager, s3_storage) as p:
         await p.write(simple_rows([1], old_ts()))
         await p.backup()

@@ -6,7 +6,7 @@
 #
 
 """PITR across a kill of the node: no `done` misses an acknowledged write, a `done` stays done, and an unfinished replay shows
-`incomplete`. T9 and T10 of docs-work/test-plan-slim.md (issue #22)."""
+`incomplete`. T9 and T10 of the QA test plan (issue #22)."""
 
 import asyncio
 import contextlib
