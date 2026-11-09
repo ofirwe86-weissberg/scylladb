@@ -8,9 +8,9 @@ undoing logical damage: a bad delete, a bad application release, a wrong
 update. It works by shipping the node's sealed commitlog segments to object
 storage (S3 or GCS) as they close, next to the sstable backups that
 `nodetool backup` already takes. A restore loads a backup into an empty table
-and then replays the shipped commitlog on top of it, up to T. The feature is
-experimental and limited to one node, replication factor 1, and vnode
-keyspaces. It does not protect against node or disk loss.
+and then replays the shipped commitlog on top of it, up to T. It is limited
+to one node, replication factor 1, and vnode keyspaces, and does not protect
+against node or disk loss.
 
 **Status: experimental, not for production.** A restore of one table to T
 runs end to end, but some refusals this README lists aren't built, so some
@@ -139,7 +139,7 @@ restart.
 | `pitr_bucket` | empty | Bucket shipping writes to |
 | `pitr_prefix` | `pitr` | Prefix of every shipped object, so one bucket can hold more than one node |
 | `pitr_seal_interval_in_seconds` | 60 | How often each shard seals its active segment. 1 to 3600 |
-| `pitr_unshipped_limit_in_mb` | 256 | Unshipped data held, in MiB, before shipping gives up on protection so writes keep succeeding. Must be above 0 |
+| `pitr_unshipped_limit_in_mb` | 256 | Unshipped data held on each shard, in MiB, before shipping gives up on protection so writes keep succeeding. 0 turns shipping off |
 
 Shipping is off while `pitr_endpoint` and `pitr_bucket` are both unset. With
 only one of them set, a value out of range, an unknown endpoint, more than
@@ -148,9 +148,14 @@ why. The commitlog clamps the limit it holds segments against to 3/4 of the
 lower of the shard's flush threshold and its share of
 `commitlog_total_space_in_mb`, so a store outage reaches the limit before it
 triggers memtable flushes or blocks writes. When the held segments reach
-that limit, the outage latch releases them and ends the chain (limit 22).
+that limit, the outage latch releases them and ends the chain. The clamp is
+not only a safety margin: on a shard with little memory it lands below one
+segment, and then the latch trips with the store healthy (limit 22). The
+commitlog logs the limit that applies at startup; the figures that line
+labels `MB` are MiB.
 
-The endpoint is configured as for backup and restore (`docs/dev/object_storage.md`):
+The endpoint is configured as for backup and restore
+(`docs/dev/object_storage.md`):
 
 ```yaml
 object_storage_endpoints:
@@ -216,7 +221,7 @@ either form.
 sealed and shipped, about S + U + 1 s after it (see [RPO](#rpo)). With the
 default S of 60 s, wait about a minute and a few seconds past T before
 step 4. There is no status report to ask yet (#14). Before then the replay
-is refused, and the task's error reads:
+is refused, and the task's error reads (one line, wrapped here):
 
 ```
 Point-in-time replay of ks.t_restored refused: t_past_coverage: T is
@@ -232,8 +237,9 @@ the time the refusal names. If covered-through doesn't move between
 retries, a shard gets no writes or shipping has stopped (limits 10, 21 and
 22): check the node log.
 
-T is UTC in ISO-8601, ending in an upper-case `Z`, with at most six fractional digits:
-`YYYY-MM-DDThh:mm:ss[.ffffff]Z`. Missing digits below the second count as zero.
+T is UTC in ISO-8601, ending in an upper-case `Z`, with at most six
+fractional digits: `YYYY-MM-DDThh:mm:ss[.ffffff]Z`. Missing digits below the
+second count as zero.
 
 ## RPO and RTO
 
@@ -339,7 +345,10 @@ more.
    - a delete batched with an element added 1 µs later can look like an
      overwrite, so at exactly the delete's T older deleted elements can
      reappear. The result counts such collections as not verified; a T
-     1 µs off avoids both cases;
+     1 µs off avoids both cases. Non-frozen user-defined types are
+     multi-cell and take the same path as collections, so overwriting one
+     as a whole has the same two shapes. Frozen collections and frozen
+     UDTs are single cells and aren't affected;
    - within one batch only the merged result exists: a T between its
      timestamps can't recover a value the batch itself overwrote.
 5. Covered-through is the capture time minus 1 s. A write appended to the
@@ -440,9 +449,12 @@ more.
     compaction let in during the run, `target_compaction_during_replay`), and a
     second replay into it is refused as `target_already_replayed`. Drop it
     and restore under a new name.
-29. One restore at a time. No dry run, and no alerting: the task's status
-    and the node log are the only signals until the status report is built
-    (#14).
+29. One restore at a time into one target: a second replay into a target one
+    is already running into is refused as `replay_already_running`. Replays
+    into different targets run side by side, and nothing bounds how many,
+    so they share the node's disk and store bandwidth. No dry run, and no
+    alerting: the task's status and the node log are the only signals until
+    the status report is built (#14).
 30. A large write can be stored across more than one segment. If it is
     incomplete in the history, it isn't applied, and the result gives an
     upper bound on how many there were. Any acknowledged one is still in
@@ -453,10 +465,11 @@ more.
     deleted. Nothing in the bucket is deleted automatically, and deleting
     shipped objects can break restores.
 33. Failed uploads can leave objects no restore uses, and you still pay for
-    them. In a chain that has stopped shipping (an earlier boot), a segment
-    object under `segments/` that no `<sequence>.entry` of that chain names,
-    or one named only by entries after a missing sequence number, is never
-    read. A store rule that clears only unfinished multipart uploads is safe.
+    them. In a chain that has stopped shipping, from an earlier boot or
+    broken earlier in this one (limit 21), a segment object under
+    `segments/` that no `<sequence>.entry` of that chain names, or one named
+    only by entries after a missing sequence number, is never read. A store
+    rule that clears only unfinished multipart uploads is safe.
 34. Damage to a segment on the node's own disk, before it is shipped, is
     found only at restore, which then refuses times past the damage.
 35. A lower seal interval gives fresher protection, but memtable flushes
@@ -485,13 +498,15 @@ more.
     {'mode': 'timeout'}` and keep `gc_grace_seconds` at its default of 10
     days. What matters is how far the backup's replay start can lag behind
     the backup, not the backup interval alone: the start can go back to
-    the oldest live commitlog segment, which stays live while any table on
-    the node has unflushed writes in it, or while shipping is held by a
-    store outage, so it can be hours or days old. A lower
+    the oldest live commitlog segment of the shard, which stays live while
+    any table on that shard has unflushed writes in it, or while shipping
+    is held by a store outage, so it can be hours or days old. A lower
     `gc_grace_seconds` must stay well above that lag plus the backup
-    interval. It also costs time: RTO grows with everything the node wrote
-    in that chain. In the 1 GB measured run, all 1.28 million writes were
-    replayed, about 80% of them already in the backup.
+    interval, and even the 10-day default is beaten by a store outage that
+    holds shipping for longer than it. It also costs time: RTO grows with
+    everything the node wrote in that chain. In the 1 GB measured run, all
+    1.28 million writes were replayed, about 80% of them already in the
+    backup.
 
 ## Implementation status (2026-11-09)
 
