@@ -22,8 +22,8 @@ backup's snapshot time, the table's own backup, server-side timestamps or
 `gc_grace_seconds`), and `enable_tombstone_gc_for_streaming_and_repair`
 off, a T not exactly on a non-frozen collection or UDT change, and a table
 that never had a column dropped (limit 17); TTL isn't rewound (limit 6).
-Outside that it can report `done` on wrong data
-(limits 1, 4, 7, 8, 9, 12, 16, 17, 19, 31 and 38); a rare undetected
+Outside that it can report `done` on wrong data (limits 1, 4, 7, 8, 9, 12,
+16, 17, 19, 31 and 38); a rare undetected
 zeroed disk sector (limit 34) can do so even inside it. Encrypted
 segments are untested (limit 11). The
 restore-path re-review (#92) is done; its README findings are limits 34,
@@ -410,13 +410,13 @@ more.
     after it, which means a node restart and a new backup.
 17. There is no schema-change refusal yet, and after a `DROP COLUMN` a new
     backup doesn't help. After an `ADD COLUMN`, a restore from a backup
-    taken after it is exact (measured 5 of 5). After a `DROP COLUMN` it
-    isn't: the replay starts below the backup's bound (limit 38), so it
-    re-applies the pre-drop writes to the dropped column, and a cell at or
-    below T in a column the target lacks fails the restore with
-    `target_schema_mismatch`, leaving the target `incomplete` (measured 5
-    of 5). From a backup taken before the drop, the same restore reports
-    `done` with the dropped column still holding the backup's values. So a
+    taken after it is exact (#156). After a `DROP COLUMN` it isn't: the
+    backup's bound sits lower than the backup needs (limit 38), so the
+    replay can re-apply pre-drop writes to the dropped column, and a cell
+    at or below T in a column the target lacks fails the restore with
+    `target_schema_mismatch`, leaving the target `incomplete` (#156). From
+    a backup taken before the drop, the same restore reports `done` with
+    the dropped column still present and holding its pre-drop values. So a
     table that ever had a column dropped can't be restored by this release
     (#156). For any other schema change, take a new backup after each
     change, and restore from one taken after the last change before T.
