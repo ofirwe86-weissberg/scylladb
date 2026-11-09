@@ -910,4 +910,15 @@ sstring format_replay_result(const replay_to_params& p, const replay_start& star
             stats.applier.cells_not_verified, stats.incomplete_split_writes);
 }
 
+refusal compaction_during_replay_refusal(const replay_to_params& p, std::string_view stage) {
+    return refusal{
+            .reason = refusal_reason::target_compaction_during_replay,
+            .message = seastar::format("A compaction of the target became possible while the {}, so a tombstone may have been purged before the writes it "
+                                       "covers. Drop the target, create it again with compaction = {{'enabled': 'false'}}, keep compaction disabled while "
+                                       "the replay runs, and call it again.",
+                    stage),
+            .detail = seastar::format("{}.{}", p.keyspace, p.table),
+    };
+}
+
 } // namespace db::pitr

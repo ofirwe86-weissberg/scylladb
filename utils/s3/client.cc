@@ -372,7 +372,10 @@ void client::group_client::register_metrics(std::string class_name, std::string 
 // series per group all reporting the same thing.
 void client::register_client_metrics() {
     namespace sm = seastar::metrics;
-    auto ep_label = sm::label("endpoint")(_host);
+    // With the port, as the object_storage group labels it: two configured endpoints
+    // can share a host (#112).
+    const auto endpoint = utils::http::endpoint_label(_host, _cfg->port, _cfg->use_https);
+    auto ep_label = sm::label("endpoint")(endpoint);
     auto op_label = sm::label("operation");
     auto request_op = op_label("request");
 
@@ -388,7 +391,14 @@ void client::register_client_metrics() {
     defs.emplace_back(sm::make_gauge("refused_request_ratio", [this] { return _request_limiter->refused_ratio(); },
             sm::description("Smoothed share of S3 requests the endpoint is refusing"), {ep_label, request_op}));
 
-    _client_metrics.add_group("s3", defs);
+    try {
+        _client_metrics.add_group("s3", defs);
+    } catch (const seastar::metrics::double_registration& e) {
+        // A second client for the same endpoint on this shard, as in
+        // group_client::register_metrics. Losing the metrics must not fail the
+        // backup, upload or restore that is creating the client.
+        s3l.warn("Not reporting s3 client metrics for {}: {}", endpoint, e.what());
+    }
 }
 
 future<client::group_client&> client::find_or_create_client() {

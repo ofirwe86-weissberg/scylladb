@@ -433,29 +433,31 @@ async def test_replay_loads_the_backup_into_the_target(manager: ScyllaClusterMan
 
 
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
-async def test_replay_fails_if_auto_compaction_is_enabled_while_it_runs(manager: ScyllaClusterManager, object_storage):
+@pytest.mark.parametrize('park', ['pitr_replay_loaded', 'pitr_replay_flushed'])
+async def test_replay_fails_if_auto_compaction_is_enabled_while_it_runs(manager: ScyllaClusterManager, object_storage, park):
     """The hold keeps every compaction of the target off, but it cannot stop auto-compaction being
-    turned back on. The run checks what it holds before it ends and fails rather than reporting a
-    recovery it cannot vouch for: a compaction between the backup's sstables and the replayed
-    history purges a tombstone before the writes it covers."""
+    turned back on. The run checks what it holds after the load and again after the flush, and
+    fails rather than reporting a recovery it cannot vouch for: a compaction between the backup's
+    sstables and the replayed history purges a tombstone before the writes it covers. Each park
+    reaches one of the two checks, and both fail with that code (#111)."""
     server = await one_server(manager, object_storage, shipping=True)
     cql = manager.get_cql()
     async with new_test_keyspace(manager, RF_1) as ks:
         snap_name, prefix = await backup_with_a_pitr_bound(manager, server, object_storage, ks, {'0': 'zero'})
         pulse = await make_pulse(cql, ks)
         await wait_for_coverage(manager, server, object_storage, ks, 'target', snap_name, prefix, pulse, from_iso(T))
-        await manager.api.enable_injection(server.ip_addr, 'pitr_replay_loaded', one_shot=True)
+        await manager.api.enable_injection(server.ip_addr, park, one_shot=True)
         log = await manager.server_open_log(server.server_id)
         mark = await log.mark()
         tid = await start_replay(manager, server, object_storage, ks, 'target', snap_name, prefix)
-        # Only once the run holds the target and has loaded the backup: enabling it earlier is
-        # refused by the check that runs before the hold, which is another test's subject.
-        await log.wait_for(f"backup '{snap_name}' loaded", from_mark=mark)
+        # Only once the run holds the target and is parked: enabling it earlier is refused by the
+        # check that runs before the hold, which is another test's subject.
+        await log.wait_for(f'{park}: waiting for message', from_mark=mark)
         await manager.api.enable_autocompaction(server.ip_addr, ks, 'target')
-        await manager.api.message_injection(server.ip_addr, 'pitr_replay_loaded')
+        await manager.api.message_injection(server.ip_addr, park)
         status = await manager.api.wait_task(server.ip_addr, tid)
         error = refusal_of(status)
-        assert 'cannot be trusted' in error, error
+        assert 'target_compaction_during_replay' in error, error
 
         # A run that failed after the mark was written leaves the target marked, so it reads as
         # incomplete and a second call on it is refused: the user drops it and replays into a new

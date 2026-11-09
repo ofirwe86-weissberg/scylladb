@@ -14,9 +14,10 @@ keyspaces. It does not protect against node or disk loss.
 
 **Status: experimental, not for production.** A restore of one table to T
 runs end to end, but some refusals this README lists aren't built, so some
-restores report `done` on wrong data (limits 1, 16, 17 and 19). A restore
-from encrypted segments hasn't been tested (limit 11). A full re-review of
-the restore path is open (#92). See
+restores report `done` on wrong data (limits 1, 16, 17 and 19). A deleted
+row can also come back with `done`, on default settings too (limit 38). A
+restore from encrypted segments hasn't been tested (limit 11). A full
+re-review of the restore path is open (#92). See
 [Implementation status](#implementation-status-2026-11-08).
 
 ## How it works
@@ -113,7 +114,9 @@ snapshot. A backup without this file can't be used for PITR.
      writes with a timestamp at or below T, and applies them to the target.
    - It flushes the target and replaces the mark with a durable `done`.
    If a compaction could have run on the target during the run, the task
-   fails and never reports `done`.
+   fails and never reports `done`. Its error reads `Point-in-time replay
+   of <ks>.<target> failed: target_compaction_during_replay: ...`: `failed`
+   rather than `refused`, because the run had already started.
 5. On success the task's status says only `done`. The result line, with
    the backup loaded and the counts, goes to the node log (limit 13).
 
@@ -330,7 +333,7 @@ more.
 4. T compares write timestamps, which clients can set:
    - clients with clocks out of step can land on the wrong side of T;
    - an old-timestamped write arriving after a purged delete can bring a
-     row back;
+     row back, on default settings too (limit 38);
    - setting a collection to empty can look like a delete 1 µs earlier, so
      at exactly that T the collection reads as empty;
    - a delete batched with an element added 1 µs later can look like an
@@ -423,7 +426,8 @@ more.
 27. The backup's `manifest.json` is read whole into memory on shard 0, up
     to 32 MiB. A backup with very many sstables needs that much free memory.
 28. No automatic cleanup after a failed replay. The target stays, with its
-    `started` mark: the task's error text says why the run failed, and a
+    `started` mark: the task's error text says why the run failed (for a
+    compaction let in during the run, `target_compaction_during_replay`), and a
     second replay into it is refused as `target_already_replayed`. Drop it
     and restore under a new name.
 29. One restore at a time. No dry run, and no alerting: the task's status
@@ -458,12 +462,26 @@ more.
     That gives the same data as long as every write that shadows a replayed
     one is in the backup or is replayed too, which holds for deletes after
     the backup and for TTL. The exception is a tombstone the backup's
-    compaction already purged (a short `gc_grace_seconds`) together with an
-    older-timestamp write of the same row still in the chain (`USING
-    TIMESTAMP` or clock skew): the replay can bring that row back. It also
-    costs time: RTO grows with everything the node wrote in that chain. In
-    the 1 GB measured run, all 1.28 million writes were replayed, about 80%
-    of them already in the backup.
+    compaction already purged, together with an older-timestamp write of
+    the same row that is still in the chain: the replay can bring that row
+    back and still report `done` (#126). This happens on default
+    settings: PITR supports only replication factor 1, where the default
+    `tombstone_gc` is `repair`, which purges a tombstone with no grace wait
+    once no live commitlog segment still holds an older write to the
+    table. A short `gc_grace_seconds` under `timeout` does it too. The
+    older write must arrive after the delete: `USING TIMESTAMP`, or
+    client-side timestamps with clock skew or a delayed retry. Plain server
+    timestamps don't trigger it. On protected tables, set `tombstone_gc =
+    {'mode': 'timeout'}` and keep `gc_grace_seconds` at its default of 10
+    days. What matters is how far the backup's replay start can lag behind
+    the backup, not the backup interval alone: the start can go back to
+    the oldest live commitlog segment, which stays live while any table on
+    the node has unflushed writes in it, or while shipping is held by a
+    store outage, so it can be hours or days old. A lower
+    `gc_grace_seconds` must stay well above that lag plus the backup
+    interval. It also costs time: RTO grows with everything the node wrote
+    in that chain. In the 1 GB measured run, all 1.28 million writes were
+    replayed, about 80% of them already in the backup.
 
 ## Implementation status (2026-11-08)
 

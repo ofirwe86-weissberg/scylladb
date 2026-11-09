@@ -111,10 +111,7 @@ static std::string endpoint_label(const db::object_storage_endpoint_param& ep) {
         return ep.get_s3_storage().endpoint;
     }();
     auto url = utils::http::parse_simple_url(endpoint);
-    if (url.port == (url.is_https() ? 443 : 80)) {
-        return url.host;
-    }
-    return fmt::format("{}:{}", url.host, url.port);
+    return utils::http::endpoint_label(url.host, url.port, url.is_https());
 }
 
 // Bytes moved to and from objects. The backends count them, and the storage

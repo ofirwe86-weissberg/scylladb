@@ -61,6 +61,11 @@ struct url_info {
 
 url_info parse_simple_url(std::string_view uri);
 
+// How metrics name an endpoint: the host, followed by ":<port>" when the port is not
+// the one the scheme implies, so that two endpoints differing by port alone get
+// distinct labels while the common case keeps the bare host.
+std::string endpoint_label(std::string_view host, unsigned port, bool use_https);
+
 // The Content-Range header of a 206 reply: "bytes <first>-<last>/<total>".
 // https://www.rfc-editor.org/rfc/rfc9110#section-14.4
 struct content_range {

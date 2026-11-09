@@ -1033,9 +1033,8 @@ future<> sstables_loader::load_backup_into_target(
     // load ran, nor auto-compaction being turned back on, so the run says
     // whether it still holds what it took, and fails if it does not.
     if (!co_await pitr_compaction_still_held(target)) {
-        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} cannot be trusted: a compaction of the target became possible while the "
-                                             "backup was loading, so a tombstone may have been purged before the writes it covers",
-                params.keyspace, params.table));
+        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} failed: {}", params.keyspace, params.table,
+                db::pitr::compaction_during_replay_refusal(params, "backup was loading")));
     }
 }
 
@@ -1064,9 +1063,8 @@ future<sstring> sstables_loader::replay_history_and_finish(
     // purged before the writes it covers makes the whole run wrong, so it fails
     // rather than writing `done`.
     if (!co_await pitr_compaction_still_held(start.target)) {
-        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} cannot be trusted: a compaction of the target became possible while the history "
-                                             "was replayed, so a tombstone may have been purged before the writes it covers",
-                params.keyspace, params.table));
+        throw std::runtime_error(fmt::format("Point-in-time replay of {}.{} failed: {}", params.keyspace, params.table,
+                db::pitr::compaction_during_replay_refusal(params, "history was replayed")));
     }
 
     const auto state_dir = pitr_replay_state_dir(cfg);
