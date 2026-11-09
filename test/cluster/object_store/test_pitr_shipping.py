@@ -5,200 +5,142 @@
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
-"""PITR shipping: when it's on, what it stores, and that coverage keeps moving."""
+"""What the node ships to the bucket, and when: nothing while shipping is off, and the seal interval's range, default and
+timer (issue #22)."""
 
+import asyncio
 import logging
 import time
 
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    ABSENCE_WINDOW_SECONDS, apply, assert_nothing_appears, CFG_BUCKET, CFG_ENDPOINT, CFG_SEAL_SECONDS, get_status, needs_phase, node_config, now_us,
-    objects_of, old_ts, pks_of, protect_table, protected_table, report_stalls, restart, restore_ok, SEAL_SECONDS, SHARDS, shipped_bytes,
-    shipping_options, SHIPPING_PREFIX, simple_rows, STEP_US, TABLE_SCHEMA, VNODES_KS, W, wait_covered
+    keys_on_every_shard, needs_phase, now_us, objects_of, pitr_node, report_stalls, segment_keys, SHARDS, SHIPPING_PREFIX, W,
+    wait_log
 )
-from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
-from test.pylib.util import unique_name, wait_for
+from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
 
-IDLE_WINDOW_US = 10_000_000
+SMALL_SEGMENTS = {'commitlog_segment_size_in_mb': 1}
+# 24 writes of 128 KiB on each shard fill three 1 MiB segments there, so every shard closes segments.
+WRITES_PER_SHARD = 24
+VALUE_BYTES = 128 * 1024
+SHIP_WINDOW_SECONDS = 10
+OFF_LINE = r'pitr - Point-in-time recovery shipping is off: '
 
 
-async def off_node(manager, storage):
-    return await manager.server_add(config=node_config(storage, shipping=False, **{CFG_SEAL_SECONDS: SEAL_SECONDS}))
+async def fill_segments(manager, p):
+    """Writes enough on every shard to close several segments of 1 MiB, then flushes."""
+    base = now_us()
+    pks = keys_on_every_shard(WRITES_PER_SHARD)
+    await p.write([W(base + i, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 0, ?) USING TIMESTAMP {{ts}}", ('x' * VALUE_BYTES,))
+                   for i, pk in enumerate(pks)])
+    await manager.api.keyspace_flush(p.server.ip_addr, p.ks, p.cf)
 
 
-@needs_phase('1.1')
-async def test_status_says_shipping_is_off_by_default(manager: ScyllaClusterManager, s3_storage):
-    """T01, SHP-1."""
-    server = await off_node(manager, s3_storage)
-    status = await get_status(manager, server)
-    assert not status.shipping_on, f'expected shipping off, status says on: {status}'
+async def shipped_by(manager, p, shard):
+    """The segments this node's shard has shipped, which tells it from another node ship to the same bucket."""
+    return await segment_keys(p.storage, await manager.get_host_id(p.server.server_id), shard)
 
 
-@needs_phase('1.1')
-async def test_shipping_settings_default_to_off(manager: ScyllaClusterManager, s3_storage):
-    """T01, SHP-1, LVL-1. Unset, and a 60 second seal interval."""
-    server = await manager.server_add(config=node_config(s3_storage, shipping=False))
-    seen = {key: await manager.api.get_config(server.ip_addr, key) for key in (CFG_ENDPOINT, CFG_BUCKET, CFG_SEAL_SECONDS)}
-    assert seen == {CFG_ENDPOINT: '', CFG_BUCKET: '', CFG_SEAL_SECONDS: 60}, f'expected unset, unset and 60 seconds, saw: {seen}'
+async def objects_shipped_by(manager, p):
+    """Everything under the node's own shipping directory, segments and ledger entries alike."""
+    return await objects_of(p.storage, f'{SHIPPING_PREFIX}/{await manager.get_host_id(p.server.server_id)}/')
 
 
-@needs_phase('1.1')
+async def wait_shipped_on_every_shard(manager, p, seconds=SHIP_WINDOW_SECONDS, pulse=False):
+    """With pulse, one write goes to every shard at each poll: a shard seals a segment on the write that finds it due, not on its own."""
+    async def shipped():
+        if pulse:
+            await p.pulse()
+        return True if all([await shipped_by(manager, p, s) for s in range(SHARDS)]) else None
+    await wait_for(shipped, time.time() + seconds, label=f'a segment shipped by each shard within {seconds} s')
+
+
+async def anything_in_bucket(p):
+    """Every object in the bucket, whatever its key, except the folder placeholders the mock store lists."""
+    return {k for k in await objects_of(p.storage, '') if not k.endswith('/')}
+
+
+async def stays_unshipped(manager, p, seconds=SHIP_WINDOW_SECONDS, pulse=False, whole_bucket=False):
+    """Nothing is shipped during a fixed window, by the node's directory or with whole_bucket anywhere in the bucket. The product's
+    seal and upload cadence is the only clock there is for an absence, so this is the one place a test waits out a window; it fails
+    the moment anything appears. With pulse, every shard is written to at each poll."""
+    end = time.time() + seconds
+    while time.time() < end:
+        if pulse:
+            await p.pulse()
+        found = await anything_in_bucket(p) if whole_bucket else await objects_shipped_by(manager, p)
+        assert not found, f'the node shipped something: {sorted(found)[:3]}'
+        await asyncio.sleep(0.5)
+
+
+@needs_phase('ep.3')
 async def test_nothing_is_shipped_when_off(manager: ScyllaClusterManager, s3_storage):
-    """T01, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which shows the same window catches shipping. The setting is
-    read first, so this can't pass on a build that doesn't have it."""
-    server = await off_node(manager, s3_storage)
-    cql = manager.get_cql()
-    assert await manager.api.get_config(server.ip_addr, CFG_ENDPOINT) == '', 'expected the shipping endpoint unset'
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        await apply(cql, ks, 't', simple_rows(range(4), old_ts()))
-        await manager.api.flush_keyspace(server.ip_addr, ks)
-        await assert_nothing_appears(s3_storage)
+    """R01-P2: SHP-1. A node with no shipping endpoint logs that shipping is off and, whatever it writes and however long it waits,
+    puts nothing in the bucket. The node is alone in its cluster: a second node would switch shipping off by itself. The control
+    is R28-P1, where the same writes with shipping on reach the bucket from each shard."""
+    async with pitr_node(manager, s3_storage, shipping=False, **SMALL_SEGMENTS) as off:
+        log = await manager.server_open_log(server_id=off.server.server_id)
+        await wait_log(log, OFF_LINE + 'pitr_endpoint and pitr_bucket are unset')
+        await fill_segments(manager, off)
+        await stays_unshipped(manager, off, pulse=True, whole_bucket=True)
 
 
-@needs_phase('1.1')
-async def test_config_and_restart_turn_shipping_on(manager: ScyllaClusterManager, s3_storage):
-    """T01, SHP-1. Objects appear within the window that test_nothing_is_shipped_when_off watches."""
-    server = await off_node(manager, s3_storage)
-    await manager.server_update_config(server.server_id, config_options=shipping_options(s3_storage))
-    cql = await restart(manager, server)
-    assert (await get_status(manager, server)).shipping_on, 'expected shipping on after config and restart'
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        await apply(cql, ks, 't', simple_rows(range(4), old_ts()))
-
-        async def something_shipped():
-            return True if await objects_of(s3_storage, SHIPPING_PREFIX) else None
-        await wait_for(something_shipped, time.time() + ABSENCE_WINDOW_SECONDS)
+@needs_phase('ep.3')
+@pytest.mark.parametrize('seal', [1, 3600])
+async def test_a_seal_interval_inside_the_range_ships(manager: ScyllaClusterManager, s3_storage, seal):
+    """R28-P1: LVL-1. A seal interval at either end of 1..3600 s ships: segments closed by rollover reach the bucket from each
+    shard within 10 s, even where the timer is an hour (the segments are 1 MiB, so rollover closes them). Control for R28-P2."""
+    async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=seal, **SMALL_SEGMENTS) as p:
+        await fill_segments(manager, p)
+        await wait_shipped_on_every_shard(manager, p)
 
 
-@needs_phase('1.3')
-@pytest.mark.parametrize('created', ['before_shipping', 'after_shipping'])
-async def test_every_table_is_shipped_once_on(manager: ScyllaClusterManager, s3_storage, created):
-    """T01, SHP-1. A table from either side of turning shipping on gets its later writes restored."""
-    server = await off_node(manager, s3_storage)
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        if created == 'before_shipping':
-            await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        await manager.server_update_config(server.server_id, config_options=shipping_options(s3_storage))
-        cql = await restart(manager, server)
-        if created == 'after_shipping':
-            await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        backup = await protect_table(manager, server, s3_storage, ks, 't')
-        await apply(cql, ks, 't', simple_rows([10], backup.start_us + STEP_US))
-        latest = await wait_covered(manager, server, ks, 't')
-        new = unique_name('restored_')
-        await restore_ok(manager, server, ks, 't', backup.name, latest, new)
-        assert await pks_of(cql, ks, new) == {10}
+@needs_phase('ep.3')
+@pytest.mark.parametrize('seal', [0, 3601])
+async def test_a_seal_interval_outside_the_range_keeps_shipping_off(manager: ScyllaClusterManager, s3_storage, seal):
+    """R28-P2: LVL-1. A seal interval outside 1..3600 s is logged as the cause, the node starts with shipping off, and writes
+    ship nothing. R28-P1 is the control: the same writes ship with the interval inside the range."""
+    async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=seal, **SMALL_SEGMENTS) as p:
+        log = await manager.server_open_log(server_id=p.server.server_id)
+        await wait_log(log, OFF_LINE + r'pitr_seal_interval_in_seconds must be between 1 and 3600')
+        await fill_segments(manager, p)
+        await stays_unshipped(manager, p)
 
 
-@needs_phase('1.1')
-async def test_status_says_why_shipping_is_off_on_two_nodes(manager: ScyllaClusterManager, s3_storage):
-    """T02, SHP-1."""
-    servers = await manager.servers_add(2, config=node_config(s3_storage))
-    for server in servers:
-        status = await get_status(manager, server)
-        assert not status.shipping_on, f'expected shipping off on two nodes: {status}'
-        assert 'node' in status.off_reason.lower(), f'expected a reason naming the nodes, saw: {status.off_reason!r}'
+@needs_phase('ep.3')
+async def test_seal_interval_defaults_to_60(manager: ScyllaClusterManager, s3_storage):
+    """R28-P3: LVL-1. A node that doesn't set the seal interval reports 60 in system.config."""
+    async with pitr_node(manager, s3_storage, shipping=False) as p:
+        rows = await p.cql.run_async("SELECT value FROM system.config WHERE name = 'pitr_seal_interval_in_seconds'")
+        assert [r.value for r in rows] == ['60']
 
 
-@needs_phase('1.1')
-async def test_nothing_is_shipped_on_two_nodes(manager: ScyllaClusterManager, s3_storage):
-    """T02, SHP-1. Means something only with test_config_and_restart_turn_shipping_on, which uses the same configuration. The setting is read first,
-    so this can't pass on a build that doesn't have it, and to show that it's set on both nodes."""
-    servers = await manager.servers_add(2, config=node_config(s3_storage))
-    cql = manager.get_cql()
-    for server in servers:
-        seen = await manager.api.get_config(server.ip_addr, CFG_ENDPOINT)
-        assert seen == s3_storage.address, f'expected the shipping endpoint set on {server.ip_addr}, saw: {seen!r}'
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        await apply(cql, ks, 't', simple_rows(range(4), now_us()))
-        for server in servers:
-            await manager.api.flush_keyspace(server.ip_addr, ks)
-        await assert_nothing_appears(s3_storage)
+def one_kib_per_shard():
+    """A small write on each shard: far from filling a segment, so only the seal timer can close one."""
+    return [W(now_us() + i, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 0, ?) USING TIMESTAMP {{ts}}", ('x' * 1024,))
+            for i, pk in enumerate(keys_on_every_shard(1))]
 
 
-def one_kb_write(ts):
-    return [W(ts, "INSERT INTO {t} (pk, ck, v) VALUES (1, 0, '" + 'x' * 1024 + "') USING TIMESTAMP {ts}")]
+@needs_phase('ep.3')
+async def test_the_timer_seals_a_partly_filled_segment(manager: ScyllaClusterManager, s3_storage):
+    """R28-P4: LVL-1. With the default segment size and a 1 s seal interval, one 1 KiB write on each shard, then a small write on
+    each shard at every poll (a shard seals when a write finds the segment due), puts a segment in the bucket within 5 s, so
+    the timer and not a rollover closed it. The control is the next test."""
+    async with pitr_node(manager, s3_storage) as p:
+        await p.write(one_kib_per_shard())
+        await wait_shipped_on_every_shard(manager, p, 5, pulse=True)
 
 
-@needs_phase('1.3')
-async def test_one_small_write_costs_under_1_mib(manager: ScyllaClusterManager, s3_storage):
-    """T03, SHP-6. At a 1 second seal interval, not the default, to stay fast. Reserved space would show just the same."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        await p.covered()
-        before = await shipped_bytes(s3_storage)
-        await p.write(one_kb_write(p.backup.start_us + STEP_US))
-        await p.covered()
-        grew = await shipped_bytes(s3_storage) - before
-        assert 0 < grew < 1024 * 1024, f'expected one 1 KB write to cost between 0 and 1 MiB, it cost {grew} bytes'
-
-
-@needs_phase('1.3')
-async def test_restore_after_one_small_write_has_only_that_write(manager: ScyllaClusterManager, s3_storage):
-    """T03, SHP-6."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        statements = one_kb_write(p.backup.start_us + STEP_US)
-        await p.write(statements)
-        rows = await p.assert_restored_exact(statements, await p.covered())
-        assert len(rows) == 1, f'expected one row, saw {rows}'
-
-
-@needs_phase('1.2')
-async def test_coverage_passes_a_write_with_the_other_shard_idle(manager: ScyllaClusterManager, s3_storage):
-    """T09, LVL-1. One key is on one shard of two. The time taken is logged, not gated: the S + U bound is a developer test (req:82)."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        ts = max(now_us(), p.backup.start_us + STEP_US)
-        await p.write(simple_rows([1], ts))
-        await p.covered(ts)
-        logger.info(f'One write covered after {(now_us() - ts) / 1e6} seconds')
-
-
-@needs_phase('1.3')
-async def test_restore_at_a_writes_timestamp_includes_it(manager: ScyllaClusterManager, s3_storage):
-    """T09, LVL-1."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        ts = max(now_us(), p.backup.start_us + STEP_US)
-        await p.write(simple_rows([1], ts))
-        await p.covered()
-        _, new = await p.restore(ts)
-        assert await pks_of(p.cql, p.ks, new) == {1}
-
-
-@needs_phase('1.2')
-async def test_coverage_advances_with_no_writes(manager: ScyllaClusterManager, s3_storage):
-    """T09, LVL-1."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        latest = await p.covered()
-        await p.covered(latest + IDLE_WINDOW_US)
-
-
-@needs_phase('1.2')
-async def test_idle_node_grows_under_4_kib_per_shard_per_seal_interval(manager: ScyllaClusterManager, s3_storage):
-    """T09, LVL-1."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        latest = await p.covered()
-        started_at = time.time()
-        before = await shipped_bytes(s3_storage)
-        await p.covered(latest + IDLE_WINDOW_US)
-        grew = await shipped_bytes(s3_storage) - before
-        intervals = (time.time() - started_at) / SEAL_SECONDS
-        assert grew < 4096 * SHARDS * intervals, f'expected under {4096 * SHARDS * intervals} bytes in {intervals} seal intervals, saw {grew}'
-
-
-@needs_phase('1.2')
-async def test_idle_node_writes_no_zero_byte_objects(manager: ScyllaClusterManager, s3_storage):
-    """T09, LVL-1."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        latest = await p.covered()
-        await p.covered(latest + IDLE_WINDOW_US)
-        objects = await objects_of(s3_storage, SHIPPING_PREFIX)
-        assert objects, 'expected some objects to look at'
-        empty = [k for k, o in objects.items() if o.size == 0]
-        assert not empty, f'expected no zero-byte objects, saw {empty}'
+@needs_phase('ep.3')
+async def test_a_long_seal_interval_does_not_seal_a_partly_filled_segment(manager: ScyllaClusterManager, s3_storage):
+    """Control for R28-P4: with a 3600 s interval, the same writes and pulses ship nothing over 10 s. It is a test of its own
+    because a second node in the cluster would switch shipping off (single node only)."""
+    async with pitr_node(manager, s3_storage, pitr_seal_interval_in_seconds=3600) as p:
+        log = await manager.server_open_log(server_id=p.server.server_id)
+        await wait_log(log, r'pitr - Point-in-time recovery shipping is on: ')
+        await p.write(one_kib_per_shard())
+        await stays_unshipped(manager, p, pulse=True)

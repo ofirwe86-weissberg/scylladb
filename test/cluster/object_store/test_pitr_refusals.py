@@ -5,597 +5,361 @@
 # SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.1
 #
 
-"""PITR refusals: each condition restore must refuse, and that nothing changes when it does."""
+"""PITR replay that must refuse, and never give `done`: T past coverage, damaged history, a TRUNCATE, a schema change and a
+backup whose upload didn't finish. Each test ends with its positive control, which flips the outcome to `done` in the same
+run, so that the refusal is shown to come from the condition and not from a broken setup. T4-T8 of docs-work/test-plan-slim.md
+(issue #22)."""
 
+import asyncio
 import logging
-import random
+import re
+import time
+from types import SimpleNamespace
 
 import pytest
 
 from test.cluster.object_store.pitr_util import (  # noqa: F401 (some are fixtures)
-    ALTER_KEYSPACE_RF1_NONDURABLE, ALTER_KEYSPACE_RF2, apply, assert_refused, assert_status_stays, assert_stays_unprotected, backup_prefix,
-    CFG_DISK_RESERVE_PERCENT, CLOCK_MARGIN_US, create_alterable_table, create_unsupported_tables, deadline, delete_object, FAILED, get_object,
-    is_immutable, iso, ISO_RE, iso_times, needs_phase, NEWER_BACKUP_WORDS, node_config, NONDURABLE_KS, now_us, objects_of, old_ts,
-    PAST_COVERAGE_WORDS, pks_of, protect_table, protected_table, put_object, Reason, report_stalls, restart, restore_ok, RF2_KS, run_restore,
-    schema_change_statement, SCHEMA_CHANGES, shipping_options, SHIPPING_PREFIX, simple_rows, STEP_US, STRONG_KS, table_exists, TABLE_SCHEMA,
-    TABLETS_KS, TOPOLOGY_LIMIT_WORDS, unsupported_tables_config, VNODES_KS, wait_covered
+    assert_exact, backup_prefix, create_target, deadline, delete_object, FAILED, gated_store, get_object, HISTORY_DAMAGED, is_shipping_upload, iso,
+    keys_on_every_shard, keys_on_shard, latest_restorable, needs_phase, now_us, objects_of, old_ts, PAST_COVERAGE_WORDS, pitr_node, pks_of, post_raw, put_object,
+    read_exact, Reason, REPLAY_URI, report_stalls, SEAL_SECONDS, SHIPPING_PREFIX, simple_rows, STEP_US, target_statement, UNCOMPRESSED_SCHEMA, W,
+    write_several_sstables
 )
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
-from test.cluster.util import new_test_keyspace
+from test.pylib.rest_client import HTTPError
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
-from test.pylib.util import unique_name, wait_for
+from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
 
-# Which table of create_unsupported_tables() each kind is: where to find it among the returned cases, by reason and name.
-UNSUPPORTED_KINDS = {'tablets': ('t', Reason.TABLETS), 'strongly_consistent': ('t', Reason.STRONG), 'durable_writes_false': ('t', Reason.DURABLE),
-                     'counters': ('counters', Reason.COUNTERS), 'view_base': ('viewed', Reason.VIEW_BASE), 'view': ('a_view', Reason.VIEW_TABLE),
-                     'indexed': ('indexed', Reason.INDEXED), 'index_table': ('an_index_index', Reason.INDEX_TABLE),
-                     'cdc': ('cdc', Reason.CDC), 'cdc_log': ('cdc_scylla_cdc_log', Reason.CDC), 'logstor': ('logstor', Reason.LOGSTOR),
-                     'system': ('local', Reason.SYSTEM), 'system_schema': ('tables', Reason.SYSTEM), 'alternator': ('alt', Reason.ALTERNATOR)}
+PAYLOAD = 'p' * (1024 * 1024)   # so that the segment holding the history is the largest object shipped after the backup
 
 
-@needs_phase('1.3')
-@pytest.mark.parametrize('kind', UNSUPPORTED_KINDS)
-async def test_refuse_unsupported_table(manager: ScyllaClusterManager, s3_storage, kind):
-    """T18, REF-1."""
-    server = await manager.server_add(config=unsupported_tables_config(node_config(s3_storage)))
-    cql = manager.get_cql()
-    name, reason = UNSUPPORTED_KINDS[kind]
-    async with new_test_keyspace(manager, VNODES_KS) as ks, \
-               new_test_keyspace(manager, TABLETS_KS) as tablet_ks, \
-               new_test_keyspace(manager, STRONG_KS) as strong_ks, \
-               new_test_keyspace(manager, NONDURABLE_KS) as nondurable_ks:
-        cases = await create_unsupported_tables(server, cql, ks, tablet_ks, strong_ks, nondurable_ks)
-        keyspace = next(k for k, cf, r in cases if (cf, r) == (name, reason))
-        # A strongly consistent table can't be scanned, so whether it stays the same isn't checked.
-        await assert_refused(manager, server, cql, keyspace, name, 'any_backup', now_us(), reason, read_source=keyspace != strong_ks)
+def assert_states_coverage(outcome, t):
+    latest = latest_restorable(outcome, t)
+    assert latest < t, f'the latest restorable time must be below T: {outcome}'
+    for word in PAST_COVERAGE_WORDS:
+        assert word in outcome.message.lower(), f'the refusal must state the {word}: {outcome}'
+    return latest
 
 
-@needs_phase('1.3')
-async def test_refuse_rf_above_1_from_creation(manager: ScyllaClusterManager, s3_storage):
-    """T19, REF-2."""
-    server = await manager.server_add(config=node_config(s3_storage))
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, RF2_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        snap, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
-        await do_backup(server, snap, backup_prefix(ks, 't', snap), ks, 't', s3_storage, manager, logger)
-        result = await assert_refused(manager, server, cql, ks, 't', snap, now_us(), Reason.RF)
-        assert TOPOLOGY_LIMIT_WORDS[Reason.RF] in result.message.lower(), f'expected the RF=1 limit stated, saw: {result.message}'
+async def test_t_past_coverage_is_refused_while_writes_wait_to_ship(manager: ScyllaClusterManager, gated_store, s3_storage):
+    """T4 (a): REF-5, P68. Shipping goes through the gate and the backup around it. The gate holds every upload, below
+    pitr_unshipped_limit_in_mb, so writes are acknowledged and not shipped. Control: let the uploads go, and the same target
+    gives `done` with the writes."""
+    pks = keys_on_every_shard(1, 100)
+    async with pitr_node(manager, s3_storage, ship_to=gated_store) as p:
+        await p.backup()
+        await p.covered()
+        gated_store.hold_when(is_shipping_upload)
+        t = now_us()
+        writes = simple_rows(pks, t)
+        await p.write(writes)
+
+        outcome, target = await p.refused(t, Reason.T_PAST_COVERAGE)
+        assert_states_coverage(outcome, t)
+
+        gated_store.release()
+        await p.covered(t + 1)
+        await p.replay_done(t, target)
+        await assert_exact(p.cql, p.ks, target, writes, t)
 
 
-@needs_phase('1.3')
-async def test_refuse_rf_altered_after_protection_began(manager: ScyllaClusterManager, s3_storage):
-    """T19, REF-2."""
-    async with protected_table(manager, s3_storage) as p:
-        t = await p.covered()
-        await p.cql.run_async(ALTER_KEYSPACE_RF2.format(ks=p.ks))
-        result = await p.refused(t, Reason.RF)
-        assert TOPOLOGY_LIMIT_WORDS[Reason.RF] in result.message.lower(), f'expected the RF=1 limit stated, saw: {result.message}'
+@needs_phase('ep.3', '15-bc')
+async def test_t_past_coverage_is_refused_with_a_shard_idle(manager: ScyllaClusterManager, s3_storage):
+    """T4 (b): REF-5, limit 26, LVL-1, P68 (PM-64). After the backup only shard 0 is written, for 5 seal intervals. The refusal
+    names shard 1 and its covered-through time. Control: one write on shard 1, and the same target gives `done`."""
+    on_0 = keys_on_shard(0, 5, 100)
+    async with pitr_node(manager, s3_storage) as p:
+        await p.backup()
+        await p.covered()
+        writes = []
+        end = time.time() + 5 * SEAL_SECONDS
+        while time.time() < end:
+            w = W(now_us(), f"INSERT INTO {{t}} (pk, ck, v) VALUES ({on_0[len(writes) % len(on_0)]}, {len(writes)}, 'x') USING TIMESTAMP {{ts}}")
+            await p.write([w])
+            writes.append(w)
+            await asyncio.sleep(0.1)    # paces the writer: this is what's tested, not a wait for something to happen
+        t = writes[-1].ts
+
+        outcome, target = await p.refused(t, Reason.T_PAST_COVERAGE)
+        assert_states_coverage(outcome, t)
+        assert re.search(r'\bshard\W{0,3}1\b', outcome.message, re.I), f'the refusal must name the idle shard 1: {outcome}'
+
+        await p.write(simple_rows(keys_on_shard(1, 1, 100), now_us()))
+        await p.covered(t + 1, pulse=False)
+        await p.replay_done(t, target)
+        await assert_exact(p.cql, p.ks, target, writes, t)
 
 
-@needs_phase('1.3')
-async def test_refuse_node_added_after_protection_began(manager: ScyllaClusterManager, s3_storage):
-    """T19, REF-2."""
-    async with protected_table(manager, s3_storage) as p:
-        t = await p.covered()
-        await manager.server_add(config=node_config(s3_storage))
-        result = await p.refused(t, Reason.NODES)
-        assert TOPOLOGY_LIMIT_WORDS[Reason.NODES] in result.message.lower(), f'expected the one-node limit stated, saw: {result.message}'
+DAMAGES = {
+    'removed': None,
+    'cut_short': lambda data: data[:len(data) // 2],
+    'one_byte_changed': lambda data: data[:len(data) // 2] + bytes([data[len(data) // 2] ^ 0xff]) + data[len(data) // 2 + 1:],
+}
 
 
-# Gaps and damage in the shipped history
+@needs_phase('ep.3')
+@pytest.mark.parametrize('damage', DAMAGES)
+async def test_damaged_history_is_refused(manager: ScyllaClusterManager, s3_storage, damage):
+    """T5: REF-4. The largest object shipped after the backup is a segment of the history: ledger entries are at most 4096
+    bytes. A cut segment would read as a normal end, so the writes after the cut would go missing. Control: put the bytes back,
+    and a new target gives `done`, exact."""
+    pks = keys_on_every_shard(1, 100)
+    async with pitr_node(manager, s3_storage) as p:
+        await p.backup()
+        writes = [W(now_us() + i, f"INSERT INTO {{t}} (pk, ck, v) VALUES ({pk}, 0, '{PAYLOAD}') USING TIMESTAMP {{ts}}") for i, pk in enumerate(pks)]
+        await p.write(writes)
+        t = max(w.ts for w in writes)
+        await p.covered()
 
-MISSING = {Reason.OBJECT_MISSING, Reason.RECORDS_MISSING}
-DAMAGED = {Reason.OBJECT_DAMAGED, Reason.RECORDS_DAMAGED}
-
-
-# Bigger than any idle seal may be (4 KiB, req:82), and random, so that compression can't shrink it.
-PAYLOAD = random.Random(22).randbytes(4096).hex()
-
-
-async def shipped_object_holding_writes(p, table, known) -> tuple[list, int, str]:
-    """Writes after the backup, then waits until T is past every upload. Returns the writes, T, and the biggest new object: it holds the writes, because
-    an object of an idle seal stays under 4 KiB. Works without knowing the format: an object can't hold anything newer than its upload, and S3 reports
-    upload times in seconds, hence the 2 seconds."""
-    writes = simple_rows(range(8, 16), max(now_us(), p.backup.start_us + STEP_US), PAYLOAD)
-    await apply(p.cql, p.ks, table, writes)
-    await p.covered()
-    objects = await objects_of(p.storage, SHIPPING_PREFIX)
-    newest = max(o.last_modified for o in objects.values()).timestamp()
-    t = await p.covered(int(newest * 1e6) + 2 * CLOCK_MARGIN_US)
-    window = {k: o for k, o in objects.items() if k not in known and is_immutable(k)}
-    assert window, 'expected a new shipped object, or this test proves nothing'
-    key = max(window, key=lambda k: (window[k].size, k))
-    assert window[key].size > 4096, f'expected the object holding the writes to be over 4 KiB, or it may be an idle seal: {key} is {window[key].size} bytes'
-    return writes, t, key
-
-
-async def shipped_object_in_window(p, table='t') -> tuple[int, str, list]:
-    await p.covered()
-    known = await objects_of(p.storage, SHIPPING_PREFIX)
-    writes, t, key = await shipped_object_holding_writes(p, table, known)
-    return t, key, writes
-
-
-async def probe(p, t, key, reasons):
-    """A restore that has to be refused for this object."""
-    new = unique_name('tampered_')
-    result = await run_restore(p.manager, p.server, p.ks, p.cf, p.backup.name, t, new)
-    assert result.state == FAILED and result.reason in reasons, f'expected a refusal with one of {reasons}, saw: {result}'
-    assert key.rsplit('/', 1)[-1] in result.message, f'expected the refusal to name {key}: {result.message}'
-    assert not result.cells_applied, f'expected a refusal before any data was loaded: {result}'
-    assert not await table_exists(p.cql, p.ks, new), f'expected no new table: {result}'
-    return result
-
-
-WRITTEN_TO = ['this_table', 'other_table']
-
-
-async def tamper_setup(p, written):
-    if written == 'other_table':
-        await p.cql.run_async(f'CREATE TABLE {p.ks}.other {TABLE_SCHEMA}')
-    return await shipped_object_in_window(p, 't' if written == 'this_table' else 'other')
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('written', WRITTEN_TO)
-async def test_refuse_a_removed_shipped_object(manager: ScyllaClusterManager, s3_storage, written):
-    """T20, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        t, key, _ = await tamper_setup(p, written)
-        await delete_object(s3_storage, key)
-        await probe(p, t, key, MISSING)
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('written', WRITTEN_TO)
-async def test_refuse_a_shipped_object_cut_short(manager: ScyllaClusterManager, s3_storage, written):
-    """T20, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        t, key, _ = await tamper_setup(p, written)
+        shipped = {k: o for k, o in (await objects_of(s3_storage, SHIPPING_PREFIX)).items() if k not in p.backup_keys}
+        key = min(shipped, key=lambda k: (-shipped[k].size, shipped[k].last_modified))
+        assert shipped[key].size > 4096, f'the largest object shipped after the backup must be a segment: {key}, {shipped[key].size} bytes'
         original = await get_object(s3_storage, key)
-        await put_object(s3_storage, key, original[:len(original) // 2])
-        await probe(p, t, key, DAMAGED)
+        logger.info(f'Damage ({damage}) to {key}, {len(original)} bytes')
+        if DAMAGES[damage] is None:
+            await delete_object(s3_storage, key)
+        else:
+            await put_object(s3_storage, key, DAMAGES[damage](original))
 
+        outcome, _ = await p.refused(t, HISTORY_DAMAGED, loaded_ok=True)
+        # The key may be given whole or under the shipping prefix: either holds this part.
+        assert key[len(SHIPPING_PREFIX) + 1:] in outcome.message, f'the refusal must name the damaged object {key}: {outcome}'
 
-@needs_phase('1.3')
-@pytest.mark.parametrize('written', WRITTEN_TO)
-async def test_refuse_a_shipped_object_with_one_byte_changed(manager: ScyllaClusterManager, s3_storage, written):
-    """T20, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        t, key, _ = await tamper_setup(p, written)
-        changed = bytearray(await get_object(s3_storage, key))
-        changed[len(changed) // 2] ^= 0x01
-        await put_object(s3_storage, key, bytes(changed))
-        await probe(p, t, key, DAMAGED)
-
-
-@needs_phase('1.3')
-async def test_restore_works_once_a_tampered_object_is_put_back(manager: ScyllaClusterManager, s3_storage):
-    """T20, REF-4. The control: the tampering, and nothing else, caused the refusals."""
-    async with protected_table(manager, s3_storage) as p:
-        t, key, writes = await shipped_object_in_window(p)
-        original = await get_object(s3_storage, key)
-        await delete_object(s3_storage, key)
-        await probe(p, t, key, MISSING)
         await put_object(s3_storage, key, original)
-        await p.assert_restored_exact(p.seed + writes, t)
+        _, target = await p.replay_done(t)
+        await assert_exact(p.cql, p.ks, target, writes, t)
 
 
-async def gap_after_some_writes(p) -> tuple[int, int, list, str]:
-    """Writes, then later writes, and removes a shipped object holding only the later ones. Returns the coverage from before the gap,
-    a T past it, the earlier history, and the object."""
-    early = simple_rows(range(8, 12), p.backup.start_us + STEP_US)
-    await p.write(early)
-    before_gap = await p.covered()
-    known = await objects_of(p.storage, SHIPPING_PREFIX)    # everything up to before_gap is in these
-    _, end, key = await shipped_object_holding_writes(p, p.cf, known)
-    await delete_object(p.storage, key)
-    return before_gap, end, p.seed + early, key
+async def restarted_chain_restores_without_truncated_rows(p, truncated, kept=()):
+    """The control of T6. P74: after a TRUNCATE, PITR needs a chain that started after it, which takes a restart, and a backup
+    on that chain. Then replay gives `done`, without the truncated rows."""
+    await p.restart()
+    await p.backup()
+    later = simple_rows(keys_on_every_shard(1, 300), now_us(), 'later')
+    await p.write(later)
+    await p.covered()
+    _, target = await p.replay_done(later[-1].ts)
+    seen = await pks_of(p.cql, p.ks, target)
+    assert not seen & set(truncated), f'truncated rows came back: {seen & set(truncated)}'
+    await assert_exact(p.cql, p.ks, target, [*kept, *later], later[-1].ts)
 
 
-@needs_phase('1.3')
-async def test_gap_refusal_gives_the_remaining_interval(manager: ScyllaClusterManager, s3_storage):
-    """T31, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        before_gap, end, _, _ = await gap_after_some_writes(p)
-        result = await p.refused(end, MISSING)
-        assert result.remaining_start_us == p.backup.start_us, f'expected it to start at the backup: {result}'
-        assert before_gap <= result.remaining_end_us < end, f'expected the end between {iso(before_gap)} and {iso(end)}: {result}'
-
-
-@needs_phase('1.3')
-async def test_gap_refusal_message_states_the_remaining_interval(manager: ScyllaClusterManager, s3_storage):
-    """T31, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        _, end, _, _ = await gap_after_some_writes(p)
-        result = await p.refused(end, MISSING)
-        times = iso_times(result.message)
-        assert result.remaining_start_us in times and result.remaining_end_us in times, f'expected both times in the message: {result}'
-
-
-@needs_phase('1.3')
-async def test_t_inside_the_remaining_interval_is_exact_with_the_gap_still_there(manager: ScyllaClusterManager, s3_storage):
-    """T31, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        before_gap, _, history, key = await gap_after_some_writes(p)
-        await p.assert_restored_exact(history, before_gap)
-        assert key not in await objects_of(s3_storage, SHIPPING_PREFIX), 'expected the gap to still be there'
-
-
-@needs_phase('1.3')
-async def test_t_at_the_end_of_the_remaining_interval_is_accepted(manager: ScyllaClusterManager, s3_storage):
-    """T31, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        _, end, _, _ = await gap_after_some_writes(p)
-        result = await p.refused(end, MISSING)
-        _, new = await p.restore(result.remaining_end_us)
-        assert set(range(12)) <= await pks_of(p.cql, p.ks, new)
-
-
-@needs_phase('1.3')
-async def test_t_1us_past_the_remaining_interval_is_refused(manager: ScyllaClusterManager, s3_storage):
-    """T31, REF-4."""
-    async with protected_table(manager, s3_storage) as p:
-        _, end, _, _ = await gap_after_some_writes(p)
-        result = await p.refused(end, MISSING)
-        await p.refused(result.remaining_end_us + 1, MISSING)
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('upload', ['before_shipping', 'after_shipping'])
-async def test_refuse_a_snapshot_from_before_shipping(manager: ScyllaClusterManager, s3_storage, upload):
-    """T21, REF-4, SHP-5. Writes between the snapshot and shipping's start are in neither, even if the upload comes after."""
-    server = await manager.server_add(config=node_config(s3_storage, shipping=False))
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        await apply(cql, ks, 't', simple_rows(range(4), old_ts()))
-        snap, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
-        prefix = backup_prefix(ks, 't', snap)
-        if upload == 'before_shipping':
-            await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
-        await manager.server_update_config(server.server_id, config_options=shipping_options(s3_storage))
-        cql = await restart(manager, server)
-        if upload == 'after_shipping':
-            await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
-        result = await assert_refused(manager, server, cql, ks, 't', snap, now_us() - CLOCK_MARGIN_US, Reason.BACKUP_BEFORE_SHIPPING)
-        assert 'nodetool backup' in result.message, f'expected the next action, saw: {result.message}'
-
-
-@needs_phase('1.2')
-@pytest.mark.parametrize('upload', ['before_shipping', 'after_shipping'])
-async def test_status_doesnt_list_a_snapshot_from_before_shipping(manager: ScyllaClusterManager, s3_storage, upload):
-    """T21, SHP-5."""
-    server = await manager.server_add(config=node_config(s3_storage, shipping=False))
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        snap, _ = await take_snapshot_on_one_server(ks, server, manager, logger)
-        prefix = backup_prefix(ks, 't', snap)
-        if upload == 'before_shipping':
-            await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
-        await manager.server_update_config(server.server_id, config_options=shipping_options(s3_storage))
-        await restart(manager, server)
-        if upload == 'after_shipping':
-            await do_backup(server, snap, prefix, ks, 't', s3_storage, manager, logger)
-        await assert_stays_unprotected(manager, server, ks, 't')
-
-
-# T outside coverage
-
-FUTURE_US = 86400_000_000
-
-
-async def assert_refusal_gives_latest_and_lag(result, t):
-    missing = [word for word in PAST_COVERAGE_WORDS if word not in result.message.lower()]
-    assert not missing, f'expected {missing} in: {result.message}'
-    assert any(x < t for x in iso_times(result.message)), f'expected the latest restorable time in: {result.message}'
-
-
-@needs_phase('1.3')
-async def test_refuse_t_in_the_future(manager: ScyllaClusterManager, s3_storage):
-    """T22, REF-5."""
-    async with protected_table(manager, s3_storage) as p:
-        t = now_us() + FUTURE_US
-        result = await p.refused(t, Reason.T_PAST_COVERAGE)
-        await assert_refusal_gives_latest_and_lag(result, t)
-
-
-@needs_phase('1.3')
-async def test_refuse_t_above_coverage_with_data_there_and_a_shard_idle(manager: ScyllaClusterManager, s3_storage):
-    """T22, REF-5. One key, so the other shard is idle, with a timestamp far ahead: data exists at T, but T isn't covered."""
-    async with protected_table(manager, s3_storage) as p:
-        t = now_us() + FUTURE_US
-        await p.write(simple_rows([50], t))
+@pytest.mark.skip_bug(link="https://github.com/ofirwe86-weissberg/scylladb/issues/15",
+                      reason="L7: won't be implemented this release; implementable when replay reads the source's truncation record")
+async def test_truncate_after_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
+    """T6 (a): REF-10, limit 21, RST-4, P55/P74. Rows R written after the backup, then a TRUNCATE. T between R and the
+    TRUNCATE is refused: replaying the history would bring R back. auto_snapshot is off, so nothing else keeps R."""
+    pks = keys_on_every_shard(1, 100)
+    async with pitr_node(manager, s3_storage, auto_snapshot=False) as p:
+        await p.write(simple_rows(keys_on_every_shard(1, 500), old_ts(), 'seed'))
+        await p.backup()
+        r_ts = now_us()
+        await p.write(simple_rows(pks, r_ts, 'R'))
         await p.covered()
-        result = await p.refused(t, Reason.T_PAST_COVERAGE)
-        await assert_refusal_gives_latest_and_lag(result, t)
-
-
-@needs_phase('1.3')
-async def test_refuse_t_1us_below_the_interval(manager: ScyllaClusterManager, s3_storage):
-    """T22, T32, REF-6."""
-    async with protected_table(manager, s3_storage) as p:
-        result = await p.refused(p.backup.start_us - 1, Reason.T_BEFORE_COVERAGE)
-        assert p.backup.start_us in iso_times(result.message), f'expected the interval in: {result.message}'
-
-
-@needs_phase('1.3')
-async def test_refuse_a_backup_that_doesnt_exist(manager: ScyllaClusterManager, s3_storage):
-    """T22, REF-6."""
-    async with protected_table(manager, s3_storage) as p:
-        result = await p.refused(p.backup.start_us, Reason.NO_SUCH_BACKUP, backup='no_such_backup')
-        assert p.backup.name in result.message or p.backup.start_us in iso_times(result.message), f'expected the usable backup or interval in: {result.message}'
-
-
-@needs_phase('1.3')
-async def test_refuse_when_there_is_no_backup(manager: ScyllaClusterManager, s3_storage):
-    """T22, REF-6."""
-    server = await manager.server_add(config=node_config(s3_storage))
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await cql.run_async(f'CREATE TABLE {ks}.t {TABLE_SCHEMA}')
-        result = await assert_refused(manager, server, cql, ks, 't', 'no_such_backup', now_us(), Reason.NO_BACKUP)
-        assert 'nodetool snapshot' in result.message and 'nodetool backup' in result.message, f'expected the exact command in: {result.message}'
-
-
-@needs_phase('1.3')
-async def test_refuse_a_snapshot_never_uploaded(manager: ScyllaClusterManager, s3_storage):
-    """T23, REF-7."""
-    async with protected_table(manager, s3_storage) as p:
-        never, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
-        result = await p.refused(await p.covered(), Reason.BACKUP_UNFINISHED, backup=never)
-        assert p.backup.name in result.message, f'expected the usable backups listed in: {result.message}'
-
-
-@needs_phase('1.2')
-async def test_status_doesnt_list_a_snapshot_never_uploaded(manager: ScyllaClusterManager, s3_storage):
-    """T23, REF-7."""
-    async with protected_table(manager, s3_storage) as p:
-        await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
-        await assert_status_stays(manager, p.server, p.ks, p.cf, lambda e: [b.name for b in e.backups] == [p.backup.name], f'only {p.backup.name} listed')
-
-
-# Schema changes and truncates in the window
-
-async def alterable_table(manager, storage):
-    server = await manager.server_add(config=node_config(storage))
-    return server
-
-
-SCHEMA_CHANGE_IDS = ['add_column', 'drop_column', 'option', 'udt_it_uses']
-
-
-async def change_schema_in_window(manager, server, storage, ks, change) -> dict:
-    """Backs up, changes the schema, and waits for coverage past it. Returns the times and the DESCRIBE from before."""
-    cql = manager.get_cql()
-    await create_alterable_table(cql, ks)
-    await apply(cql, ks, 't', simple_rows(range(4), old_ts()))
-    describe = (await cql.run_async(f'DESCRIBE TABLE {ks}.t'))[0].create_statement
-    backup = await protect_table(manager, server, storage, ks, 't')
-    before = await wait_covered(manager, server, ks, 't')
-    low = now_us()
-    await cql.run_async(schema_change_statement(change, ks))
-    high = now_us()
-    after = await wait_covered(manager, server, ks, 't')
-    return dict(backup=backup, before=before, after=after, low=low, high=high, describe=describe)
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('change', SCHEMA_CHANGES, ids=SCHEMA_CHANGE_IDS)
-async def test_refuse_t_after_a_schema_change(manager: ScyllaClusterManager, s3_storage, change):
-    """T24, REF-9."""
-    server = await alterable_table(manager, s3_storage)
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        c = await change_schema_in_window(manager, server, s3_storage, ks, change)
-        result = await assert_refused(manager, server, manager.get_cql(), ks, 't', c['backup'].name, c['after'], Reason.SCHEMA_CHANGED)
-        times = iso_times(result.message)
-        assert any(c['low'] - CLOCK_MARGIN_US <= x <= c['high'] + CLOCK_MARGIN_US for x in times), f'expected the event time in: {result.message}'
-        assert any(word in result.message.lower() for word in NEWER_BACKUP_WORDS), f'expected the next action in: {result.message}'
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('change', SCHEMA_CHANGES, ids=SCHEMA_CHANGE_IDS)
-async def test_t_before_a_schema_change_uses_the_old_schema(manager: ScyllaClusterManager, s3_storage, change):
-    """T24, REF-9."""
-    server = await alterable_table(manager, s3_storage)
-    cql = manager.get_cql()
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        c = await change_schema_in_window(manager, server, s3_storage, ks, change)
-        new = unique_name('restored_')
-        await restore_ok(manager, server, ks, 't', c['backup'].name, c['before'], new)
-        restored = (await cql.run_async(f'DESCRIBE TABLE {ks}.{new}'))[0].create_statement
-        assert restored.replace(f'{ks}.{new}', f'{ks}.t') == c['describe'], f"expected:\n{c['describe']}\nsaw:\n{restored}"
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('change', SCHEMA_CHANGES, ids=SCHEMA_CHANGE_IDS)
-async def test_newer_backup_is_accepted_after_a_schema_change(manager: ScyllaClusterManager, s3_storage, change):
-    """T24, REF-9."""
-    server = await alterable_table(manager, s3_storage)
-    async with new_test_keyspace(manager, VNODES_KS) as ks:
-        await change_schema_in_window(manager, server, s3_storage, ks, change)
-        newer = await protect_table(manager, server, s3_storage, ks, 't')
-        await restore_ok(manager, server, ks, 't', newer.name, await wait_covered(manager, server, ks, 't'), unique_name('restored_'))
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('change', ['ALTER TABLE {ks}.other ADD added int', 'ALTER TYPE {ks}.unused ADD extra int'], ids=['other_table', 'udt_it_doesnt_use'])
-async def test_schema_change_elsewhere_is_accepted(manager: ScyllaClusterManager, s3_storage, change):
-    """T33, REF-9."""
-    async with protected_table(manager, s3_storage) as p:
-        await p.cql.run_async(f'CREATE TABLE {p.ks}.other {TABLE_SCHEMA}')
-        await p.cql.run_async(f'CREATE TYPE {p.ks}.unused (zip int)')
-        await p.cql.run_async(change.format(ks=p.ks))
-        await p.assert_restored_exact(p.seed, await p.covered())
-
-
-@needs_phase('1.3')
-async def test_refuse_after_durable_writes_is_turned_off(manager: ScyllaClusterManager, s3_storage):
-    """T33, REF-1."""
-    async with protected_table(manager, s3_storage) as p:
-        t = await p.covered()
-        await p.cql.run_async(ALTER_KEYSPACE_RF1_NONDURABLE.format(ks=p.ks))
-        await p.refused(t, Reason.DURABLE)
-
-
-async def truncate_in_window(p) -> dict:
-    before = await p.covered()
-    low = now_us()
-    await p.cql.run_async(f'TRUNCATE TABLE {p.ks}.t')
-    high = now_us()
-    await p.write(simple_rows([50], high))
-    return dict(before=before, after=await p.covered(), low=low, high=high)
-
-
-@needs_phase('1.3')
-async def test_refuse_t_after_a_truncate(manager: ScyllaClusterManager, s3_storage):
-    """T25, REF-10."""
-    async with protected_table(manager, s3_storage) as p:
-        c = await truncate_in_window(p)
-        result = await p.refused(c['after'], Reason.TRUNCATED)
-        times = iso_times(result.message)
-        assert any(c['low'] - CLOCK_MARGIN_US <= x <= c['high'] + CLOCK_MARGIN_US for x in times), f'expected the event time in: {result.message}'
-        assert any(word in result.message.lower() for word in NEWER_BACKUP_WORDS), f'expected the next action in: {result.message}'
-
-
-@needs_phase('1.3')
-async def test_t_before_a_truncate_is_accepted(manager: ScyllaClusterManager, s3_storage):
-    """T25, REF-10."""
-    async with protected_table(manager, s3_storage) as p:
-        c = await truncate_in_window(p)
-        await p.assert_restored_exact(p.seed, c['before'])
-
-
-@needs_phase('1.3')
-async def test_newer_backup_is_accepted_after_a_truncate(manager: ScyllaClusterManager, s3_storage):
-    """T25, REF-10."""
-    async with protected_table(manager, s3_storage) as p:
-        await truncate_in_window(p)
-        newer = await protect_table(manager, p.server, s3_storage, p.ks, p.cf)
-        _, new = await p.restore(await p.covered(), backup=newer.name)
-        seen = await pks_of(p.cql, p.ks, new)
-        assert seen == {50}, f'expected only the write after the truncate, saw {seen}'
-
-
-# The form of T
-
-INVALID_T = {'no_zone': '2026-11-04T14:05:00', 'no_zone_with_fraction': '2026-11-04T14:05:00.123456', 'offset': '2026-11-04T14:05:00+02:00',
-             'zero_offset': '2026-11-04T14:05:00+00:00',
-             'local_form': '2026-11-04 14:05:00', 'space_with_z': '2026-11-04 14:05:00Z', 'seven_digits': '2026-11-04T14:05:00.1234567Z',
-             'impossible_day': '2026-02-30T14:05:00Z',
-             'impossible_month': '2026-13-01T14:05:00Z', 'leap_second': '2026-12-31T23:59:60Z', 'hour_24': '2026-11-04T24:00:00Z',
-             'lowercase_z': '2026-11-04T14:05:00z',
-             'lowercase_t': '2026-11-04t14:05:00Z', 'leading_space': ' 2026-11-04T14:05:00Z', 'trailing_space': '2026-11-04T14:05:00Z ',
-             'seconds': '1730000000',
-             'microseconds': '1730000000000000', 'empty': '', 'only_a_space': ' ', 'word': 'now'}
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('name', INVALID_T)
-async def test_refuse_invalid_t(manager: ScyllaClusterManager, s3_storage, name):
-    """T26, REF-14."""
-    async with protected_table(manager, s3_storage) as p:
-        result = await p.refused(INVALID_T[name], Reason.T_INVALID)
-        assert ISO_RE.search(result.message), f'expected an example of the form in: {result.message}'
-
-
-SHORT_FORMS = {'no_fraction': ('{base}Z', {1}), 'six_digits': ('{base}.000000Z', {1}), 'one_digit': ('{base}.5Z', {1, 2}),
-               'below_the_half': ('{base}.499999Z', {1})}
-
-
-@needs_phase('1.3')
-@pytest.mark.parametrize('name', SHORT_FORMS)
-async def test_missing_fields_below_the_second_mean_zero(manager: ScyllaClusterManager, s3_storage, name):
-    """T26, REF-14. Rows sit exactly on the boundary, so a form read wrongly shows."""
-    async with protected_table(manager, s3_storage, seed=[]) as p:
-        whole_second = (p.backup.start_us // 1_000_000 + 2) * 1_000_000
-        await p.write(simple_rows([1], whole_second) + simple_rows([2], whole_second + 500_000))
-        await p.covered(whole_second + 500_000 + CLOCK_MARGIN_US)
+        await p.cql.run_async(f'TRUNCATE TABLE {p.ks}.t')
         await p.covered()
-        form, expected = SHORT_FORMS[name]
-        t = form.format(base=iso(whole_second)[:-len('.000000Z')])
-        _, new = await p.restore(t)
-        seen = await pks_of(p.cql, p.ks, new)
-        assert seen == expected, f'expected keys {expected} at {t}, saw {seen}'
+
+        await p.refused(r_ts + STEP_US, Reason.TRUNCATED)
+        await restarted_chain_restores_without_truncated_rows(p, pks)
 
 
-# The disk reserve
+@needs_phase('ep.3', '15-bc')
+async def test_truncate_before_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
+    """T6 (b): REF-10, RST-4, P55/P74. With shipping on: rows R, a TRUNCATE, the backup, then rows S. P74 refuses every T once
+    the source was truncated after its chain started. A commitlog-wide bound below the cleared writes would bring R back."""
+    r_pks, s_pks = keys_on_every_shard(1, 100), keys_on_every_shard(1, 200)
+    async with pitr_node(manager, s3_storage, auto_snapshot=False) as p:
+        await p.write(simple_rows(r_pks, old_ts(), 'R'))
+        await p.cql.run_async(f'TRUNCATE TABLE {p.ks}.t')
+        await p.backup()
+        s = simple_rows(s_pks, now_us(), 'S')
+        await p.write(s)
+        await p.covered()
 
-async def set_reserve(manager, server, percent):
-    await manager.server_update_config(server.server_id, CFG_DISK_RESERVE_PERCENT, percent)
-
-    async def applied():
-        return True if await manager.api.get_config(server.ip_addr, CFG_DISK_RESERVE_PERCENT) == percent else None
-    await wait_for(applied, deadline())
-
-
-@needs_phase('1.3')
-async def test_disk_reserve_defaults_to_10_percent(manager: ScyllaClusterManager, s3_storage):
-    """T27, REF-16."""
-    server = await manager.server_add(config=node_config(s3_storage))
-    seen = await manager.api.get_config(server.ip_addr, CFG_DISK_RESERVE_PERCENT)
-    assert seen == 10, f'expected 10, saw {seen}'
-
-
-@needs_phase('1.3')
-async def test_refuse_when_the_disk_reserve_would_be_breached(manager: ScyllaClusterManager, s3_storage):
-    """T27, REF-16."""
-    async with protected_table(manager, s3_storage) as p:
-        t = await p.covered()
-        await set_reserve(manager, p.server, 100)
-        result = await p.refused(t, Reason.DISK)
-        assert result.needed_bytes > 0 and result.free_bytes > 0 and result.reserve_bytes > 0, f'expected all three figures: {result}'
-        assert result.free_bytes - result.needed_bytes < result.reserve_bytes, f'expected the figures to explain the refusal: {result}'
+        await p.refused(s[-1].ts, Reason.TRUNCATED)
+        await restarted_chain_restores_without_truncated_rows(p, r_pks, kept=s)
 
 
-@needs_phase('1.3')
-async def test_lowering_the_disk_reserve_lets_a_restore_through(manager: ScyllaClusterManager, s3_storage):
-    """T27, REF-16."""
-    async with protected_table(manager, s3_storage) as p:
-        t = await p.covered()
-        await set_reserve(manager, p.server, 100)
-        await p.refused(t, Reason.DISK)
-        await set_reserve(manager, p.server, 1)
-        await p.assert_restored_exact(p.seed, t)
+@needs_phase('ep.3', '15-bc', 'st.1')
+async def test_schema_change_since_the_backup_is_refused(manager: ScyllaClusterManager, s3_storage):
+    """T7: REF-9, limit 22, PM-60. Values in column w, the backup, w dropped, more writes. Any T after the backup is refused, or
+    the dropped values would come back in the copy. Control: T at the snapshot time gives `done`, exact."""
+    pks = keys_on_every_shard(1, 100)
+    async with pitr_node(manager, s3_storage) as p:
+        seed = [W(old_ts(), f"INSERT INTO {{t}} (pk, ck, v, w) VALUES ({pk}, 0, 'seed', {pk}) USING TIMESTAMP {{ts}}") for pk in pks]
+        await p.write(seed)
+        await p.backup()
+        await p.cql.run_async(f'ALTER TABLE {p.ks}.t DROP w')
+        later = simple_rows(keys_on_every_shard(1, 200), now_us(), 'later')
+        await p.write(later)
+        await p.covered()
+
+        await p.refused(later[-1].ts, Reason.SCHEMA_CHANGED)
+
+        snapshot_t = await p.snapshot_time()
+        _, target = await p.replay_done(snapshot_t)
+        await assert_exact(p.cql, p.ks, target, seed, snapshot_t)
 
 
-# The new table's name
+@needs_phase('ep.3', '12-2.2')
+async def test_backup_with_unfinished_upload_is_refused(manager: ScyllaClusterManager, gated_store, s3_storage):
+    """T8: REF-7 (don't-cut list). The backup goes through the gate, cut after about half the snapshot's bytes, and shipping
+    goes around it. A partial backup loads fewer sstables. Control: back up the same snapshot again, uncut, and a new target
+    gives `done`, exact."""
+    async with pitr_node(manager, s3_storage, schema=UNCOMPRESSED_SCHEMA, also=(gated_store,)) as p:
+        await write_several_sstables(manager, p.server, p.cql, p.ks)
+        size = await manager.api.get_table_disk_space_used(p.server.ip_addr, p.ks, 't')
+        p.snap, _ = await take_snapshot_on_one_server(p.ks, p.server, manager, logger)
+        p.prefix = backup_prefix(p.ks, 't', p.snap)
+        gated_store.fail_after_bytes(size // 2)
+        tid = await manager.api.backup(p.server.ip_addr, p.ks, 't', p.snap, gated_store.address, gated_store.bucket_name, p.prefix)
 
-BAD_NAMES = {'taken_by_another_table': ('existing', Reason.NAME_TAKEN), 'taken_by_a_finished_restore': ('finished', Reason.NAME_TAKEN),
-             'the_source': ('t', Reason.NAME_TAKEN),
-             'too_long': ('a' * 49, Reason.NAME_INVALID), 'has_a_space': ('has space', Reason.NAME_INVALID), 'has_a_dash': ('has-dash', Reason.NAME_INVALID),
-             'empty': ('', Reason.NAME_INVALID), 'dotted': ('some.name', Reason.NAME_INVALID)}
+        async def went_down():
+            return True if gated_store.down else None
+        await wait_for(went_down, deadline())
+        try:
+            await manager.api.abort_task(p.server.ip_addr, tid)
+        except HTTPError as e:
+            logger.info(f'The task had already ended: {e}')
+        assert (await manager.api.wait_task(p.server.ip_addr, tid))['state'] == 'failed'
+        uploaded = sum(o.size for o in (await objects_of(s3_storage, f'{p.prefix}/')).values())
+        assert 0 < uploaded < size, f'the upload must be part-way: {uploaded} of {size} bytes'
+        gated_store.recover()
+        t = now_us()
+        await p.covered()
+
+        # The cut upload may lack schema.cql, so this target is made from the source's own schema, the same at this point.
+        target = 'cut_target'
+        source = (await p.cql.run_async(f'DESCRIBE TABLE {p.ks}.t'))[0].create_statement
+        await p.cql.run_async(target_statement(source, p.ks, target))
+        await p.refused(t, Reason.BACKUP_UNFINISHED, target=target)
+
+        await do_backup(p.server, p.snap, p.prefix, p.ks, 't', s3_storage, manager, logger)
+        _, target = await p.replay_done(t)
+        assert await read_exact(p.cql, p.ks, target) == await read_exact(p.cql, p.ks, 't')
 
 
-@needs_phase('1.3')
-@pytest.mark.parametrize('name', BAD_NAMES)
-async def test_refuse_new_table_name(manager: ScyllaClusterManager, s3_storage, name):
-    """T28, REF-13."""
-    async with protected_table(manager, s3_storage) as p:
-        await p.cql.run_async(f'CREATE TABLE {p.ks}.existing {TABLE_SCHEMA}')
-        await apply(p.cql, p.ks, 'existing', simple_rows([9], old_ts(), 'keep'))
-        t = await p.covered()
-        await p.restore(t, new_table='finished')
-        new_table, reason = BAD_NAMES[name]
-        await p.refused(t, reason, watched=['existing', 'finished'], new_table=new_table)
+@needs_phase('ep.3')
+async def test_a_replay_into_a_done_target_is_refused_naming_the_earlier_run(manager: ScyllaClusterManager, s3_storage):
+    """R16-P2: REF-13. A second replay into a target that is already `done` is refused, the message names the earlier run's backup
+    and T, and the target keeps its rows. Control: the first call was `done` and the target is not empty."""
+    pks = keys_on_every_shard(2)
+    async with pitr_node(manager, s3_storage) as p:
+        await p.write(simple_rows(pks, old_ts(), 'seed'))
+        await p.backup()
+        t = now_us()
+        await p.covered(t + 1_000_000)
+
+        _, target = await p.replay_done(t)
+        rows = await read_exact(p.cql, p.ks, target)
+        assert rows, 'the first replay must have loaded the backup'
+        t2 = t + 1000
+        second, _ = await p.replay(t2, target)
+        assert second.state == 'failed' and second.reason == Reason.TARGET_ALREADY_REPLAYED, f'a done target must be refused: {second}'
+        assert p.snap in second.message, f'the refusal must name the earlier run\'s backup {p.snap}: {second}'
+        assert iso(t) in second.message, f'the refusal must name the earlier run\'s T {iso(t)}: {second}'
+        assert iso(t2) not in second.message, f'the refusal must not echo this request\'s T {iso(t2)}: {second}'
+        assert await read_exact(p.cql, p.ks, target) == rows, 'the refused replay changed the target'
 
 
-@needs_phase('1.3')
-async def test_refuse_new_table_in_another_keyspace(manager: ScyllaClusterManager, s3_storage):
-    """T28, REF-13."""
-    async with protected_table(manager, s3_storage) as p, new_test_keyspace(manager, VNODES_KS) as other_ks:
-        await p.refused(await p.covered(), Reason.NAME_OTHER_KEYSPACE, new_table='elsewhere', new_keyspace=other_ks)
-        assert not await table_exists(p.cql, other_ks, 'elsewhere'), 'expected no table in the other keyspace'
+async def ready_for_replay(p, pks=None):
+    """S0 plus coverage: a backup, rows after it, and a T the history covers. Returns T."""
+    await p.write(simple_rows(pks or keys_on_every_shard(2), old_ts(), 'seed'))
+    await p.backup()
+    t = now_us()
+    await p.covered(t + 1_000_000)
+    return t
 
 
-@needs_phase('1.3')
-async def test_new_table_name_of_maximum_length_is_accepted(manager: ScyllaClusterManager, s3_storage):
-    """T28, REF-13. The control for the refusals above."""
-    async with protected_table(manager, s3_storage) as p:
-        longest = 'a' * 48
-        await p.restore(await p.covered(), new_table=longest)
-        assert await table_exists(p.cql, p.ks, longest), f'expected table {longest}'
+@needs_phase('ep.3')
+async def test_a_call_missing_a_required_parameter_is_rejected_naming_it(manager: ScyllaClusterManager, s3_storage):
+    """R06-P4: RST-1. Each of the seven parameters, left out and then given empty with the other six valid, is an HTTP 400 that
+    names it and starts no task. Control: the full call into the same target ends `done`, so no case marked it."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        target = await p.new_target()
+        valid = {'endpoint': s3_storage.address, 'bucket': s3_storage.bucket_name, 'prefix': p.prefix, 'keyspace': p.ks, 'table': target,
+                 'snapshot': p.snap, 't': iso(t)}
+        for name in valid:
+            for how, params in (('left out', {k: v for k, v in valid.items() if k != name}), ('empty', valid | {name: ''})):
+                status, body = await post_raw(manager, p.server, REPLAY_URI, params)
+                assert status == 400, f'{name} {how}: expected HTTP 400, got {status}: {body}'
+                assert f"Missing mandatory parameter '{name}'" in body, f'{name} {how}: the 400 must name the parameter: {body}'
+        await p.assert_nothing_loaded(target)
+        await p.replay_done(t, target)
+
+
+@needs_phase('ep.3')
+async def test_an_endpoint_the_node_does_not_know_is_refused(manager: ScyllaClusterManager, s3_storage):
+    """R06-P5: RST-1. An endpoint name the node isn't configured with is refused with its reason and name, and loads nothing.
+    Control: the configured endpoint into a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        outcome, _ = await p.refused(t, Reason.STORE_LOCATION_MISSING,
+                                     storage=SimpleNamespace(address='nowhere', bucket_name=s3_storage.bucket_name))
+        assert "endpoint='nowhere'" in outcome.message, f'the refusal must name the endpoint: {outcome}'
+        await p.replay_done(t)
+
+
+@needs_phase('ep.3')
+async def test_a_bucket_that_does_not_exist_is_refused_as_no_backup(manager: ScyllaClusterManager, s3_storage):
+    """R06-P6: RST-1. A bucket that doesn't exist is refused as a missing backup, and loads nothing. Control: the real bucket
+    into a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        outcome, _ = await p.refused(t, Reason.BACKUP_FILE_MISSING,
+                                     storage=SimpleNamespace(address=s3_storage.address, bucket_name='no-such-bucket'))
+        assert 'There is no backup under this prefix' in outcome.message, f'the refusal must say there is no backup: {outcome}'
+        await p.replay_done(t)
+
+
+@needs_phase('ep.3')
+async def test_a_target_table_that_does_not_exist_is_refused_and_not_created(manager: ScyllaClusterManager, s3_storage):
+    """R06-P7: RST-1. A replay into a table that doesn't exist is refused naming it, and doesn't create it. Control: once the
+    table is created from the backup's schema.cql, the same call ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        before = await read_exact(p.cql, p.ks, p.cf)
+        outcome, _ = await p.replay(t, 'nosuch')
+        assert outcome.state == FAILED and outcome.reason == Reason.TARGET_MISSING, f'a missing target must be refused: {outcome}'
+        assert f'{p.ks}.nosuch' in outcome.message, f'the refusal must name the target: {outcome}'
+        rows = await p.cql.run_async(f"SELECT table_name FROM system_schema.tables WHERE keyspace_name = '{p.ks}' AND table_name = 'nosuch'")
+        assert not list(rows), 'the refused replay created the target'
+        assert await read_exact(p.cql, p.ks, p.cf) == before, 'the source changed in a refusal'
+        await create_target(p.cql, s3_storage, p.ks, 'nosuch', p.prefix)
+        await p.replay_done(t, 'nosuch')
+
+
+@needs_phase('ep.3')
+@pytest.mark.parametrize('t', [
+    pytest.param('2026-11-08 10:00:00Z', id='space'),
+    pytest.param('2026-11-08T10:00:00+00:00', id='offset'),
+    pytest.param('2026-11-08t10:00:00z', id='lower_case'),
+    pytest.param('2026-12-31T23:59:60Z', id='leap_second'),
+    pytest.param('2026-11-08T10:00:00.1234567Z', id='seven_digits'),
+    pytest.param('2026-02-30T10:00:00Z', id='feb_30'),
+])
+async def test_an_unparsable_t_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage, t):
+    """R07-P5: RST-2. A T that isn't a UTC time of the documented form is refused as invalid before the backup is loaded, and
+    leaves no mark. Control: a valid T into the same target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        valid = await ready_for_replay(p)
+        outcome, target = await p.refused(t, Reason.T_INVALID)
+        assert 'T must be a UTC time of the form' in outcome.message, f'the refusal must state the form: {outcome}'
+        await p.replay_done(valid, target)
+
+
+@needs_phase('ep.3')
+async def test_a_backup_whose_bound_file_was_removed_is_refused_before_anything_is_loaded(manager: ScyllaClusterManager, s3_storage):
+    """R05-P2: SHP-5. A backup without its pitr-bound.txt is refused, naming the file, and loads nothing. Control: with the file
+    put back, a fresh target ends `done`."""
+    async with pitr_node(manager, s3_storage) as p:
+        t = await ready_for_replay(p)
+        key = f'{p.prefix}/pitr-bound.txt'
+        content = await get_object(s3_storage, key)
+        await delete_object(s3_storage, key)
+        outcome, _ = await p.refused(t, Reason.BACKUP_FILE_MISSING)
+        assert 'pitr-bound.txt' in outcome.message, f'the refusal must name the bound file: {outcome}'
+        await put_object(s3_storage, key, content)
+        await p.replay_done(t)

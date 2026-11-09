@@ -22,6 +22,7 @@ from test.cluster.object_store.pitr_util import from_iso, iso, now_us, SHARDS, s
 from test.cluster.object_store.test_backup import do_backup, take_snapshot_on_one_server
 from test.cluster.util import new_test_keyspace
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
+from test.pylib.skip_types import skip_env
 from test.pylib.util import wait_for
 
 logger = logging.getLogger(__name__)
@@ -269,7 +270,7 @@ async def test_replay_refuses_a_damaged_pitr_bound(manager: ScyllaClusterManager
     if object_storage.type != 'S3':
         # Only the damage is written through boto3, which the GCS front refuses; the check it
         # exercises reads the object the same way whatever wrote it.
-        pytest.skip('putting an object back into the bucket needs the S3 front')
+        skip_env('putting an object back into the bucket needs the S3 front')
     server = await one_server(manager, object_storage, shipping=True)
     async with new_test_keyspace(manager, RF_1) as ks:
         snap_name, prefix = await backup_with_a_pitr_bound(manager, server, object_storage, ks, {'0': 'zero'})
